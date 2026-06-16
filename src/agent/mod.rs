@@ -326,7 +326,7 @@ fn merge_usage(cumulative: &mut Option<Usage>, new_usage: Option<Usage>) {
         if let Some(ref mut cum) = cumulative {
             cum.prompt_tokens += new.prompt_tokens;
             cum.completion_tokens += new.completion_tokens;
-            cum.cached_tokens = cum.cached_tokens.or(new.cached_tokens);
+            cum.cached_tokens = Some(cum.cached_tokens.unwrap_or(0) + new.cached_tokens.unwrap_or(0));
             cum.reasoning_tokens = cum.reasoning_tokens.or(new.reasoning_tokens);
         } else {
             *cumulative = Some(new);
@@ -399,7 +399,7 @@ RULES:\n\
     let tools_def = mcp.to_openai_tools(&prof.allowed_tools);
 
     // 6. Tool-calling loop — max iterations controls total LLM calls
-    let max_llm_calls = config.max_iterations.min(20); // safety cap
+    let max_llm_calls = config.max_iterations.min(40); // safety cap
     let mut final_content = String::new();
     let mut final_reasoning: Option<String> = None;
     let mut final_tool_call: bool = false;

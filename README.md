@@ -132,6 +132,47 @@ Stop processing for a channel. All pending messages are marked as `skipped`.
 
 Resume processing for a stopped channel.
 
+## Backup Container
+
+The stack includes a standalone **backup** container for S3 data durability. It is agent-agnostic — does not require the agent to be running, making it suitable for setup on a new machine before the agent starts.
+
+### Architecture
+
+```yaml
+services:
+  backup:
+    build: ./backup
+    env_file: backup.env          # NOT git-versioned
+    volumes:
+      - ./data:/opt/data:rw
+```
+
+### Commands
+
+Run inside the container (`docker compose exec backup <command>`):
+
+| Command | Description |
+|---------|-------------|
+| `backup` | Syncs `/opt/data/` to `S3_BUCKET/S3_PATH/data/` |
+| `checkpoint` | Syncs `/opt/data/` to `S3_BUCKET/S3_PATH/checkpoint/YYYYMMDD/` |
+| `restore_backup` | Syncs from `S3_BUCKET/S3_PATH/data/` to `/opt/data/` |
+| `restore_checkpoint YYYYMMDD` | Syncs from `S3_BUCKET/S3_PATH/checkpoint/YYYYMMDD/` to `/opt/data/` |
+
+### Configuration (`backup.env`)
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `S3_ENDPOINT` | `https://s3.us-east-005.backblazeb2.com` | S3-compatible endpoint |
+| `S3_REGION` | `us-east-005` | S3 region |
+| `S3_BUCKET` | `my-bucket` | S3 bucket name |
+| `S3_PATH` | `omni` | Path prefix within the bucket |
+| `S3_ACCESS_KEY` | — | S3 access key ID |
+| `S3_SECRET_KEY` | — | S3 secret access key |
+| `CRON_BACKUP` | `"0 5 * * *"` | Backup schedule (empty = disabled) |
+| `CRON_CHECKPOINT` | `"0 3 * * 0"` | Weekly checkpoint schedule (empty = disabled) |
+
+Both backup and checkpoint use `rclone sync` with rclone v1.74+.
+
 ## Data Directory Structure
 
 Persistent data lives under `OMNI_DATA_DIR` (default `/opt/data`):

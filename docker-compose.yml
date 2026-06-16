@@ -51,6 +51,15 @@ services:
       - "8080"
     user: root
 
+  backup:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    env_file:
+      - backup.env
+    volumes:
+      - ./data:/opt/data:rw
+
 volumes:
   postgres_data:
   qdrant_data:

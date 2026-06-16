@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
     let server_host = cfg.host.clone();
     let server_port = cfg.port;
     let server_handle = tokio::spawn(async move {
-        server::start_server(pool_server, server_host, server_port, cancel_tokens_server).await;
+        server::start_server(pool_server, server_host, server_port, cancel_tokens_server, data_dir).await;
     });
 
     tracing::info!(

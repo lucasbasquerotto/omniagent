@@ -7,6 +7,8 @@
 
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -18,34 +20,35 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::db::types as queries;
+use crate::prompt_builder::{build_system_prompt, MemoryStore};
 
 /// Shared application state for the HTTP server.
 #[derive(Clone)]
 struct AppState {
     pool: PgPool,
     cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
+    data_dir: String,
 }
 
 /// Start the HTTP server on the given host and port.
-///
-/// The server provides endpoints for health checking and stopping
-/// channel processing. The `cancel_tokens` map is shared with the
-/// agent supervisor so channels can be cleanly stopped.
 pub async fn start_server(
     pool: PgPool,
     host: String,
     port: u16,
     cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
+    data_dir: String,
 ) {
     let app_state = Arc::new(AppState {
         pool,
         cancel_tokens,
+        data_dir,
     });
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/stop/{channel_id}", post(stop_handler))
-        .route("/stop/{channel_id}", get(stop_handler))
+        .route("/stop/:channel_id", post(stop_handler))
+        .route("/stop/:channel_id", get(stop_handler))
+        .route("/prompt/:channel_name", get(prompt_handler))
         .with_state(app_state);
 
     let addr = format!("{}:{}", host, port);
@@ -111,4 +114,57 @@ async fn stop_handler(
             "channel_id": channel_id,
         }))
     }
+}
+
+/// Show the system prompt for a channel, using `<<<prompt>>>` as the
+/// placeholder for where the user's actual message would go.
+///
+/// This is a reference tool — it shows what the prompt preamble would
+/// look like when a user sends a message to this channel, without
+/// actually invoking the agent.
+async fn prompt_handler(
+    Path(channel_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // 1. Look up the channel by name
+    let channel = match queries::get_channel_by_name(&state.pool, &channel_name).await {
+        Ok(Some(ch)) => ch,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("Channel '{}' not found", channel_name),
+            );
+        }
+        Err(e) => {
+            error!("Failed to look up channel '{}': {:?}", channel_name, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            );
+        }
+    };
+
+    // 2. Determine the profile name
+    let profile_name = if channel.current_profile.is_empty() {
+        "default"
+    } else {
+        &channel.current_profile
+    };
+
+    // 3. Load the memory store for the profile
+    let profile_path = format!("{}/profiles/{}", state.data_dir, profile_name);
+    let mut memory_store = MemoryStore::new(&profile_path);
+    memory_store.load_from_disk();
+
+    // 4. Build the system prompt (same as process_message would)
+    let platform = channel.platform.as_str();
+    let system_prompt = build_system_prompt(&memory_store, platform, None, profile_name);
+
+    // 5. Format the full messages array as it would be sent to the LLM
+    let result = format!(
+        "System Prompt:\n{}\n\n---\n\nMessages sent to LLM:\n\n{{\n  \"role\": \"system\",\n  \"content\": \"\"\"\n{}\n  \"\"\"\n}},\n{{\n  \"role\": \"user\",\n  \"content\": \"<<<prompt>>>\"\n}}",
+        system_prompt, system_prompt
+    );
+
+    (StatusCode::OK, result)
 }

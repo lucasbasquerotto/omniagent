@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(interval).await;
             let before = chrono::Utc::now() - chrono::Duration::days(delete_after_days as i64);
-            match db::queries::delete_old_messages(&pool_clean, before).await {
+            match db::types::delete_old_messages(&pool_clean, before).await {
                 Ok(count) => {
                     if count > 0 {
                         tracing::info!(

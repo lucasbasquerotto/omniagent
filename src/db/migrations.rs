@@ -140,7 +140,8 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             ADD COLUMN IF NOT EXISTS profile TEXT NOT NULL DEFAULT 'default',
             ADD COLUMN IF NOT EXISTS provider TEXT,
             ADD COLUMN IF NOT EXISTS model TEXT,
-            ADD COLUMN IF NOT EXISTS processing_time_ms INT;
+            ADD COLUMN IF NOT EXISTS processing_time_ms INT,
+            ADD COLUMN IF NOT EXISTS token_usage JSONB;
         "#,
     )
     .execute(pool)

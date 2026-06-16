@@ -11,7 +11,7 @@
 //! OpenCode Go serves two API surfaces depending on the model:
 //! - `chat_completions` — OpenAI-compatible `/v1/chat/completions` (GLM, Kimi, DeepSeek)
 //! - `anthropic_messages` — Anthropic-compatible `/v1/messages` (MiniMax, Qwen 3.7)
-//! API mode is auto-detected from the model name.
+//!   API mode is auto-detected from the model name.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,9 @@ pub struct LLMConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
+    #[expect(dead_code)]
     pub max_tokens: u32,
+    #[expect(dead_code)]
     pub temperature: f32,
 }
 
@@ -126,8 +128,7 @@ impl LLMConfig {
             .parse()
             .expect("Invalid LLM_PROVIDER value");
 
-        let model = std::env::var("LLM_MODEL")
-            .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+        let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
 
         let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match provider {
             ProviderKind::OpenCodeGo => "https://opencode.ai/zen/go/v1".to_string(),
@@ -234,6 +235,7 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     #[serde(default)]
+    #[serde(alias = "prompt_cache_hit_tokens")]
     pub cached_tokens: Option<u32>,
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
@@ -340,6 +342,7 @@ struct AnthropicContentBlock {
     #[serde(default)]
     thinking: Option<String>,
     #[serde(default)]
+    #[expect(dead_code)]
     signature: Option<String>,
 }
 
@@ -389,7 +392,10 @@ impl LLMClient {
     // -----------------------------------------------------------------------
 
     async fn completion_openai(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
 
         // Build the JSON body — the opencode-go provider gets an extra
         // `include_reasoning: true` flag.
@@ -423,15 +429,10 @@ impl LLMClient {
             .context("Failed to send OpenAI-compatible completion request")?;
 
         let status = resp.status();
-        let resp_text = resp
-            .text()
-            .await
-            .context("Failed to read response body")?;
+        let resp_text = resp.text().await.context("Failed to read response body")?;
 
         if !status.is_success() {
-            anyhow::bail!(
-                "OpenAI-compatible API returned {status}: {resp_text}",
-            );
+            anyhow::bail!("OpenAI-compatible API returned {status}: {resp_text}",);
         }
 
         let parsed: OpenAiResponse = serde_json::from_str(&resp_text)
@@ -465,7 +466,12 @@ impl LLMClient {
             .message
             .as_ref()
             .and_then(|m| m.reasoning_content.clone())
-            .or_else(|| choice.delta.as_ref().and_then(|d| d.reasoning_content.clone()));
+            .or_else(|| {
+                choice
+                    .delta
+                    .as_ref()
+                    .and_then(|d| d.reasoning_content.clone())
+            });
 
         let tool_calls = choice
             .message

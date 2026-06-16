@@ -1,14 +1,15 @@
 use anyhow::Result;
 use serde_json::Value;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use sqlx::PgPool;
 
 pub mod tools;
 
 /// A tool call requested by the LLM.
 #[derive(Debug, Clone)]
 pub struct McpToolCall {
+    #[expect(dead_code)]
     pub id: String,
     pub name: String,
     pub arguments: Value,
@@ -17,8 +18,10 @@ pub struct McpToolCall {
 /// A tool execution result to send back to the LLM.
 #[derive(Debug, Clone)]
 pub struct McpToolResult {
+    #[expect(dead_code)]
     pub call_id: String,
     pub content: String,
+    #[expect(dead_code)]
     pub is_error: bool,
 }
 
@@ -27,6 +30,7 @@ pub struct McpToolResult {
 pub struct AppContext {
     pub pool: PgPool,
     pub data_dir: String,
+    #[expect(dead_code)]
     pub qdrant_url: Option<String>,
 }
 
@@ -111,6 +115,7 @@ impl McpRegistry {
     }
 
     /// Build all tools for OpenAI format.
+    #[expect(dead_code)]
     pub fn to_openai_tools_all(&self) -> Vec<Value> {
         self.all()
             .iter()

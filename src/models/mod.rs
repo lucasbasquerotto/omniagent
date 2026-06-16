@@ -7,5 +7,7 @@ pub use channel::ChannelStop;
 pub use message::Message;
 pub use message::MessageNew;
 pub use message::MessageStatus;
+#[expect(unused_imports)]
 pub use profile::ProfileNew;
+#[expect(unused_imports)]
 pub use profile::ProfileRow;

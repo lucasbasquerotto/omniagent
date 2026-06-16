@@ -1,20 +1,8 @@
-# Stage 1: Build (or use pre-built binary)
-FROM rust:latest AS builder
+# OmniAgent — Development Dockerfile
+# Source code is mounted as a volume; binary built on host with `cargo build --release`.
+# No docker cp needed — just build then `docker compose restart omniagent`.
 
-WORKDIR /app
-
-COPY Cargo.toml Cargo.lock* ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release 2>/dev/null || true
-RUN rm -rf src
-
-COPY src/ ./src/
-
-# Force rebuild by touching every source file
-RUN find src/ -name '*.rs' -exec touch {} + && cargo build --release
-
-# Stage 2: Runtime
-FROM debian:bookworm-slim AS runtime
+FROM rust:latest
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -24,10 +12,7 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/omniagent /app/omniagent
-
-USER root
-
-EXPOSE 8080
-
-CMD ["/app/omniagent"]
+# Run the pre-built release binary from the mounted target/ directory.
+# Build on the host: cd /opt/workspace/omniagent && cargo build --release
+# Then restart: docker compose restart omniagent
+CMD ["./target/release/omniagent"]

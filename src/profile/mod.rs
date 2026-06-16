@@ -50,6 +50,7 @@ impl Profile {
     }
 
     /// Resolve the effective model, checking channel override first, then profile.
+    #[expect(dead_code)]
     pub fn resolve_model(&self, channel_model: Option<&str>) -> Option<String> {
         channel_model
             .map(|s| s.to_string())
@@ -57,6 +58,7 @@ impl Profile {
     }
 
     /// Resolve the effective provider.
+    #[expect(dead_code)]
     pub fn resolve_provider(&self, channel_provider: Option<&str>) -> Option<String> {
         channel_provider
             .map(|s| s.to_string())
@@ -69,6 +71,7 @@ impl Profile {
 #[derive(Debug, Clone)]
 pub struct ProfileRegistry {
     pub profiles: HashMap<String, Profile>,
+    #[expect(dead_code)]
     pub default_profile: String,
     pub data_dir: String,
 }
@@ -98,11 +101,16 @@ impl ProfileRegistry {
 
     /// Get a profile by name, falling back to default.
     pub fn get(&self, name: &str) -> Option<&Profile> {
-        self.profiles.get(name).or_else(|| self.profiles.get("default"))
+        self.profiles
+            .get(name)
+            .or_else(|| self.profiles.get("default"))
     }
 
     /// Get the default profile.
+    #[expect(dead_code)]
     pub fn default(&self) -> &Profile {
-        self.profiles.get("default").expect("Default profile must exist")
+        self.profiles
+            .get("default")
+            .expect("Default profile must exist")
     }
 }

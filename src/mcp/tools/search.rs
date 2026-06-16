@@ -7,7 +7,7 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
     let pool = ctx.pool.clone();
     McpTool {
         name: "search_messages".to_string(),
-        description: "Search messages in the database by text content. Returns matching message IDs, roles, and content previews.".to_string(),
+        description: "SEARCH CONVERSATION HISTORY in the database by text content. Use this to find past messages and discussions. This is a DATABASE SEARCH of conversation text, NOT a file reader. It searches message content, not files on disk. For reading files use filesystem_read.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -34,33 +34,37 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
             let limit = args["limit"]
                 .as_i64()
                 .unwrap_or(10)
-                .min(50) as i64;
+                .min(50);
             let channel_id = args["channel_id"].as_i64();
 
             let pool = pool.clone();
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| anyhow::anyhow!("Failed to create runtime: {}", e))?;
 
-            let results: Vec<(i64, String, String)> = rt.block_on(async {
-                if let Some(cid) = channel_id {
-                    sqlx::query_as(
-                        "SELECT id, role, content FROM messages WHERE channel_id = $1 AND content ILIKE '%' || $2 || '%' ORDER BY created_at DESC LIMIT $3"
-                    )
-                    .bind(cid)
-                    .bind(query)
-                    .bind(limit)
-                    .fetch_all(&pool)
-                    .await
-                } else {
-                    sqlx::query_as(
-                        "SELECT id, role, content FROM messages WHERE content ILIKE '%' || $1 || '%' ORDER BY created_at DESC LIMIT $2"
-                    )
-                    .bind(query)
-                    .bind(limit)
-                    .fetch_all(&pool)
-                    .await
-                }
-            })?;
+            // Use block_in_place + Handle::current() to run async sqlx from sync handler.
+            // The async block returns sqlx::Error; converted to anyhow::Error via map_err.
+            let results: Vec<(i64, String, String)> = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    if let Some(cid) = channel_id {
+                        sqlx::query_as(
+                            "SELECT id, role, content FROM messages WHERE channel_id = $1 AND content ILIKE '%' || $2 || '%' ORDER BY created_at DESC LIMIT $3"
+                        )
+                        .bind(cid)
+                        .bind(query)
+                        .bind(limit)
+                        .fetch_all(&pool)
+                        .await
+                    } else {
+                        sqlx::query_as(
+                            "SELECT id, role, content FROM messages WHERE content ILIKE '%' || $1 || '%' ORDER BY created_at DESC LIMIT $2"
+                        )
+                        .bind(query)
+                        .bind(limit)
+                        .fetch_all(&pool)
+                        .await
+                    }
+                })
+            })
+            .map_err(|e: sqlx::Error| anyhow::anyhow!(e))?;
 
             if results.is_empty() {
                 return Ok(McpToolResult {
@@ -93,7 +97,7 @@ pub fn search_wiki_tool(ctx: &AppContext) -> McpTool {
     let _ = ctx; // keep for future use (Qdrant integration)
     McpTool {
         name: "search_wiki".to_string(),
-        description: "Search the wiki by text in wiki files. Searches the profiles/<profile>/wiki/ directory for matching content.".to_string(),
+        description: "SEARCH WIKI DOCUMENTATION by text content in local wiki/markdown files. Use this to find relevant documentation in wiki files. Searches inside .md files under the profile's wiki directory. For reading specific wiki files, use filesystem_read.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {

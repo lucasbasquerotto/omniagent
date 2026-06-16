@@ -18,7 +18,7 @@ fn restrict_path(path: &str, ctx: &AppContext) -> Result<String> {
 pub fn read_tool() -> McpTool {
     McpTool {
         name: "filesystem_read".to_string(),
-        description: "Read the contents of a file. Returns the file content as text.".to_string(),
+        description: "READ A LOCAL FILE from disk. Use this to read any file on the filesystem (markdown, text files, config files, code files, research documents). This is the ONLY tool for reading existing file content. Do NOT use search_messages for file reading.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -30,7 +30,9 @@ pub fn read_tool() -> McpTool {
             "required": ["path"]
         }),
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
-            let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
             let safe_path = restrict_path(path, &ctx)?;
             let content = fs::read_to_string(&safe_path)
                 .map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", safe_path, e))?;
@@ -46,7 +48,7 @@ pub fn read_tool() -> McpTool {
 pub fn write_tool() -> McpTool {
     McpTool {
         name: "filesystem_write".to_string(),
-        description: "Write content to a file. Creates parent directories if needed. Overwrites existing content.".to_string(),
+        description: "WRITE/CREATE A LOCAL FILE on disk. Use this to save content to a new or existing file. Creates parent directories automatically. This is the ONLY tool for writing file content.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -64,15 +66,30 @@ pub fn write_tool() -> McpTool {
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
             let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
             let content = args["content"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
-            let safe_path = restrict_path(path, &ctx)?;
-            if let Some(parent) = Path::new(&safe_path).parent() {
+
+            // For write, canonicalize the parent dir (file may not exist yet)
+            let path_obj = Path::new(path);
+            let parent = path_obj.parent().ok_or_else(|| anyhow::anyhow!("Invalid path: no parent directory"))?;
+            let parent_canon = parent.canonicalize().map_err(|e| anyhow::anyhow!("Parent directory does not exist: {} ({})", parent.display(), e))?;
+
+            // Check parent is within data directory
+            let data_dir = Path::new(&ctx.data_dir).canonicalize()?;
+            if !parent_canon.starts_with(&data_dir) {
+                anyhow::bail!("Access denied: path is outside the data directory");
+            }
+
+            let safe_path = parent_canon.join(
+                path_obj.file_name().ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?
+            );
+            let safe_path_str = safe_path.to_string_lossy().to_string();
+            if let Some(parent) = safe_path.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&safe_path, content)
-                .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", safe_path, e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to write file '{}': {}", safe_path_str, e))?;
             Ok(McpToolResult {
                 call_id: String::new(),
-                content: format!("Successfully wrote {} bytes to {}", content.len(), safe_path),
+                content: format!("Successfully wrote {} bytes to {}", content.len(), safe_path_str),
                 is_error: false,
             })
         }),
@@ -82,7 +99,7 @@ pub fn write_tool() -> McpTool {
 pub fn list_tool() -> McpTool {
     McpTool {
         name: "filesystem_list".to_string(),
-        description: "List files and directories at a given path. Returns names and types.".to_string(),
+        description: "LIST FILES AND DIRECTORIES at a given path. Use this to explore a directory and see what files exist before reading them. Returns names and types (file vs directory).".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -94,7 +111,9 @@ pub fn list_tool() -> McpTool {
             "required": ["path"]
         }),
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
-            let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
             let safe_path = restrict_path(path, &ctx)?;
             let entries = fs::read_dir(&safe_path)
                 .map_err(|e| anyhow::anyhow!("Failed to list '{}': {}", safe_path, e))?;
@@ -102,7 +121,11 @@ pub fn list_tool() -> McpTool {
             for entry in entries {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().to_string();
-                let typ = if entry.file_type()?.is_dir() { "directory" } else { "file" };
+                let typ = if entry.file_type()?.is_dir() {
+                    "directory"
+                } else {
+                    "file"
+                };
                 results.push(format!("{} [{}]", name, typ));
             }
             results.sort();
@@ -118,7 +141,7 @@ pub fn list_tool() -> McpTool {
 pub fn search_tool() -> McpTool {
     McpTool {
         name: "filesystem_search".to_string(),
-        description: "Search for files matching a glob pattern. Searches recursively from the given path.".to_string(),
+        description: "SEARCH FOR FILES BY NAME matching a glob pattern (e.g. '*.md', '**/*.rs'). Searches recursively from the given path. Use this when you need to find files with specific names or extensions.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -134,8 +157,12 @@ pub fn search_tool() -> McpTool {
             "required": ["path", "pattern"]
         }),
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
-            let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
-            let pattern = args["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+            let pattern = args["pattern"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
             let safe_path = restrict_path(path, &ctx)?;
             let glob_pattern = format!("{}/{}", safe_path.trim_end_matches('/'), pattern);
             let entries = glob::glob(&glob_pattern)
@@ -161,7 +188,7 @@ pub fn search_tool() -> McpTool {
 pub fn info_tool() -> McpTool {
     McpTool {
         name: "filesystem_info".to_string(),
-        description: "Get metadata about a file or directory (size, modified time, type).".to_string(),
+        description: "GET FILE/DIRECTORY METADATA. Returns size, type (file or directory), modification time, and permissions. Use this to check if a path exists and get details about it before reading.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -173,11 +200,14 @@ pub fn info_tool() -> McpTool {
             "required": ["path"]
         }),
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
-            let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
             let safe_path = restrict_path(path, &ctx)?;
             let metadata = fs::metadata(&safe_path)
                 .map_err(|e| anyhow::anyhow!("Failed to stat '{}': {}", safe_path, e))?;
-            let modified = metadata.modified()
+            let modified = metadata
+                .modified()
                 .map(|t| {
                     let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
                     chrono::DateTime::from_timestamp(dur.as_secs() as i64, 0)
@@ -185,7 +215,11 @@ pub fn info_tool() -> McpTool {
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
-            let typ = if metadata.is_dir() { "directory" } else { "file" };
+            let typ = if metadata.is_dir() {
+                "directory"
+            } else {
+                "file"
+            };
             Ok(McpToolResult {
                 call_id: String::new(),
                 content: serde_json::json!({
@@ -194,7 +228,8 @@ pub fn info_tool() -> McpTool {
                     "size": metadata.len(),
                     "modified": modified,
                     "permissions": format!("{:o}", metadata.permissions().mode() & 0o777),
-                }).to_string(),
+                })
+                .to_string(),
                 is_error: false,
             })
         }),

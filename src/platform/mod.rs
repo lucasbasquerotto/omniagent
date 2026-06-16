@@ -3,8 +3,8 @@
 //! Defines the [`Platform`] trait that all message platforms (Telegram, Cron,
 //! etc.) must implement, along with a [`PlatformRegistry`] to manage them.
 
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 use sqlx::PgPool;
 
 /// A platform that can receive messages from external sources and send
@@ -30,6 +30,7 @@ pub trait Platform: Send + Sync {
     /// The `message_id` refers to the agent's response message stored in the
     /// database. The platform should look up the message and deliver it to
     /// the appropriate external destination.
+    #[expect(dead_code)]
     async fn send_response(&self, pool: &PgPool, message_id: i64) -> Result<()>;
 }
 
@@ -45,9 +46,7 @@ pub struct PlatformRegistry {
 impl PlatformRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self {
-            platforms: vec![],
-        }
+        Self { platforms: vec![] }
     }
 
     /// Register a platform implementation.

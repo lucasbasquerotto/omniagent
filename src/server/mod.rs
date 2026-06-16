@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::db::queries;
+use crate::db::types as queries;
 
 /// Shared application state for the HTTP server.
 #[derive(Clone)]
@@ -37,7 +37,10 @@ pub async fn start_server(
     port: u16,
     cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
 ) {
-    let app_state = Arc::new(AppState { pool, cancel_tokens });
+    let app_state = Arc::new(AppState {
+        pool,
+        cancel_tokens,
+    });
 
     let app = Router::new()
         .route("/health", get(health_handler))

@@ -6,18 +6,13 @@ use std::sync::Arc;
 pub fn fetch_tool() -> McpTool {
     McpTool {
         name: "fetch".to_string(),
-        description: "Make an HTTP GET request to a URL. Returns the response body as text. Use for research, API calls, and web scraping.".to_string(),
+        description: "FETCH/HTTP GET a URL from the internet. Use this to download web pages, API responses, or any HTTP-accessible content. Does NOT work with file:// URLs or local files — use filesystem_read for local files.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
                     "description": "The URL to fetch"
-                },
-                "headers": {
-                    "type": "object",
-                    "description": "Optional HTTP headers to include",
-                    "additionalProperties": {"type": "string"}
                 }
             },
             "required": ["url"]
@@ -27,53 +22,47 @@ pub fn fetch_tool() -> McpTool {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'url' argument"))?;
 
-            // Validate URL scheme
-            let parsed = url::Url::parse(url)
-                .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url, e))?;
-            match parsed.scheme() {
-                "http" | "https" => {}
-                scheme => anyhow::bail!("Unsupported URL scheme '{}'. Only http/https allowed.", scheme),
-            }
+            let url = url.to_string();
 
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .user_agent("OmniAgent/1.0")
-                .build()
-                .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
+            // Use block_in_place + Handle::current() to run async reqwest from sync handler.
+            // The inner async block returns a typed Result to help inference.
+            let mcp_result: McpToolResult = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                let inner: std::result::Result<McpToolResult, anyhow::Error> = handle.block_on(async {
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()?;
 
-            let mut req = client.get(url);
-            if let Some(headers) = args["headers"].as_object() {
-                for (key, val) in headers {
-                    if let Some(val_str) = val.as_str() {
-                        req = req.header(key, val_str);
-                    }
-                }
-            }
+                    let response = client
+                        .get(&url)
+                        .header("User-Agent", "OmniAgent/1.0")
+                        .send()
+                        .await?;
 
-            let resp = req
-                .send()
-                .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+                    let status = response.status();
+                    let body = response.text().await?;
 
-            let status = resp.status();
-            let body = resp
-                .text()
-                .map_err(|e| anyhow::anyhow!("Failed to read response body: {}", e))?;
+                    let preview = if body.len() > 2000 {
+                        format!("{}...\n\n[Response truncated from {} to 2000 characters]", &body[..2000], body.len())
+                    } else {
+                        body
+                    };
 
-            let content = format!(
-                "Status: {}\n\n{}",
-                status.as_u16(),
-                if body.len() > 50000 {
-                    format!("{}... [truncated to 50000 chars]", &body[..50000])
-                } else {
-                    body
-                }
-            );
+                    Ok(McpToolResult {
+                        call_id: String::new(),
+                        content: format!(
+                            "HTTP {} {}\n\n{}",
+                            status.as_u16(),
+                            status.canonical_reason().unwrap_or(""),
+                            preview
+                        ),
+                        is_error: !status.is_success(),
+                    })
+                });
+                inner
+            })?;
 
-            Ok(McpToolResult {
-                call_id: String::new(),
-                content,
-                is_error: !status.is_success(),
-            })
+            Ok(mcp_result)
         }),
     }
 }

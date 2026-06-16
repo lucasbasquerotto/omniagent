@@ -1,6 +1,6 @@
 pub mod migrations;
-pub mod queries;
 pub mod schema;
+pub mod types;
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;

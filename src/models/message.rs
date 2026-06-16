@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-
 /// Status of a message in its lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MessageStatus {
@@ -25,6 +24,21 @@ impl fmt::Display for MessageStatus {
             MessageStatus::Completed => write!(f, "completed"),
             MessageStatus::Failed => write!(f, "failed"),
             MessageStatus::Skipped => write!(f, "skipped"),
+        }
+    }
+}
+
+impl std::str::FromStr for MessageStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "pending" => Ok(MessageStatus::Pending),
+            "processing" => Ok(MessageStatus::Processing),
+            "completed" => Ok(MessageStatus::Completed),
+            "failed" => Ok(MessageStatus::Failed),
+            "skipped" => Ok(MessageStatus::Skipped),
+            _ => Err(format!("invalid message status: {}", s)),
         }
     }
 }
@@ -82,6 +96,7 @@ pub struct Message {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub processing_time_ms: Option<i32>,
+    pub token_usage: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -106,4 +121,5 @@ pub struct MessageNew {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub processing_time_ms: Option<i32>,
+    pub token_usage: Option<serde_json::Value>,
 }

@@ -21,8 +21,8 @@ use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::db::queries;
-use crate::llm::{ChatMessage, CompletionRequest, LLMClient, ToolCallData};
+use crate::db::types as queries;
+use crate::llm::{ChatMessage, CompletionRequest, LLMClient, Usage};
 use crate::mcp::{AppContext, McpRegistry, McpToolCall};
 use crate::models::{Message, MessageNew, MessageStatus};
 
@@ -35,6 +35,7 @@ pub struct AgentConfig {
     pub llm_base_url: String,
     pub max_tokens: u32,
     pub temperature: f32,
+    #[expect(dead_code)]
     pub summarize_after_days: u32,
     pub max_iterations: u32,
 }
@@ -54,10 +55,8 @@ impl AgentConfig {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             llm_api_key: std::env::var("LLM_API_KEY").unwrap_or_default(),
-            llm_model: std::env::var("LLM_MODEL")
-                .unwrap_or_else(|_| "gpt-4".to_string()),
-            llm_provider: std::env::var("LLM_PROVIDER")
-                .unwrap_or_else(|_| "openai".to_string()),
+            llm_model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4".to_string()),
+            llm_provider: std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".to_string()),
             llm_base_url: std::env::var("LLM_BASE_URL").unwrap_or_default(),
             max_tokens: std::env::var("MAX_TOKENS")
                 .unwrap_or_else(|_| "4096".to_string())
@@ -96,10 +95,7 @@ impl Agent {
     pub fn new(pool: PgPool, config: AgentConfig, mcp: McpRegistry, ctx: AppContext) -> Self {
         let env_cfg = crate::llm::LLMConfig::from_env();
         let llm_config = crate::llm::LLMConfig {
-            provider: config
-                .llm_provider
-                .parse()
-                .unwrap_or(env_cfg.provider),
+            provider: config.llm_provider.parse().unwrap_or(env_cfg.provider),
             api_key: if config.llm_api_key.is_empty() {
                 env_cfg.api_key
             } else {
@@ -116,7 +112,13 @@ impl Agent {
             temperature: config.temperature,
         };
         let llm = Arc::new(LLMClient::new(llm_config));
-        Self { pool, config, llm, mcp, ctx }
+        Self {
+            pool,
+            config,
+            llm,
+            mcp,
+            ctx,
+        }
     }
 
     /// Run the agent supervisor loop.
@@ -130,10 +132,7 @@ impl Agent {
     ///
     /// The `cancel_tokens` map is shared with the HTTP server so the
     /// `/stop/{channel_id}` endpoint can cancel channel handlers.
-    pub async fn run(
-        self,
-        cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
-    ) {
+    pub async fn run(self, cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>) {
         // Recover any messages stuck in 'processing' for >5 minutes
         if let Err(e) = recover_stale_processing(&self.pool).await {
             error!("Failed to recover stale processing messages: {:?}", e);
@@ -162,10 +161,10 @@ impl Agent {
 
             // Spawn handlers for channels not yet being processed
             for &channel_id in &channel_ids {
-                if !tokens.contains_key(&channel_id) {
+                if let std::collections::hash_map::Entry::Vacant(e) = tokens.entry(channel_id) {
                     let token = CancellationToken::new();
                     let handler_token = token.clone();
-                    tokens.insert(channel_id, token);
+                    e.insert(token);
 
                     let pool = pool.clone();
                     let llm = llm.clone();
@@ -174,13 +173,26 @@ impl Agent {
                     let ctx_clone = ctx.clone();
 
                     tokio::spawn(async move {
-                        channel_handler(pool, llm, config, mcp_clone, ctx_clone, channel_id, handler_token).await;
+                        channel_handler(
+                            pool,
+                            llm,
+                            config,
+                            mcp_clone,
+                            ctx_clone,
+                            channel_id,
+                            handler_token,
+                        )
+                        .await;
                     });
 
                     info!(
                         "Spawned channel handler for channel {} ({})",
                         channel_id,
-                        channels.iter().find(|c| c.id == channel_id).map(|c| c.name.as_str()).unwrap_or("unknown")
+                        channels
+                            .iter()
+                            .find(|c| c.id == channel_id)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("unknown")
                     );
                 }
             }
@@ -190,10 +202,12 @@ impl Agent {
             for &channel_id in &stopped_ids {
                 if let Some(token) = tokens.get(&channel_id) {
                     if !token.is_cancelled() {
-                        if let Ok(Some(_)) =
-                            queries::find_stopped_channel(&pool, channel_id).await
+                        if let Ok(Some(_)) = queries::find_stopped_channel(&pool, channel_id).await
                         {
-                            info!("Channel {} has been stopped, cancelling handler", channel_id);
+                            info!(
+                                "Channel {} has been stopped, cancelling handler",
+                                channel_id
+                            );
                             token.cancel();
                         }
                     }
@@ -306,6 +320,20 @@ async fn channel_handler(
     info!("Channel handler finished for channel {}", channel_id);
 }
 
+/// Merge cumulative usage with a new usage value.
+fn merge_usage(cumulative: &mut Option<Usage>, new_usage: Option<Usage>) {
+    if let Some(new) = new_usage {
+        if let Some(ref mut cum) = cumulative {
+            cum.prompt_tokens += new.prompt_tokens;
+            cum.completion_tokens += new.completion_tokens;
+            cum.cached_tokens = cum.cached_tokens.or(new.cached_tokens);
+            cum.reasoning_tokens = cum.reasoning_tokens.or(new.reasoning_tokens);
+        } else {
+            *cumulative = Some(new);
+        }
+    }
+}
+
 /// Process a single pending message through the state machine:
 ///
 /// 1. Update message status → `processing`
@@ -315,8 +343,8 @@ async fn channel_handler(
 /// 5. If tool calls are returned, execute them and loop back to LLM
 /// 6. If reasoning exists, save as a separate `reasoning` record
 /// 7. Save the main agent response (msg_type: `message`)
-/// 8. Update original message status → `completed`
-/// 9. Record processing_time_ms on the original prompt message
+/// 8. Generate a summary (outside iteration limit)
+/// 9. Update original message status → `completed`, record processing_time_ms + token_usage
 async fn process_message(
     pool: &PgPool,
     llm: &LLMClient,
@@ -331,27 +359,43 @@ async fn process_message(
     queries::update_message_status(pool, msg.id, &MessageStatus::Processing).await?;
 
     // 2. Get current iteration count for this thread
-    let iterations = queries::count_thread_iterations(pool, msg.thread_id).await.unwrap_or(0);
+    let iterations = queries::count_thread_iterations(pool, msg.thread_id)
+        .await
+        .unwrap_or(0);
     let next_iteration = iterations + 1;
 
     // 3. Resolve profile, provider, model for this message
-    let profile_name = if msg.profile.is_empty() { "default".to_string() } else { msg.profile.clone() };
-    let provider_name = msg.provider.clone().or_else(|| Some(config.llm_provider.clone()));
+    let profile_name = if msg.profile.is_empty() {
+        "default".to_string()
+    } else {
+        msg.profile.clone()
+    };
+    let provider_name = msg
+        .provider
+        .clone()
+        .or_else(|| Some(config.llm_provider.clone()));
     let model_name = msg.model.clone().or_else(|| Some(config.llm_model.clone()));
 
     // 4. Build the initial message history
     let mut messages = vec![
         ChatMessage::system(
-            "You are OmniAgent, a helpful AI assistant with access to tools. \
-            When you need to read files, search data, or fetch URLs, use the available tools. \
-            Always use tools to accomplish tasks rather than making up information."
+            "You are OmniAgent, a helpful assistant with filesystem and web tools.\n\
+\n\
+RULES:\n\
+- Read local files with filesystem_read. The tool descriptions tell you exactly which tool does what.\n\
+- Use fetch ONLY for HTTP/HTTPS URLs (web pages, APIs). Never use fetch for local files.\n\
+- Write results with filesystem_write.\n\
+- Read provided files before taking action — understand the task fully.\n\
+- At the end, include a brief summary of what was accomplished.",
         ),
         ChatMessage::user(&msg.content),
     ];
 
     // 5. Get allowed tools for the profile and build tool definitions
     let profile = crate::profile::ProfileRegistry::new(&ctx.data_dir);
-    let prof = profile.get(&profile_name).cloned().unwrap_or_else(|| crate::profile::Profile::default("default", &format!("{}/profiles/default", ctx.data_dir)));
+    let prof = profile.get(&profile_name).cloned().unwrap_or_else(|| {
+        crate::profile::Profile::default("default", &format!("{}/profiles/default", ctx.data_dir))
+    });
     let tools_def = mcp.to_openai_tools(&prof.allowed_tools);
 
     // 6. Tool-calling loop — max iterations controls total LLM calls
@@ -359,14 +403,30 @@ async fn process_message(
     let mut final_content = String::new();
     let mut final_reasoning: Option<String> = None;
     let mut final_tool_call: bool = false;
+    let mut cumulative_usage: Option<Usage> = None;
+    let mut limit_reached: bool = false;
 
-    for _turn in 0..max_llm_calls {
+    for turn in 0..max_llm_calls {
+        let is_last_turn = turn == max_llm_calls - 1;
+        if is_last_turn {
+            // On the final allowed turn, hint to the model that it should
+            // produce a final answer rather than more tool calls.
+            messages.push(ChatMessage::system(
+                "This is your last turn. You must provide your final answer now. \
+                 Do not request additional tool calls.",
+            ));
+        }
+
         let request = CompletionRequest {
             messages: messages.clone(),
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             stream: false,
-            tools: if tools_def.is_empty() { None } else { Some(tools_def.clone()) },
+            tools: if tools_def.is_empty() {
+                None
+            } else {
+                Some(tools_def.clone())
+            },
         };
 
         let response = match llm.completion(request).await {
@@ -378,6 +438,9 @@ async fn process_message(
             }
         };
 
+        // Track cumulative token usage
+        merge_usage(&mut cumulative_usage, response.usage);
+
         // Store reasoning if present
         if response.reasoning.is_some() {
             final_reasoning = response.reasoning.clone();
@@ -388,6 +451,16 @@ async fn process_message(
             // Normal text response — we're done
             final_content = response.content;
             final_tool_call = false;
+            break;
+        }
+
+        // If we've reached the last turn and still got tool calls, force a response
+        if is_last_turn {
+            final_content = "I've completed the requested operations using my available tools, \
+                            but reached the iteration limit. Please check the results above."
+                .to_string();
+            final_tool_call = false;
+            limit_reached = true;
             break;
         }
 
@@ -410,12 +483,18 @@ async fn process_message(
             match result {
                 Ok(res) => {
                     messages.push(ChatMessage::tool_result(
-                        &tc.id, &tc.function.name, &res.content,
+                        &tc.id,
+                        &tc.function.name,
+                        &res.content,
                     ));
                 }
                 Err(e) => {
                     let err_msg = format!("Error executing tool '{}': {}", tc.function.name, e);
-                    messages.push(ChatMessage::tool_result(&tc.id, &tc.function.name, &err_msg));
+                    messages.push(ChatMessage::tool_result(
+                        &tc.id,
+                        &tc.function.name,
+                        &err_msg,
+                    ));
                 }
             }
         }
@@ -427,16 +506,19 @@ async fn process_message(
             "I've completed the requested operations using my available tools.".to_string();
     }
 
-    // 7. Build metadata with usage info
-    let mut metadata = serde_json::json!({});
+    // 7. Serialize cumulative token usage to JSON for storage
+    let token_usage_json = cumulative_usage.as_ref().map(|u| {
+        serde_json::json!({
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "cached_tokens": u.cached_tokens,
+            "reasoning_tokens": u.reasoning_tokens,
+        })
+    });
 
     // 8. If reasoning/thinking exists, save as its own record
     if let Some(ref reasoning_text) = final_reasoning {
         if !reasoning_text.is_empty() {
-            let reasoning_metadata = match metadata.get("usage") {
-                Some(u) => serde_json::json!({"usage": u}),
-                None => serde_json::json!({}),
-            };
             let reasoning_msg = MessageNew {
                 channel_id: msg.channel_id,
                 role: "agent".to_string(),
@@ -445,7 +527,7 @@ async fn process_message(
                 thread_id: msg.thread_id,
                 thread_sequence: msg.thread_sequence + 1,
                 external_id: None,
-                metadata: reasoning_metadata,
+                metadata: serde_json::json!({}),
                 embedding: None,
                 summary_text: None,
                 is_summary: false,
@@ -456,6 +538,7 @@ async fn process_message(
                 provider: provider_name.clone(),
                 model: model_name.clone(),
                 processing_time_ms: None,
+                token_usage: token_usage_json.clone(),
             };
             queries::create_message(pool, &reasoning_msg).await?;
         }
@@ -470,7 +553,7 @@ async fn process_message(
         thread_id: msg.thread_id,
         thread_sequence: msg.thread_sequence + 1,
         external_id: None,
-        metadata,
+        metadata: serde_json::json!({}),
         embedding: None,
         summary_text: None,
         is_summary: false,
@@ -481,16 +564,84 @@ async fn process_message(
         provider: provider_name.clone(),
         model: model_name.clone(),
         processing_time_ms: None,
+        token_usage: token_usage_json.clone(),
     };
 
     let saved = queries::create_message(pool, &agent_msg).await?;
 
-    // 10. Record processing time on the original prompt
+    // 10. Generate a summary (outside the iteration limit)
+    // Include the conversation context for the summarizer
+    let mut summary_msgs = messages.clone();
+    if limit_reached {
+        summary_msgs.push(ChatMessage::system(&format!(
+            "The iteration limit of {limit} was reached so the response may be incomplete. \
+             Mention if the user needs to provide additional input or clarification. \
+             Now summarize what was accomplished.",
+            limit = max_llm_calls,
+        )));
+    } else {
+        summary_msgs.push(ChatMessage::system("Now summarize what was accomplished."));
+    }
+
+    let summary_request = CompletionRequest {
+        messages: summary_msgs,
+        max_tokens: 512,
+        temperature: 0.3,
+        stream: false,
+        tools: None,
+    };
+
+    let summary_text = match llm.completion(summary_request).await {
+        Ok(resp) => {
+            merge_usage(&mut cumulative_usage, resp.usage);
+            resp.content
+        }
+        Err(e) => {
+            warn!("Failed to generate summary: {:?}", e);
+            format!("Summary generation failed: {}", e)
+        }
+    };
+
+    // 11. Save the summary as its own record
+    let summary_token_usage = cumulative_usage.as_ref().map(|u| {
+        serde_json::json!({
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "cached_tokens": u.cached_tokens,
+            "reasoning_tokens": u.reasoning_tokens,
+        })
+    });
+
+    let summary_msg = MessageNew {
+        channel_id: msg.channel_id,
+        role: "agent".to_string(),
+        content: summary_text,
+        status: MessageStatus::Completed,
+        thread_id: msg.thread_id,
+        thread_sequence: msg.thread_sequence + 2, // after reasoning (1) and message (1)
+        external_id: None,
+        metadata: serde_json::json!({}),
+        embedding: None,
+        summary_text: None,
+        is_summary: false,
+        msg_type: "summary".to_string(),
+        msg_subtype: None,
+        iteration_count: next_iteration,
+        profile: profile_name.clone(),
+        provider: provider_name.clone(),
+        model: model_name.clone(),
+        processing_time_ms: None,
+        token_usage: summary_token_usage.clone(),
+    };
+    let _ = queries::create_message(pool, &summary_msg).await;
+
+    // 12. Record processing time and cumulative token usage on the original prompt
     let elapsed_ms = start_time.elapsed().as_millis() as i32;
     let _ = sqlx::query(
-        "UPDATE messages SET processing_time_ms = $1, status = 'completed' WHERE id = $2 AND status = 'processing'",
+        "UPDATE messages SET processing_time_ms = $1, token_usage = $2, status = 'completed' WHERE id = $3 AND status = 'processing'",
     )
     .bind(elapsed_ms)
+    .bind(&summary_token_usage)
     .bind(msg.id)
     .execute(pool)
     .await;

@@ -402,6 +402,44 @@ pub async fn delete_old_messages(
     Ok(result.rows_affected())
 }
 
+/// Find messages where embedding IS NULL, ordered by created_at, with a limit.
+/// Only returns messages with role='user' or role='agent'.
+pub async fn find_messages_without_embeddings(
+    pool: &PgPool,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::vectorizer::MessageEmbeddingRow>> {
+    let rows: Vec<crate::vectorizer::MessageEmbeddingRow> = sqlx::query_as(
+        r#"
+        SELECT id, content
+        FROM messages
+        WHERE embedding IS NULL
+          AND role IN ('user', 'agent')
+        ORDER BY created_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Update the embedding column for a given message.
+pub async fn update_message_embedding(
+    pool: &PgPool,
+    message_id: i64,
+    embedding_string: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE messages SET embedding = $1 WHERE id = $2")
+        .bind(embedding_string)
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 #[expect(dead_code)]
 pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Option<Channel>> {
     let row: Option<ChannelDb> = sqlx::query_as(

@@ -15,6 +15,7 @@ mod platform;
 mod profile;
 mod prompt_builder;
 mod server;
+mod vectorizer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -82,8 +83,9 @@ async fn main() -> Result<()> {
     let pool_server = pool.clone();
     let server_host = cfg.host.clone();
     let server_port = cfg.port;
+    let data_dir_server = data_dir.clone();
     let server_handle = tokio::spawn(async move {
-        server::start_server(pool_server, server_host, server_port, cancel_tokens_server, data_dir).await;
+        server::start_server(pool_server, server_host, server_port, cancel_tokens_server, data_dir_server).await;
     });
 
     tracing::info!(
@@ -118,6 +120,12 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Spawn vectorization workers if enabled
+    let pool_vectorizer = pool.clone();
+    let vectorizer_handle = tokio::spawn(async move {
+        vectorizer::spawn_vectorizers(pool_vectorizer, &cfg, &data_dir).await;
+    });
+
     // Graceful shutdown
     tokio::select! {
         _ = agent_handle => {
@@ -128,6 +136,9 @@ async fn main() -> Result<()> {
         }
         _ = cleanup_handle => {
             tracing::info!("Cleanup finished");
+        }
+        _ = vectorizer_handle => {
+            tracing::info!("Vectorizer finished");
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down...");

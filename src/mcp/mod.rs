@@ -161,5 +161,8 @@ pub fn default_registry(ctx: &AppContext) -> McpRegistry {
     registry.register(tools::search::search_messages_tool(ctx));
     registry.register(tools::search::search_wiki_tool(ctx));
 
+    // Skill creation tool
+    registry.register(tools::skills::create_skill_tool());
+
     registry
 }

@@ -239,6 +239,78 @@ src/
 - **Channel handlers**: One tokio task per channel, polls every 1s
 - **HTTP server**: Axum on separate task
 - **Message cleanup**: Background task runs daily
+- **Vectorization workers**: Background tasks for embedding messages + wiki
 - **Graceful shutdown**: tokio::select! over all tasks + Ctrl+C
 
 The agent uses `CancellationToken` per channel — calling the `/stop/{channel_id}` HTTP endpoint cancels that channel's handler.
+
+## Backup Container
+
+A standalone `backup` container (in `backup/` directory) provides S3 data durability independent of the agent.
+
+### Dockerfile
+
+```dockerfile
+FROM alpine:latest
+RUN apk add --no-cache rclone dcron bash tini
+```
+
+Uses `tini` as PID 1 to handle signals and zombie reaping. The entrypoint generates an rclone config from S3 environment variables and starts crond (Dillon's cron daemon, foreground mode with `-f -l 2 -L /dev/stdout`).
+
+### Scripts (`backup/scripts/`)
+
+| Script | Installed as | Function |
+|--------|-------------|----------|
+| `backup.sh` | `/usr/bin/backup` | Syncs `/opt/data/` to `S3_BUCKET/S3_PATH/data/` via rclone |
+| `checkpoint.sh` | `/usr/bin/checkpoint` | Syncs `/opt/data/` to `S3_BUCKET/S3_PATH/checkpoint/YYYYMMDD/` |
+| `restore_backup.sh` | `/usr/bin/restore_backup` | Syncs from `S3_BUCKET/S3_PATH/data/` to `/opt/data/` |
+| `restore_checkpoint.sh` | `/usr/bin/restore_checkpoint` | Syncs from a specific checkpoint to `/opt/data/` |
+| `entrypoint.sh` | `/entrypoint.sh` | Generates rclone config, installs crontab, starts crond |
+
+### rclone Configuration
+
+The entrypoint writes an rclone config at `/etc/rclone/rclone.conf` with a remote named `s3-backup`:
+
+```
+[s3-backup]
+type = s3
+provider = Other
+access_key_id = ${S3_ACCESS_KEY}
+secret_access_key = ${S3_SECRET_KEY}
+endpoint = ${S3_ENDPOINT}
+region = ${S3_REGION}
+```
+
+All scripts reference this config via `RCLONE_CONFIG=/etc/rclone/rclone.conf`.
+
+### Environment (`backup.env`, NOT git-versioned)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_ENDPOINT` | — | S3-compatible endpoint URL |
+| `S3_REGION` | — | S3 region |
+| `S3_BUCKET` | — | S3 bucket name |
+| `S3_PATH` | `omni` | Path prefix in the bucket |
+| `S3_ACCESS_KEY` | — | S3 access key ID |
+| `S3_SECRET_KEY` | — | S3 secret access key |
+| `CRON_BACKUP` | `"0 5 * * *"` | Cron schedule for daily backups (empty = disabled) |
+| `CRON_CHECKPOINT` | `"0 3 * * 0"` | Cron schedule for weekly checkpoints (empty = disabled) |
+
+### Cron Integration
+
+The entrypoint dynamically generates the crontab from `CRON_BACKUP` and `CRON_CHECKPOINT`. Each cron command sets `RCLONE_CONFIG` and logs to `/var/log/backup.log` or `/var/log/checkpoint.log`. If a variable is empty, that schedule is omitted from the crontab.
+
+### Agent-Agnostic Design
+
+The backup container does not depend on the omniagent service. It only needs:
+- `./data:/opt/data:rw` volume mount
+- `backup.env` with valid S3 credentials
+- Network access to the S3 endpoint
+
+This allows restoring data onto a fresh machine before the agent is even built. Commands can be run imperatively:
+
+```bash
+# On a fresh machine with data/ empty:
+docker compose run --rm backup restore_backup
+docker compose up -d
+```

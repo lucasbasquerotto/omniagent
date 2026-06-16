@@ -1,15 +1,12 @@
 use anyhow::Result;
-use pgvector::Vector;
 use sqlx::PgPool;
-use std::str::FromStr;
-use uuid::Uuid;
 
-use crate::models::{Channel, Message, MessageNew, MessageStatus};
+use crate::models::{Channel, ChannelStop, Message, MessageNew, MessageStatus};
 
 /// Find the oldest pending messages for a channel, ordered by created_at.
 pub async fn find_pending_messages(
     pool: &PgPool,
-    channel_id: Uuid,
+    channel_id: i64,
 ) -> Result<Vec<Message>> {
     let rows = sqlx::query_as::<_, Message>(
         r#"
@@ -23,7 +20,7 @@ pub async fn find_pending_messages(
             thread_sequence,
             external_id,
             metadata,
-            embedding::text AS embedding,
+            embedding,
             summary_text,
             is_summary,
             created_at
@@ -41,11 +38,6 @@ pub async fn find_pending_messages(
 
 /// Insert a new message into the database.
 pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> Result<Message> {
-    let embedding_sql: Option<Vector> = match &msg.embedding {
-        Some(s) => Some(Vector::from_str(s)?),
-        None => None,
-    };
-
     let row = sqlx::query_as::<_, Message>(
         r#"
         INSERT INTO messages (
@@ -64,7 +56,7 @@ pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> Result<Message> 
             thread_sequence,
             external_id,
             metadata,
-            embedding::text AS embedding,
+            embedding,
             summary_text,
             is_summary,
             created_at
@@ -78,7 +70,7 @@ pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> Result<Message> 
     .bind(msg.thread_sequence)
     .bind(&msg.external_id)
     .bind(&msg.metadata)
-    .bind(embedding_sql)
+    .bind(&msg.embedding)
     .bind(&msg.summary_text)
     .bind(msg.is_summary)
     .fetch_one(pool)
@@ -90,7 +82,7 @@ pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> Result<Message> 
 /// Update the status of a message by its id.
 pub async fn update_message_status(
     pool: &PgPool,
-    id: Uuid,
+    id: i64,
     status: &MessageStatus,
 ) -> Result<()> {
     sqlx::query("UPDATE messages SET status = $1 WHERE id = $2")
@@ -166,7 +158,7 @@ pub async fn find_processing_older_than(
             thread_sequence,
             external_id,
             metadata,
-            embedding::text AS embedding,
+            embedding,
             summary_text,
             is_summary,
             created_at
@@ -217,4 +209,97 @@ pub async fn create_channel(
     .await?;
 
     Ok(row)
+}
+
+/// Find a stopped channel by its channel_id.
+pub async fn find_stopped_channel(
+    pool: &PgPool,
+    channel_id: i64,
+) -> Result<Option<ChannelStop>> {
+    let row = sqlx::query_as::<_, ChannelStop>(
+        r#"
+        SELECT id, channel_id, stopped_at
+        FROM channel_stops
+        WHERE channel_id = $1
+        "#,
+    )
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// Stop a channel — insert or update the channel_stops entry.
+///
+/// If the channel is already stopped, its `stopped_at` timestamp is refreshed.
+pub async fn stop_channel(pool: &PgPool, channel_id: i64) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO channel_stops (channel_id)
+        VALUES ($1)
+        ON CONFLICT (channel_id) DO UPDATE SET stopped_at = NOW()
+        "#,
+    )
+    .bind(channel_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Clear a channel stop — remove the entry from channel_stops.
+///
+/// After this, new pending messages for this channel will be processed again.
+pub async fn clear_channel_stop(pool: &PgPool, channel_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM channel_stops WHERE channel_id = $1")
+        .bind(channel_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+/// Skip all pending messages for a channel by marking them as `skipped`.
+///
+/// Returns the number of messages that were skipped.
+pub async fn skip_pending_messages(pool: &PgPool, channel_id: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE messages SET status = 'skipped' WHERE channel_id = $1 AND status = 'pending'",
+    )
+    .bind(channel_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Delete messages created before the given timestamp.
+///
+/// Returns the number of rows deleted.
+pub async fn delete_old_messages(
+    pool: &PgPool,
+    before: chrono::DateTime<chrono::Utc>,
+) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM messages WHERE created_at < $1")
+        .bind(before)
+        .execute(pool)
+        .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Find all stopped channels, ordered by most recently stopped first.
+pub async fn find_all_stopped_channels(pool: &PgPool) -> Result<Vec<ChannelStop>> {
+    let rows = sqlx::query_as::<_, ChannelStop>(
+        r#"
+        SELECT id, channel_id, stopped_at
+        FROM channel_stops
+        ORDER BY stopped_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }

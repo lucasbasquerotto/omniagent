@@ -1,19 +1,17 @@
-# Stage 1: Build
+# Stage 1: Build (or use pre-built binary)
 FROM rust:latest AS builder
 
 WORKDIR /app
 
-# Copy only Cargo.toml and Cargo.lock first for dependency caching
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release 2>/dev/null || true
 RUN rm -rf src
 
-# Copy actual source
 COPY src/ ./src/
 
-# Build the actual binary
-RUN cargo build --release
+# Force rebuild by touching every source file
+RUN find src/ -name '*.rs' -exec touch {} + && cargo build --release
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim AS runtime
@@ -29,5 +27,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/omniagent /app/omniagent
 
 USER root
+
+EXPOSE 8080
 
 CMD ["/app/omniagent"]

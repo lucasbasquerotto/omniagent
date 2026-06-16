@@ -6,7 +6,6 @@
 use async_trait::async_trait;
 use anyhow::Result;
 use sqlx::PgPool;
-use uuid::Uuid;
 
 /// A platform that can receive messages from external sources and send
 /// responses back to them.
@@ -31,7 +30,7 @@ pub trait Platform: Send + Sync {
     /// The `message_id` refers to the agent's response message stored in the
     /// database. The platform should look up the message and deliver it to
     /// the appropriate external destination.
-    async fn send_response(&self, pool: &PgPool, message_id: Uuid) -> Result<()>;
+    async fn send_response(&self, pool: &PgPool, message_id: i64) -> Result<()>;
 }
 
 /// Registry that holds all registered platform implementations.
@@ -105,7 +104,7 @@ impl Platform for TelegramPlatform {
         Ok(())
     }
 
-    async fn send_response(&self, _pool: &PgPool, _message_id: Uuid) -> Result<()> {
+    async fn send_response(&self, _pool: &PgPool, _message_id: i64) -> Result<()> {
         tracing::warn!("Telegram platform send_response not yet implemented");
         Ok(())
     }

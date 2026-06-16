@@ -1,11 +1,17 @@
 use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 mod agent;
 mod config;
 mod db;
+mod llm;
 mod models;
 mod platform;
+mod server;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,7 +27,7 @@ async fn main() -> Result<()> {
 
     // Load base configuration
     let cfg = config::Config::from_env()?;
-    tracing::info!("Configuration loaded: {:?}", cfg);
+    tracing::info!("Configuration loaded");
 
     // Connect to PostgreSQL
     let pool = db::connect(&cfg.database_url).await?;
@@ -29,9 +35,9 @@ async fn main() -> Result<()> {
 
     // Run migrations
     db::migrations::run(&pool).await?;
-    tracing::info!("Database migrations completed successfully");
+    tracing::info!("Database migrations completed");
 
-    // Create agent config from environment
+    // Build agent config from environment
     let agent_cfg = agent::AgentConfig::from_env()?;
     tracing::info!(
         "Agent config — model: {}, provider: {}, max_tokens: {}, temperature: {}",
@@ -44,26 +50,72 @@ async fn main() -> Result<()> {
     // Build the agent
     let agent = agent::Agent::new(pool.clone(), agent_cfg);
 
+    // Shared cancellation tokens for /stop endpoint
+    let cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let cancel_tokens_agent = cancel_tokens.clone();
+    let cancel_tokens_server = cancel_tokens.clone();
+
+    // Spawn the agent supervisor (parallel channel processing)
+    let agent_handle = tokio::spawn(async move {
+        agent.run(cancel_tokens_agent).await;
+    });
+
     // Create platform registry and register built-in platforms
     let mut registry = platform::PlatformRegistry::new();
     registry.register(Box::new(platform::TelegramPlatform::new()));
-
-    // Start all platform listener tasks
     let _platform_handles = registry.start_all(pool.clone());
 
-    // Spawn the agent loop as a concurrent task
-    let agent_handle = tokio::spawn(async move {
-        if let Err(e) = agent.run().await {
-            tracing::error!("Agent loop exited with error: {:?}", e);
+    // Spawn HTTP server (health, /stop endpoint)
+    let pool_server = pool.clone();
+    let server_host = cfg.host.clone();
+    let server_port = cfg.port;
+    let server_handle = tokio::spawn(async move {
+        server::start_server(pool_server, server_host, server_port, cancel_tokens_server).await;
+    });
+
+    tracing::info!(
+        "OmniAgent is ready! HTTP server on {}:{}",
+        cfg.host,
+        cfg.port
+    );
+
+    // Spawn old-message deletion task (daily cleanup)
+    let pool_clean = pool.clone();
+    let delete_after_days = std::env::var("DELETE_AFTER_DAYS")
+        .unwrap_or_else(|_| "30".to_string())
+        .parse::<u32>()
+        .unwrap_or(30);
+    let cleanup_handle = tokio::spawn(async move {
+        let interval = tokio::time::Duration::from_secs(86400); // daily
+        loop {
+            tokio::time::sleep(interval).await;
+            let before = chrono::Utc::now() - chrono::Duration::days(delete_after_days as i64);
+            match db::queries::delete_old_messages(&pool_clean, before).await {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(
+                            "Deleted {} messages older than {} days",
+                            count,
+                            delete_after_days
+                        );
+                    }
+                }
+                Err(e) => tracing::error!("Failed to delete old messages: {:?}", e),
+            }
         }
     });
 
-    tracing::info!("OmniAgent is ready! Waiting for messages...");
-
-    // Graceful shutdown on Ctrl+C
+    // Graceful shutdown
     tokio::select! {
         _ = agent_handle => {
             tracing::info!("Agent loop finished");
+        }
+        _ = server_handle => {
+            tracing::info!("Server finished");
+        }
+        _ = cleanup_handle => {
+            tracing::info!("Cleanup finished");
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down...");

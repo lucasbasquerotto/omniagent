@@ -2,16 +2,26 @@ use anyhow::Result;
 use sqlx::PgPool;
 
 pub async fn run(pool: &PgPool) -> Result<()> {
-    // Enable pgvector extension FIRST
-    sqlx::query("CREATE EXTENSION IF NOT EXISTS vector;")
-        .execute(pool)
-        .await?;
+    // Enable pgvector extension — wrapped in DO block so it doesn't fail
+    // if pgvector isn't installed (optional vector support).
+    sqlx::query(
+        r#"
+        DO $$ BEGIN
+            CREATE EXTENSION IF NOT EXISTS vector;
+        EXCEPTION
+            WHEN OTHERS THEN
+                -- vector extension not available, continue without it
+        END $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     // Create channels table
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS channels (
-            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            id          BIGSERIAL PRIMARY KEY,
             name        TEXT NOT NULL,
             platform    TEXT NOT NULL,
             external_id TEXT NOT NULL,
@@ -30,21 +40,35 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS messages (
-            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            channel_id      UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            id              BIGSERIAL PRIMARY KEY,
+            channel_id      BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
             role            TEXT NOT NULL,
             content         TEXT NOT NULL,
             status          TEXT NOT NULL DEFAULT 'pending',
-            thread_id       UUID NOT NULL,
+            thread_id       BIGINT NOT NULL,
             thread_sequence INT NOT NULL,
             external_id     TEXT,
             metadata        JSONB DEFAULT '{}',
-            embedding       vector(1536),
+            embedding       TEXT,
             summary_text    TEXT,
             is_summary      BOOL NOT NULL DEFAULT false,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(channel_id, external_id),
             UNIQUE(thread_id, thread_sequence)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Create channel_stops table for tracking stopped/paused channels
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS channel_stops (
+            id          BIGSERIAL PRIMARY KEY,
+            channel_id  BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            stopped_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(channel_id)
         );
         "#,
     )

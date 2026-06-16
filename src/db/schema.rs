@@ -7,12 +7,12 @@
 //
 // Stores communication channels (e.g., Telegram group/channel, cron jobs).
 //
-//  id          UUID PRIMARY KEY DEFAULT gen_random_uuid()
-//  name        TEXT NOT NULL            -- e.g. "user-lucas", "cron-daily-backup"
-//  platform    TEXT NOT NULL            -- e.g. "telegram", "cron"
-//  external_id TEXT NOT NULL            -- e.g. Telegram chat ID
-//  cause       TEXT NOT NULL            -- 'user' or 'cron'
-//  metadata    JSONB DEFAULT '{}'       -- arbitrary metadata
+//  id          BIGSERIAL PRIMARY KEY        -- auto-incrementing
+//  name        TEXT NOT NULL                -- e.g. "user-lucas", "cron-daily-backup"
+//  platform    TEXT NOT NULL                -- e.g. "telegram", "cron"
+//  external_id TEXT NOT NULL                -- e.g. Telegram chat ID
+//  cause       TEXT NOT NULL                -- 'user' or 'cron'
+//  metadata    JSONB DEFAULT '{}'           -- arbitrary metadata
 //  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //
@@ -23,23 +23,37 @@
 // Stores messages received across channels, including agent replies and tool
 // calls. Messages are grouped into threads for conversation tracking.
 //
-//  id               UUID PRIMARY KEY DEFAULT gen_random_uuid()
-//  channel_id       UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE
-//  role             TEXT NOT NULL       -- 'user', 'agent', 'system', 'tool'
-//  content          TEXT NOT NULL       -- message body
+//  id               BIGSERIAL PRIMARY KEY           -- auto-incrementing
+//  channel_id       BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE
+//  role             TEXT NOT NULL                   -- 'user', 'agent', 'system', 'tool'
+//  content          TEXT NOT NULL                   -- message body
 //  status           TEXT NOT NULL DEFAULT 'pending'
-//                                      -- 'pending', 'processing', 'completed', 'failed'
-//  thread_id        UUID NOT NULL      -- groups related messages
-//  thread_sequence  INT NOT NULL       -- order within thread
-//  external_id      TEXT               -- e.g. Telegram message ID
-//  metadata         JSONB DEFAULT '{}' -- arbitrary metadata
-//  embedding        vector(1536)       -- pgvector embedding vector
-//  summary_text     TEXT               -- cached summary of the message
+//                                                   -- 'pending', 'processing', 'completed',
+//                                                   -- 'failed', 'skipped'
+//  thread_id        BIGINT NOT NULL                 -- groups related messages (sequential)
+//  thread_sequence  INT NOT NULL                    -- order within thread
+//  external_id      TEXT                            -- e.g. Telegram message ID
+//  metadata         JSONB DEFAULT '{}'              -- arbitrary metadata
+//  embedding        TEXT                            -- embedding vector as text; cast to
+//                                                   -- vector(1536) at query time if the
+//                                                   -- pgvector extension is available
+//  summary_text     TEXT                            -- cached summary of the message
 //  is_summary       BOOL NOT NULL DEFAULT false
 //  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 //
 //  UNIQUE(channel_id, external_id)
 //  UNIQUE(thread_id, thread_sequence)
+//
+// ── channel_stops ─────────────────────────────────────────────────────────
+//
+// Tracks channels that have been stopped (paused). When a channel is stopped,
+// new pending messages are not processed until the stop is cleared.
+//
+//  id          BIGSERIAL PRIMARY KEY
+//  channel_id  BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE
+//  stopped_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//
+//  UNIQUE(channel_id)
 //
 // ── Indexes ───────────────────────────────────────────────────────────────
 //
@@ -49,5 +63,6 @@
 // ── Extension ─────────────────────────────────────────────────────────────
 //
 //  pgvector (CREATE EXTENSION vector) — provides vector(1536) type for
-//  embedding storage and similarity search.
+//  embedding storage and similarity search. Optional; the DO block in
+//  migrations gracefully handles absence.
 //

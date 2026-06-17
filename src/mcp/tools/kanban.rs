@@ -1,6 +1,7 @@
 use crate::mcp::{AppContext, McpTool, McpToolResult};
 use anyhow::Result;
 use serde_json::Value;
+use sql_forge::sql_forge;
 use std::sync::Arc;
 
 pub fn create_kanban_task_tool() -> McpTool {
@@ -68,18 +69,13 @@ pub fn create_kanban_task_tool() -> McpTool {
                             .as_nanos()
                     });
 
-                    sqlx::query(
+                    sql_forge!(
                         r#"
                         INSERT INTO kanban_tasks (id, title, body, status, priority, assignee)
-                        VALUES ($1, $2, $3, $4, $5, $6)
+                        VALUES (:id, :title, :body, :status, :priority, :assignee)
                         "#,
+                        ( :id = &id, :title = title, :body = body, :status = status, :priority = priority, :assignee = assignee )
                     )
-                    .bind(&id)
-                    .bind(title)
-                    .bind(body)
-                    .bind(status)
-                    .bind(priority)
-                    .bind(assignee)
                     .execute(&pool)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create kanban task: {}", e))?;
@@ -117,7 +113,7 @@ pub fn list_kanban_tasks_tool() -> McpTool {
                 handle.block_on(async {
                     if let Some(ref status) = status_filter {
                         sqlx::query_as::<_, (String, String, Option<String>, String, i32, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-                            "SELECT id, title, body, status, priority, assignee, created_at, updated_at FROM kanban_tasks WHERE status = $1 ORDER BY priority DESC, created_at DESC"
+                            "SELECT id, title, body, status, priority, assignee, created_at, updated_at FROM kanban_tasks WHERE status = $1 ORDER BY priority DESC, created_at DESC",
                         )
                         .bind(status)
                         .fetch_all(&pool)
@@ -125,7 +121,7 @@ pub fn list_kanban_tasks_tool() -> McpTool {
                         .map_err(|e| anyhow::anyhow!("Failed to list kanban tasks: {}", e))
                     } else {
                         sqlx::query_as::<_, (String, String, Option<String>, String, i32, Option<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
-                            "SELECT id, title, body, status, priority, assignee, created_at, updated_at FROM kanban_tasks ORDER BY status, priority DESC, created_at DESC"
+                            "SELECT id, title, body, status, priority, assignee, created_at, updated_at FROM kanban_tasks ORDER BY status, priority DESC, created_at DESC",
                         )
                         .fetch_all(&pool)
                         .await
@@ -207,10 +203,11 @@ pub fn update_kanban_task_tool() -> McpTool {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     // Check task exists
-                    let exists: bool = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM kanban_tasks WHERE id = $1"
+                    let exists: bool = sql_forge!(
+                        scalar i64,
+                        "SELECT COUNT(*) FROM kanban_tasks WHERE id = :id",
+                        ( :id = &id_clone )
                     )
-                    .bind(&id_clone)
                     .fetch_one(&pool)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to check task existence: {}", e))?
@@ -255,7 +252,6 @@ pub fn update_kanban_task_tool() -> McpTool {
                     if args.get("assignee").is_some() {
                         set_clauses.push(format!("assignee = ${}", param_idx));
                         params.push(args["assignee"].clone());
-                        param_idx += 1;
                     }
 
                     if set_clauses.is_empty() {
@@ -269,7 +265,7 @@ pub fn update_kanban_task_tool() -> McpTool {
                         set_clauses.join(", ")
                     );
 
-                    let mut query = sqlx::query(&sql).bind(&id_clone);
+                    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&id_clone);
                     for p in &params {
                         if let Some(s) = p.as_str() {
                             query = query.bind(s);
@@ -325,11 +321,13 @@ pub fn delete_kanban_task_tool() -> McpTool {
             let deleted = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
-                    sqlx::query("DELETE FROM kanban_tasks WHERE id = $1")
-                        .bind(&id_clone)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to delete kanban task: {}", e))
+                    sql_forge!(
+                        "DELETE FROM kanban_tasks WHERE id = :id",
+                        ( :id = &id_clone )
+                    )
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to delete kanban task: {}", e))
                 })
             })?;
 

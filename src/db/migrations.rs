@@ -203,6 +203,7 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         CREATE TABLE IF NOT EXISTS cron_jobs (
             id          TEXT PRIMARY KEY,
             name        TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
             schedule    TEXT NOT NULL,
             prompt      TEXT NOT NULL DEFAULT '',
             skills      TEXT DEFAULT '[]',
@@ -211,6 +212,26 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             next_run_at TIMESTAMP WITH TIME ZONE,
             created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Add display_name if it doesn't exist (for existing tables)
+    sqlx::query(
+        r#"
+        ALTER TABLE cron_jobs
+        ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Add running flag for atomic concurrency guard
+    sqlx::query(
+        r#"
+        ALTER TABLE cron_jobs
+        ADD COLUMN IF NOT EXISTS running BOOLEAN NOT NULL DEFAULT false
         "#,
     )
     .execute(pool)

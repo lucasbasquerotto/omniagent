@@ -1,22 +1,27 @@
 use crate::mcp::{AppContext, McpTool, McpToolResult};
 use anyhow::Result;
 use serde_json::Value;
+use sql_forge::sql_forge;
 use std::sync::Arc;
 
 pub fn create_cron_job_tool() -> McpTool {
     McpTool {
         name: "create_cron_job".to_string(),
-        description: "Create a new cron job. Schedules a recurring task with a cron expression and a prompt to execute.".to_string(),
+        description: "Create a new cron job. Schedules a recurring task with a cron expression and a prompt to execute. Provide a unique short name (lowercase, underscores, no spaces) as 'name', and optionally a human-readable 'display_name'.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "A unique name for this cron job (lowercase, hyphens/underscores)"
+                    "description": "A unique short name for this cron job (lowercase, underscores, no spaces). Example: 'hourly-message-count'"
+                },
+                "display_name": {
+                    "type": "string",
+                    "description": "Optional human-readable display name. Example: 'Hourly Message Count'. If omitted, the name is used as display_name."
                 },
                 "schedule": {
                     "type": "string",
-                    "description": "Cron schedule expression (e.g., '0 9 * * 1-5' for weekdays at 9am, '0 */6 * * *' every 6 hours)"
+                    "description": "Cron schedule expression in 7-field quartz format (sec min hour day month weekday year). Examples: '0 0 9 * * 1-5 *' for weekdays at 9am, '0 0 * * * * *' every hour"
                 },
                 "prompt": {
                     "type": "string",
@@ -42,7 +47,10 @@ pub fn create_cron_job_tool() -> McpTool {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'prompt'"))?;
 
+            let display_name = args["display_name"].as_str().unwrap_or(name);
             let skills_str = args["skills"].as_str().unwrap_or("");
+            let display_name_owned = display_name.to_string();
+            let name_owned = name.to_string();
 
             if name.is_empty() {
                 anyhow::bail!("Job name must not be empty");
@@ -80,17 +88,13 @@ pub fn create_cron_job_tool() -> McpTool {
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
-                    sqlx::query(
+                    sql_forge!(
                         r#"
-                        INSERT INTO cron_jobs (id, name, schedule, prompt, skills)
-                        VALUES ($1, $2, $3, $4, $5::text::jsonb)
+                        INSERT INTO cron_jobs (id, name, display_name, schedule, prompt, skills)
+                        VALUES (:id, :name, :display_name, :schedule, :prompt, :skills)
                         "#,
+                        ( :id = &id, :name = &name_owned, :display_name = &display_name_owned, :schedule = schedule, :prompt = prompt, :skills = skills_json.to_string() )
                     )
-                    .bind(&id)
-                    .bind(name)
-                    .bind(schedule)
-                    .bind(prompt)
-                    .bind(skills_json.to_string())
                     .execute(&pool)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create cron job: {}", e))?;
@@ -114,7 +118,8 @@ pub fn create_cron_job_tool() -> McpTool {
 pub fn list_cron_jobs_tool() -> McpTool {
     McpTool {
         name: "list_cron_jobs".to_string(),
-        description: "List all cron jobs with their schedule, status, and last/next run times.".to_string(),
+        description: "List all cron jobs with their schedule, status, and last/next run times."
+            .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {}
@@ -126,7 +131,7 @@ pub fn list_cron_jobs_tool() -> McpTool {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     sqlx::query_as::<_, (String, String, String, String, bool, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)>(
-                        "SELECT id, name, schedule, prompt, enabled, last_run_at, next_run_at, created_at FROM cron_jobs ORDER BY created_at DESC"
+                        "SELECT id, name, schedule, prompt, enabled, last_run_at, next_run_at, created_at FROM cron_jobs ORDER BY created_at DESC",
                     )
                     .fetch_all(&pool)
                     .await
@@ -137,7 +142,16 @@ pub fn list_cron_jobs_tool() -> McpTool {
             let jobs: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(
-                    |(id, name, schedule, prompt, enabled, last_run_at, next_run_at, created_at)| {
+                    |(
+                        id,
+                        name,
+                        schedule,
+                        prompt,
+                        enabled,
+                        last_run_at,
+                        next_run_at,
+                        created_at,
+                    )| {
                         serde_json::json!({
                             "id": id,
                             "name": name,
@@ -191,11 +205,13 @@ pub fn delete_cron_job_tool() -> McpTool {
             let deleted = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
-                    sqlx::query("DELETE FROM cron_jobs WHERE id = $1")
-                        .bind(&id_clone)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to delete cron job: {}", e))
+                    sql_forge!(
+                        "DELETE FROM cron_jobs WHERE id = :id",
+                        ( :id = &id_clone )
+                    )
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to delete cron job: {}", e))
                 })
             })?;
 

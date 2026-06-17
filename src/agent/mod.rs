@@ -133,11 +133,6 @@ impl Agent {
     /// The `cancel_tokens` map is shared with the HTTP server so the
     /// `/stop/{channel_id}` endpoint can cancel channel handlers.
     pub async fn run(self, cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>) {
-        // Recover any messages stuck in 'processing' for >5 minutes
-        if let Err(e) = recover_stale_processing(&self.pool).await {
-            error!("Failed to recover stale processing messages: {:?}", e);
-        }
-
         let pool = self.pool;
         let llm = self.llm;
         let config = self.config;
@@ -308,6 +303,41 @@ async fn channel_handler(
 
                     if let Err(e) = process_message(&pool, &llm, &config, &mcp, &ctx, msg).await {
                         error!("Failed to process message {}: {:?}", msg.id, e);
+                        // Report error as a message in the same thread
+                        let err_msg = MessageNew {
+                            channel_id: msg.channel_id,
+                            role: "system".to_string(),
+                            content: format!(
+                                "Error processing message {}: {}",
+                                msg.id, e
+                            ),
+                            status: MessageStatus::Completed,
+                            thread_id: msg.thread_id,
+                            thread_sequence: msg.thread_sequence + 1,
+                            external_id: Some(format!("error:{}:{}", msg.id, chrono::Utc::now().timestamp())),
+                            metadata: serde_json::json!({
+                                "error_type": "processing",
+                                "original_msg_id": msg.id,
+                            }),
+                            embedding: None,
+                            summary_text: None,
+                            is_summary: false,
+                            msg_type: "tool".to_string(),
+                            msg_subtype: Some("error".to_string()),
+                            iteration_count: 0,
+                            profile: msg.profile.clone(),
+                            provider: None,
+                            model: None,
+                            processing_time_ms: None,
+                            token_usage: None,
+                        };
+                        if let Err(e2) = crate::db::types::create_message(&pool, &err_msg).await {
+                            error!("Failed to insert error message for {}: {:?}", msg.id, e2);
+                        }
+                        // Mark original message as failed
+                        let _ = crate::db::types::update_message_status(
+                            &pool, msg.id, &MessageStatus::Failed,
+                        ).await;
                     }
                 }
 
@@ -326,7 +356,8 @@ fn merge_usage(cumulative: &mut Option<Usage>, new_usage: Option<Usage>) {
         if let Some(ref mut cum) = cumulative {
             cum.prompt_tokens += new.prompt_tokens;
             cum.completion_tokens += new.completion_tokens;
-            cum.cached_tokens = Some(cum.cached_tokens.unwrap_or(0) + new.cached_tokens.unwrap_or(0));
+            cum.cached_tokens =
+                Some(cum.cached_tokens.unwrap_or(0) + new.cached_tokens.unwrap_or(0));
             cum.reasoning_tokens = cum.reasoning_tokens.or(new.reasoning_tokens);
         } else {
             *cumulative = Some(new);
@@ -379,7 +410,7 @@ async fn process_message(
     // 4. Build the initial message history with the structured system prompt
     let system_prompt = crate::prompt_builder::build_system_prompt(
         &ctx.memory_store,
-        &"",  // platform — will be enriched from channel metadata in the future
+        "",   // platform — will be enriched from channel metadata in the future
         None, // system_message
         &profile_name,
     );
@@ -634,14 +665,14 @@ async fn process_message(
 
     // 12. Record processing time and cumulative token usage on the original prompt
     let elapsed_ms = start_time.elapsed().as_millis() as i32;
-    let _ = sqlx::query(
-        "UPDATE messages SET processing_time_ms = $1, token_usage = $2, status = 'completed' WHERE id = $3 AND status = 'processing'",
+    sqlx::query(
+        "UPDATE messages SET processing_time_ms = $1, token_usage = $2::jsonb, status = 'completed' WHERE id = $3 AND status = 'processing'",
     )
     .bind(elapsed_ms)
     .bind(&summary_token_usage)
     .bind(msg.id)
     .execute(pool)
-    .await;
+    .await?;
 
     Ok(saved)
 }
@@ -650,22 +681,57 @@ async fn process_message(
 /// more than 5 minutes ago — mark them as `failed` to unblock the channel.
 ///
 /// Returns the number of recovered messages.
-pub async fn recover_stale_processing(pool: &PgPool) -> Result<u64> {
-    let five_min_ago = chrono::Utc::now() - chrono::Duration::minutes(5);
-    let stale = queries::find_processing_older_than(pool, five_min_ago).await?;
-    let count = stale.len() as u64;
+/// On startup, skip all messages left in pending or processing state.
+/// Called from main.rs BEFORE spawning any concurrent tasks.
+pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
+    // Debug: check specific message 122
+    let specific: Result<(i64, String, String), _> =
+        sqlx::query_as("SELECT id, status, msg_type FROM messages WHERE id = 122")
+            .fetch_one(pool)
+            .await;
 
-    for msg in &stale {
-        warn!(
-            "Recovering stale processing message {} (created at {})",
-            msg.id, msg.created_at
+    match &specific {
+        Ok((id, status, msg_type)) => {
+            info!(
+                "[startup] DEBUG message {}: status={}, type={}",
+                id, status, msg_type
+            );
+        }
+        Err(e) => {
+            info!("[startup] DEBUG message 122 not found: {}", e);
+        }
+    }
+
+    // Debug: list ALL pending/processing messages before skipping
+    let affected: Vec<(i64, String, String)> = sqlx::query_as(
+        r#"
+        SELECT id, status, msg_type
+        FROM messages
+        WHERE status IN ('pending', 'processing')
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if affected.is_empty() {
+        info!("[startup] No pending/processing messages to skip");
+        return Ok(0);
+    }
+
+    for (id, status, msg_type) in &affected {
+        info!(
+            "[startup] Will skip message {} (status={}, type={})",
+            id, status, msg_type
         );
-        queries::update_message_status(pool, msg.id, &MessageStatus::Failed).await?;
     }
 
+    let count = queries::skip_all_pending_processing(pool).await?;
     if count > 0 {
-        info!("Recovered {} stale processing messages", count);
+        info!(
+            "[startup] Skipped {} pending/processing messages on startup",
+            count
+        );
     }
-
     Ok(count)
 }

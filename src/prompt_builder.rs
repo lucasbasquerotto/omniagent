@@ -98,7 +98,7 @@ fn format_thousands(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(c);
@@ -125,15 +125,25 @@ impl MemoryStore {
         let memory_entries = self.read_file(&self.memories_dir.join("MEMORY.md"));
         let user_entries = self.read_file(&self.memories_dir.join("USER.md"));
 
-        self.snapshot.insert("memory".to_string(), self.render_block("memory", &memory_entries, MEMORY_CHAR_LIMIT));
-        self.snapshot.insert("user".to_string(), self.render_block("user", &user_entries, USER_CHAR_LIMIT));
+        self.snapshot.insert(
+            "memory".to_string(),
+            self.render_block("memory", &memory_entries, MEMORY_CHAR_LIMIT),
+        );
+        self.snapshot.insert(
+            "user".to_string(),
+            self.render_block("user", &user_entries, USER_CHAR_LIMIT),
+        );
     }
 
     /// Return the frozen snapshot block for the given target ("memory" or "user").
     /// Returns None if the snapshot has no content.
     pub fn format_for_system_prompt(&self, target: &str) -> Option<&str> {
         let block = self.snapshot.get(target)?;
-        if block.is_empty() { None } else { Some(block.as_str()) }
+        if block.is_empty() {
+            None
+        } else {
+            Some(block.as_str())
+        }
     }
 
     // ── Internal helpers ──
@@ -175,12 +185,16 @@ impl MemoryStore {
         let header = if target == "user" {
             format!(
                 "USER PROFILE (who the user is) [{}% — {}/{} chars]",
-                pct, format_thousands(current), format_thousands(limit)
+                pct,
+                format_thousands(current),
+                format_thousands(limit)
             )
         } else {
             format!(
                 "MEMORY (your personal notes) [{}% — {}/{} chars]",
-                pct, format_thousands(current), format_thousands(limit)
+                pct,
+                format_thousands(current),
+                format_thousands(limit)
             )
         };
 
@@ -250,10 +264,7 @@ pub fn build_system_prompt_parts(
     // Timestamp line
     use chrono::Utc;
     let now = Utc::now();
-    let timestamp_line = format!(
-        "Conversation started: {}",
-        now.format("%A, %B %d, %Y")
-    );
+    let timestamp_line = format!("Conversation started: {}", now.format("%A, %B %d, %Y"));
     // Try to add host info if available
     if let Ok(hostname) = env::var("HOSTNAME").or_else(|_| env::var("HOST")) {
         volatile_parts.push(format!("Host: {}", hostname));
@@ -355,9 +366,10 @@ mod tests {
         let mut store = MemoryStore::new(dir.path().to_str().unwrap());
         store.load_from_disk();
 
-        let prompt = build_system_prompt(&store, "telegram", Some("Custom system message"), "default");
+        let prompt =
+            build_system_prompt(&store, "telegram", Some("Custom system message"), "default");
         assert!(prompt.contains("OmniAgent"));
-        assert!(prompt.contains("Tool guidance"));
+        assert!(prompt.contains("You have access to a set of tools"));
         assert!(prompt.contains("Test memory"));
         assert!(prompt.contains("Test user"));
         assert!(prompt.contains("Telegram"));

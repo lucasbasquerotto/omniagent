@@ -580,7 +580,7 @@ impl WikiVectorizer {
             }
 
             // Generate embedding
-            let embedding = self.vectorizer.generate_embedding(&body).await;
+            let embedding = self.vectorizer.generate_embedding(body).await;
 
             // Derive a deterministic ID from the path (must be unsigned for Qdrant)
             let mut hasher = DefaultHasher::new();
@@ -646,10 +646,10 @@ impl WikiVectorizer {
 /// Strip YAML/TOML frontmatter delimited by `---` lines from markdown content.
 fn strip_frontmatter(content: &str) -> &str {
     let content = content.trim_start();
-    if content.starts_with("---") {
-        if let Some(end) = content[3..].find("---") {
-            let after = &content[3 + end + 3..];
-            return after.trim_start();
+    if let Some(after) = content.strip_prefix("---") {
+        if let Some(end) = after.find("---") {
+            let after_stripped = &after[end + 3..];
+            return after_stripped.trim_start();
         }
     }
     content
@@ -675,11 +675,7 @@ pub struct MessageEmbeddingRow {
 /// This function does not return until cancellation (i.e., it loops forever
 /// via `futures::future::pending()`). It is intended to be spawned as its own
 /// tokio task from main.
-pub async fn spawn_vectorizers(
-    pool: PgPool,
-    config: &crate::config::Config,
-    data_dir: &str,
-) {
+pub async fn spawn_vectorizers(pool: PgPool, config: &crate::config::Config, data_dir: &str) {
     fn make_vectorizer(
         method: &str,
         api_url: &Option<String>,
@@ -710,7 +706,12 @@ pub async fn spawn_vectorizers(
                         proto,
                         model
                     );
-                    Box::new(ApiVectorizer::new(proto, url.clone(), api_key.clone(), model))
+                    Box::new(ApiVectorizer::new(
+                        proto,
+                        url.clone(),
+                        api_key.clone(),
+                        model,
+                    ))
                 } else {
                     tracing::warn!(
                         "{}: method=api but no api_url set; falling back to local",

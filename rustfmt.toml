@@ -1,0 +1,6 @@
+# Rustfmt configuration for omniagent project
+# Ensures consistent formatting across the codebase
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+edition = "2021"

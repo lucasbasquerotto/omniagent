@@ -14,6 +14,7 @@ mod models;
 mod platform;
 mod profile;
 mod prompt_builder;
+mod scheduler;
 mod server;
 mod vectorizer;
 
@@ -63,6 +64,14 @@ async fn main() -> Result<()> {
     // Build the agent with MCP context
     let agent = agent::Agent::new(pool.clone(), agent_cfg, mcp, ctx);
 
+    // ── STARTUP: Skip pending/processing messages BEFORE spawning any concurrent tasks ──
+    if let Err(e) = agent::skip_on_startup(&pool).await {
+        tracing::error!(
+            "Failed to skip pending/processing messages on startup: {:?}",
+            e
+        );
+    }
+
     // Shared cancellation tokens for /stop endpoint
     let cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -85,7 +94,14 @@ async fn main() -> Result<()> {
     let server_port = cfg.port;
     let data_dir_server = data_dir.clone();
     let server_handle = tokio::spawn(async move {
-        server::start_server(pool_server, server_host, server_port, cancel_tokens_server, data_dir_server).await;
+        server::start_server(
+            pool_server,
+            server_host,
+            server_port,
+            cancel_tokens_server,
+            data_dir_server,
+        )
+        .await;
     });
 
     tracing::info!(
@@ -126,6 +142,9 @@ async fn main() -> Result<()> {
         vectorizer::spawn_vectorizers(pool_vectorizer, &cfg, &data_dir).await;
     });
 
+    // Spawn cron scheduler
+    let cron_handle = scheduler::spawn(pool.clone());
+
     // Graceful shutdown
     tokio::select! {
         _ = agent_handle => {
@@ -139,6 +158,9 @@ async fn main() -> Result<()> {
         }
         _ = vectorizer_handle => {
             tracing::info!("Vectorizer finished");
+        }
+        _ = cron_handle => {
+            tracing::info!("Cron scheduler finished");
         }
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down...");

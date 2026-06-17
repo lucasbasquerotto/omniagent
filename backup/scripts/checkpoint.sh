@@ -1,20 +1,51 @@
 #!/bin/bash
+# Checkpoint: sync /opt/data/ + Postgres dump + Qdrant snapshot to S3 with date suffix
 set -euo pipefail
 
-# Checkpoint: sync /opt/data/ to S3_BUCKET/S3_PATH/checkpoint/YYYYMMDD/
 : "${S3_BUCKET:?S3_BUCKET not set}"
 : "${S3_PATH:?S3_PATH not set}"
 
 export RCLONE_CONFIG=${RCLONE_CONFIG:-/etc/rclone/rclone.conf}
 
 DATE_SUFFIX=$(date +%Y%m%d)
-DEST="${S3_BUCKET}/${S3_PATH}/checkpoint/${DATE_SUFFIX}/"
+DEST="s3-backup:${S3_BUCKET}/${S3_PATH}/checkpoint/${DATE_SUFFIX}"
 
-echo "[checkpoint] Starting: /opt/data/ → s3-backup:${DEST}"
+echo "[checkpoint] Starting full checkpoint for ${DATE_SUFFIX}..."
 
-rclone sync /opt/data/ \
-    "s3-backup:${DEST}" \
-    --create-empty-src-dirs \
-    --verbose
+# ─── 1. File data ─────────────────────────────────────────────────────
+echo "[checkpoint] Step 1/3: File data → ${DEST}/data/"
+rclone sync /opt/data/ "${DEST}/data/" --create-empty-src-dirs --s3-no-check-bucket --verbose
 
-echo "[checkpoint] Complete."
+# ─── 2. Postgres dump ─────────────────────────────────────────────────
+echo "[checkpoint] Step 2/3: Postgres dump..."
+PG_HOST="${PGHOST:-postgres}"
+PG_PORT="${PGPORT:-5432}"
+PG_USER="${PGUSER:-omniagent}"
+PG_DB="${PGDATABASE:-omniagent}"
+
+if [ -n "${PGPASSWORD:-}" ]; then
+  export PGPASSWORD
+  pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
+    --no-owner --no-acl 2>/dev/null | gzip > /tmp/pg-dump.sql.gz
+  rclone copy /tmp/pg-dump.sql.gz "${DEST}/db/" --s3-no-check-bucket
+  rm -f /tmp/pg-dump.sql.gz
+  echo "[checkpoint] Postgres dump uploaded."
+else
+  echo "[checkpoint] PGPASSWORD not set — skipping Postgres backup."
+fi
+
+# ─── 3. Qdrant snapshot ───────────────────────────────────────────────
+echo "[checkpoint] Step 3/3: Qdrant wiki snapshot..."
+SNAPSHOT_RESPONSE=$(wget -qO- --post-data="" http://qdrant:6333/collections/wiki/snapshots 2>&1) || {
+  echo "[checkpoint] Qdrant snapshot creation failed — skipping."
+}
+if [ -n "$SNAPSHOT_RESPONSE" ]; then
+  SNAPSHOT_NAME=$(echo "$SNAPSHOT_RESPONSE" | sed 's/.*"name":"//' | sed 's/".*//')
+  echo "[checkpoint] Snapshot: $SNAPSHOT_NAME"
+  wget -qO /tmp/wiki-snapshot.snapshot "http://qdrant:6333/collections/wiki/snapshots/$SNAPSHOT_NAME"
+  rclone copy /tmp/wiki-snapshot.snapshot "${DEST}/db/" --s3-no-check-bucket
+  rm -f /tmp/wiki-snapshot.snapshot
+  echo "[checkpoint] Qdrant snapshot uploaded."
+fi
+
+echo "[checkpoint] Full checkpoint complete for ${DATE_SUFFIX}."

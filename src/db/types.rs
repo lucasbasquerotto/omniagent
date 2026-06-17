@@ -8,6 +8,7 @@
 //! macros for compile-time SQL validation.
 
 use chrono::{DateTime, Utc};
+use sql_forge::sql_forge;
 use sqlx::PgPool;
 
 use crate::models::{Channel, ChannelStop, Message, MessageNew, MessageStatus};
@@ -279,11 +280,12 @@ pub async fn update_message_status(
     status: &MessageStatus,
 ) -> anyhow::Result<()> {
     let status_str = status.to_string();
-    sqlx::query("UPDATE messages SET status = $1 WHERE id = $2")
-        .bind(&status_str)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sql_forge!(
+        "UPDATE messages SET status = :status WHERE id = :id",
+        ( :status = &status_str, :id = id )
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -305,41 +307,17 @@ pub async fn find_all_channels(pool: &PgPool) -> anyhow::Result<Vec<Channel>> {
     rows.into_iter().map(|r| r.try_into()).collect()
 }
 
-pub async fn find_processing_older_than(
-    pool: &PgPool,
-    before: chrono::DateTime<chrono::Utc>,
-) -> anyhow::Result<Vec<Message>> {
-    let rows: Vec<MessageDb> = sqlx::query_as(
-        r#"
-        SELECT
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
-            metadata::text, embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text,
-            TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
-        FROM messages
-        WHERE status = 'processing' AND created_at < $1
-        ORDER BY created_at ASC
-        "#,
-    )
-    .bind(before)
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter().map(|r| r.try_into()).collect()
-}
-
 pub async fn count_thread_iterations(pool: &PgPool, thread_id: i64) -> anyhow::Result<i32> {
-    let count: Option<i64> = sqlx::query_scalar(
+    let count: Option<i64> = sql_forge!(
+        scalar Option<i64>,
         r#"
         SELECT COUNT(*) FROM messages
-        WHERE thread_id = $1
+        WHERE thread_id = :thread_id
           AND role = 'agent'
           AND msg_type = 'message'
         "#,
+        ( :thread_id = thread_id )
     )
-    .bind(thread_id)
     .fetch_one(pool)
     .await?;
 
@@ -347,25 +325,86 @@ pub async fn count_thread_iterations(pool: &PgPool, thread_id: i64) -> anyhow::R
 }
 
 pub async fn skip_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Result<u64> {
-    let result = sqlx::query(
-        "UPDATE messages SET status = 'skipped' WHERE channel_id = $1 AND status = 'pending'",
+    let result = sql_forge!(
+        "UPDATE messages SET status = 'skipped' WHERE channel_id = :channel_id AND status = 'pending'",
+        ( :channel_id = channel_id )
     )
-    .bind(channel_id)
     .execute(pool)
     .await?;
 
     Ok(result.rows_affected())
 }
 
-pub async fn stop_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<()> {
-    sqlx::query(
+/// Mark ALL pending and processing messages as skipped (run on startup).
+/// Also aggregates thread-level stats (processing time, token usage, message count)
+/// and writes them back to the sequence-0 message before skipping.
+pub async fn skip_all_pending_processing(pool: &PgPool) -> anyhow::Result<u64> {
+    // First pass: update sequence-0 messages with aggregated thread stats, then mark skipped
+    let result = sqlx::query(
         r#"
-        INSERT INTO channel_stops (channel_id)
-        VALUES ($1)
-        ON CONFLICT (channel_id) DO UPDATE SET stopped_at = NOW()
+        WITH affected_threads AS (
+            SELECT DISTINCT channel_id, thread_id
+            FROM messages
+            WHERE status IN ('pending', 'processing') AND thread_sequence = 0
+        ),
+        aggregates AS (
+            SELECT
+                m.channel_id,
+                m.thread_id,
+                SUM(m.processing_time_ms) AS total_time,
+                COUNT(*) AS msg_count,
+                jsonb_build_object(
+                    'prompt_tokens',
+                    SUM(COALESCE((token_usage->>'prompt_tokens')::int, 0)),
+                    'completion_tokens',
+                    SUM(COALESCE((token_usage->>'completion_tokens')::int, 0))
+                ) AS total_tokens
+            FROM messages m
+            INNER JOIN affected_threads t
+                ON m.channel_id = t.channel_id AND m.thread_id = t.thread_id
+            GROUP BY m.channel_id, m.thread_id
+        )
+        UPDATE messages m
+        SET
+            status = 'skipped',
+            processing_time_ms = a.total_time,
+            iteration_count = a.msg_count,
+            token_usage = a.total_tokens
+        FROM aggregates a
+        WHERE m.channel_id = a.channel_id
+          AND m.thread_id = a.thread_id
+          AND m.thread_sequence = 0
+          AND m.status IN ('pending', 'processing')
         "#,
     )
-    .bind(channel_id)
+    .execute(pool)
+    .await?;
+
+    let seq0_count = result.rows_affected();
+
+    // Second pass: skip remaining pending/processing messages (non-sequence-0)
+    let remaining = sqlx::query(
+        r#"
+        UPDATE messages
+        SET status = 'skipped'
+        WHERE status IN ('pending', 'processing')
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(seq0_count + remaining.rows_affected())
+}
+
+pub async fn stop_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<()> {
+    sql_forge!(
+        r#"
+        INSERT INTO channel_stops (channel_id)
+        VALUES (:channel_id)
+        ON CONFLICT (channel_id) DO UPDATE SET stopped_at = NOW()
+        "#,
+        ( :channel_id = channel_id )
+    )
     .execute(pool)
     .await?;
 
@@ -408,17 +447,18 @@ pub async fn find_messages_without_embeddings(
     pool: &PgPool,
     limit: usize,
 ) -> anyhow::Result<Vec<crate::vectorizer::MessageEmbeddingRow>> {
-    let rows: Vec<crate::vectorizer::MessageEmbeddingRow> = sqlx::query_as(
+    let rows: Vec<crate::vectorizer::MessageEmbeddingRow> = sql_forge!(
+        crate::vectorizer::MessageEmbeddingRow,
         r#"
         SELECT id, content
         FROM messages
         WHERE embedding IS NULL
           AND role IN ('user', 'agent')
         ORDER BY created_at ASC
-        LIMIT $1
+        LIMIT :limit
         "#,
+        ( :limit = limit as i64 )
     )
-    .bind(limit as i64)
     .fetch_all(pool)
     .await?;
 
@@ -431,16 +471,16 @@ pub async fn update_message_embedding(
     message_id: i64,
     embedding_string: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query("UPDATE messages SET embedding = $1 WHERE id = $2")
-        .bind(embedding_string)
-        .bind(message_id)
-        .execute(pool)
-        .await?;
+    sql_forge!(
+        "UPDATE messages SET embedding = :embedding WHERE id = :id",
+        ( :embedding = embedding_string, :id = message_id )
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
 
-#[expect(dead_code)]
 pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Option<Channel>> {
     let row: Option<ChannelDb> = sqlx::query_as(
         r#"
@@ -459,7 +499,6 @@ pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Op
     row.map(|r| r.try_into()).transpose()
 }
 
-#[expect(dead_code)]
 pub async fn create_channel(
     pool: &PgPool,
     name: &str,
@@ -491,8 +530,7 @@ pub async fn create_channel(
 
 #[expect(dead_code)]
 pub async fn clear_channel_stop(pool: &PgPool, channel_id: i64) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM channel_stops WHERE channel_id = $1")
-        .bind(channel_id)
+    sql_forge!("DELETE FROM channel_stops WHERE channel_id = :channel_id", ( :channel_id = channel_id ))
         .execute(pool)
         .await?;
 

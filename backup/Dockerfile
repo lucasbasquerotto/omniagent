@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk add --no-cache rclone dcron bash tini
+RUN apk add --no-cache rclone dcron bash tini postgresql-client curl
 
 # Copy scripts
 COPY scripts/backup.sh /usr/bin/backup

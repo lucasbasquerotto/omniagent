@@ -1,6 +1,7 @@
 use crate::mcp::{AppContext, McpTool, McpToolResult};
 use anyhow::Result;
 use serde_json::Value;
+
 use std::sync::Arc;
 
 pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
@@ -45,8 +46,8 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     if let Some(cid) = channel_id {
-                        sqlx::query_as(
-                            "SELECT id, role, content FROM messages WHERE channel_id = $1 AND content ILIKE '%' || $2 || '%' ORDER BY created_at DESC LIMIT $3"
+                        sqlx::query_as::<_, (i64, String, String)>(
+                            "SELECT id, role, content FROM messages WHERE channel_id = $1 AND content ILIKE '%' || $2 || '%' ORDER BY created_at DESC LIMIT $3",
                         )
                         .bind(cid)
                         .bind(query)
@@ -54,8 +55,8 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
                         .fetch_all(&pool)
                         .await
                     } else {
-                        sqlx::query_as(
-                            "SELECT id, role, content FROM messages WHERE content ILIKE '%' || $1 || '%' ORDER BY created_at DESC LIMIT $2"
+                        sqlx::query_as::<_, (i64, String, String)>(
+                            "SELECT id, role, content FROM messages WHERE content ILIKE '%' || $1 || '%' ORDER BY created_at DESC LIMIT $2",
                         )
                         .bind(query)
                         .bind(limit)
@@ -76,8 +77,14 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
 
             let mut lines = Vec::new();
             for (id, role, content) in &results {
+                // Safe UTF-8 slicing: find the char boundary closest to 200
                 let preview = if content.len() > 200 {
-                    format!("{}...", &content[..200])
+                    let truncate_to = content
+                        .char_indices()
+                        .nth(200)
+                        .map(|(i, _)| i)
+                        .unwrap_or(content.len());
+                    format!("{}...", &content[..truncate_to])
                 } else {
                     content.clone()
                 };

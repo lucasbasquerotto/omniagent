@@ -1849,9 +1849,9 @@ dependencies = [
 
 [[package]]
 name = "sql-forge"
-version = "0.4.6"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1eb088b6f2113df357caf070eb71589ea84c92e641219621bf351a52abce6cdf"
+checksum = "9d6fc2e4ebcee163ef239bc6db466d27cff45cea5598ae5bae263a445c55f0eb"
 dependencies = [
  "sql-forge-macro",
  "sqlx",
@@ -1859,9 +1859,9 @@ dependencies = [
 
 [[package]]
 name = "sql-forge-macro"
-version = "0.4.6"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b6834450fb3934bab020fec0b1c0f979195ba227786ccfdb34fcfe242a90fce"
+checksum = "a3232e1784176b78f097433c146866207eebf3fe0f1b390aecfbb706e1e137d6"
 dependencies = [
  "proc-macro2",
  "quote",

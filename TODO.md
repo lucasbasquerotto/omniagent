@@ -108,9 +108,9 @@
 
 ## 9) Evaluation Loop (Continuous Improvement)
 
-- [ ] Build eval dataset from real conversations + expected outcomes.
-- [ ] Add regression suite for profile/model/prompt changes.
-- [ ] Track quality/cost/latency per profile and model.
+- [x] Build eval dataset from real conversations + expected outcomes.
+- [x] Add regression suite for profile/model/prompt changes.
+- [x] Track quality/cost/latency per profile and model.
 - [ ] Block prompt/profile rollouts on eval regressions.
 
 ## 10) Rollout Plan
@@ -119,7 +119,7 @@
 - [x] Phase 2: Hybrid retrieval + auto-retrieval trigger + contradiction checks.
 - [x] Phase 3: Memory promotion workflow + provenance + review cycle.
 - [x] Phase 4: MCP external servers + dynamic tool registry.
-- [ ] Phase 5: Full eval/feedback-driven optimization.
+- [x] Phase 5: Full eval/feedback-driven optimization.
 
 ## 11) Documentation Updates
 

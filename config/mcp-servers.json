@@ -17,6 +17,15 @@
       "timeout_secs": 120,
       "max_retries": 3,
       "allowed_tools": ["*"]
+    },
+    {
+      "name": "docker",
+      "transport": "stdio",
+      "command": "python3",
+      "args": ["scripts/mcp-docker-server.py"],
+      "timeout_secs": 300,
+      "max_retries": 3,
+      "allowed_tools": ["*"]
     }
   ]
 }

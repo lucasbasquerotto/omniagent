@@ -26,7 +26,7 @@ use crate::llm::{ChatMessage, CompletionRequest, LLMClient, Usage};
 
 /// Maximum total characters of tool results in conversation history before
 /// old tool results are pruned (Layer 3 compression).
-const TOOL_RESULT_HISTORY_BUDGET: usize = 80_000;
+const TOOL_RESULT_HISTORY_BUDGET: usize = 120_000;
 use crate::context_builder::{BlockPriority, ContextAssemblyMeta, ContextBlock, ContextBuilder};
 use crate::vectorizer::Vectorizer;
 use crate::mcp::{
@@ -683,7 +683,7 @@ async fn process_message(
     // 4b. Assemble additional context blocks via ContextBuilder
     let ctx_assembly_meta: Option<ContextAssemblyMeta>;
     let context_messages = {
-        let mut builder = ContextBuilder::new().with_budget(4_000);
+        let mut builder = ContextBuilder::new().with_budget(8_000);
 
         // Classify the user message to determine retrieval needs
         let (_query_class, needs_retrieval) =

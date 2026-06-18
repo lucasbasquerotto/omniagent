@@ -335,7 +335,7 @@ pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> anyhow::Result<M
             profile, provider, model, processing_time_ms, token_usage,
             iterations
         )
-        VALUES (:channel_id, :role, :content, :status, :thread_id, :thread_sequence, :external_id, :metadata, :embedding, :summary_text, :is_summary, :msg_type, :msg_subtype, :iteration_count, :profile, :provider, :model, :processing_time_ms, :token_usage, :iterations)
+        VALUES (:channel_id, :role, :content, :status, NULLIF(:thread_id, 0::bigint), :thread_sequence, NULLIF(:external_id, '')::text, :metadata, NULLIF(:embedding, '')::text, NULLIF(:summary_text, '')::text, :is_summary, :msg_type, NULLIF(:msg_subtype, '')::text, :iteration_count, :profile, NULLIF(:provider, '')::text, NULLIF(:model, '')::text, NULLIF(:processing_time_ms, 0)::int, :token_usage, :iterations)
         RETURNING
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,

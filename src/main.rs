@@ -47,6 +47,10 @@ async fn main() -> Result<()> {
     let data_dir = std::env::var("OMNI_DATA_DIR").unwrap_or_else(|_| "/opt/data".to_string());
     tracing::info!("Data directory: {}", data_dir);
 
+    // Determine workspace directory (default: /opt/workspace)
+    let workspace_dir = std::env::var("WORKSPACE_DIR").unwrap_or_else(|_| "/opt/workspace".to_string());
+    tracing::info!("Workspace directory: {}", workspace_dir);
+
     // Build agent config from environment
     let agent_cfg = agent::AgentConfig::from_env()?;
     tracing::info!(
@@ -59,7 +63,7 @@ async fn main() -> Result<()> {
     );
 
     // Create AppContext and MCP registry
-    let ctx = mcp::AppContext::new(pool.clone(), &data_dir, Some(cfg.qdrant_url.clone()));
+    let ctx = mcp::AppContext::new(pool.clone(), &data_dir, &workspace_dir, Some(cfg.qdrant_url.clone()));
     let mcp = mcp::default_registry(&ctx);
 
     // Build the agent with MCP context

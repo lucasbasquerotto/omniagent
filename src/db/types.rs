@@ -280,9 +280,11 @@ impl TryFrom<ChannelStopDb> for ChannelStop {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SummaryDb {
     pub id: i64,
+    #[allow(dead_code)]
     pub channel_id: i64,
     pub next_thread_id: i64,
     pub content: String,
+    #[allow(dead_code)]
     pub created_at: Option<String>,
 }
 
@@ -429,8 +431,8 @@ pub async fn find_all_channels(pool: &PgPool) -> anyhow::Result<Vec<Channel>> {
 }
 
 pub async fn count_thread_iterations(pool: &PgPool, thread_id: i64) -> anyhow::Result<i32> {
-    let count: Option<i64> = sql_forge!(
-        scalar Option<i64>,
+    let count: Option<i32> = sql_forge!(
+        scalar Option<i32>,
         r#"
         SELECT COALESCE(MAX(iterations), 0) FROM messages
         WHERE thread_id = :thread_id
@@ -440,7 +442,7 @@ pub async fn count_thread_iterations(pool: &PgPool, thread_id: i64) -> anyhow::R
     .fetch_one(pool)
     .await?;
 
-    Ok(count.unwrap_or(0) as i32)
+    Ok(count.unwrap_or(0))
 }
 
 pub async fn skip_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Result<u64> {
@@ -734,7 +736,6 @@ pub async fn create_channel(
 // ---------------------------------------------------------------------------
 
 /// Search messages by embedding similarity (pgvector cosine distance).
-/// Uses raw sqlx for vector operator support (pgvector <=>).
 /// Returns messages sorted by similarity (closest first).
 pub async fn search_messages_semantic(
     pool: &PgPool,
@@ -742,7 +743,9 @@ pub async fn search_messages_semantic(
     channel_id: i64,
     limit: i64,
 ) -> anyhow::Result<Vec<Message>> {
-    // Use raw sqlx query since pgvector's <=> operator isn't supported by sql_forge!
+    // Runtime-only sqlx::query_as — the `vector` type from pgvector is not in
+    // sqlx's compile-time type registry. Both sqlx::query_as! and sql_forge!()
+    // share this limitation. Only sqlx::query_as (runtime) works here.
     let rows: Vec<MessageDb> = sqlx::query_as(
         r#"
         SELECT
@@ -939,6 +942,7 @@ pub async fn get_latest_summary(
 }
 
 /// Get the last N summaries for a channel (newest first).
+#[expect(dead_code)]
 pub async fn get_recent_summaries(
     pool: &PgPool,
     channel_id: i64,

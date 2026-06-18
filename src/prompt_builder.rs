@@ -49,11 +49,13 @@ comparison tables where appropriate, and cite sources. Verify the file was writt
 by reading it back with filesystem_read.\n\
 \n\
 FILESYSTEM ACCESS:\n\
-- Read/write/search/list operations target data_dir=<data_dir> only.\n\
+- Read/write/search/list operations are allowed under TWO directories:\n\
+  * data_dir=<data_dir> — agent config, profiles, wiki, memories\n\
+  * /opt/workspace/ — project development (create, edit, manage project files)\n\
 - Research output file path: <data_dir>/research-output.md (MUST write to this path).\n\
-- The file read/write tools are restricted to <data_dir>/ — anything outside will fail.\n\
 - To read the research input, use filesystem_read(path=\"<data_dir>/research-input.md\").\n\
-- Do NOT try to access paths under /app/ — they are outside the data directory.";
+- For project files, write to paths under /opt/workspace/.\n\
+- Do NOT try to access paths under /app/ — they are outside the allowed directories.";
 
 const RESEARCH_WORKFLOW: &str = "\
 RESEARCH WORKFLOW (follow this exact sequence for research tasks):\n\

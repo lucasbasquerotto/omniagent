@@ -13,6 +13,8 @@
 //! requests from the `/stop` HTTP endpoint.
 
 use anyhow::Result;
+use sql_forge::sql_forge;
+use sqlx::FromRow;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1289,15 +1291,18 @@ async fn process_message(
 
     let final_status = if limit_reached { "interrupted" } else { "completed" };
     let elapsed_ms = start_time.elapsed().as_millis() as i32;
-    let token_usage_str: Option<String> = token_usage_json.as_ref().map(|v| v.to_string());
-    sqlx::query(
-        "UPDATE messages SET processing_time_ms = $1, token_usage = $2::jsonb, status = $3::text, iterations = $4 WHERE id = $5 AND status = 'processing'",
+    let token_usage_val = token_usage_json.unwrap_or(serde_json::Value::Null);
+    sql_forge!(
+        r#"
+        UPDATE messages
+        SET processing_time_ms = :elapsed_ms,
+            token_usage = :token_usage,
+            status = :status::text,
+            iterations = :iterations
+        WHERE id = :msg_id AND status = 'processing'
+        "#,
+        ( :elapsed_ms = elapsed_ms, :token_usage = token_usage_val, :status = final_status, :iterations = current_iter, :msg_id = msg.id )
     )
-    .bind(elapsed_ms)
-    .bind(&token_usage_str)
-    .bind(final_status)
-    .bind(current_iter)
-    .bind(msg.id)
     .execute(pool)
     .await?;
 
@@ -1317,16 +1322,26 @@ async fn process_message(
 /// Called from main.rs BEFORE spawning any concurrent tasks.
 pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
     // Debug: check specific message 122
-    let specific: Result<(i64, String, String), _> =
-        sqlx::query_as("SELECT id, status, msg_type FROM messages WHERE id = 122")
-            .fetch_one(pool)
-            .await;
+    #[derive(Debug, FromRow)]
+    struct MsgRow {
+        id: i64,
+        status: String,
+        msg_type: String,
+    }
+
+    let specific: Result<MsgRow, _> = sql_forge!(
+        MsgRow,
+        "SELECT id, status, msg_type FROM messages WHERE id = :msg_id",
+        ( :msg_id = 122i64 )
+    )
+    .fetch_one(pool)
+    .await;
 
     match &specific {
-        Ok((id, status, msg_type)) => {
+        Ok(row) => {
             info!(
                 "[startup] DEBUG message {}: status={}, type={}",
-                id, status, msg_type
+                row.id, row.status, row.msg_type
             );
         }
         Err(e) => {
@@ -1335,13 +1350,23 @@ pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
     }
 
     // Debug: list ALL pending/processing messages before skipping
-    let affected: Vec<(i64, String, String)> = sqlx::query_as(
+    #[derive(Debug, FromRow)]
+    struct PendingRow {
+        id: i64,
+        status: String,
+        msg_type: String,
+    }
+
+    let affected: Vec<PendingRow> = sql_forge!(
+        PendingRow,
         r#"
         SELECT id, status, msg_type
         FROM messages
-        WHERE status IN ('pending', 'processing')
+        WHERE 1 = :_one
+          AND status IN ('pending', 'processing')
         ORDER BY id
         "#,
+        ( :_one = 1i32 )
     )
     .fetch_all(pool)
     .await?;
@@ -1351,10 +1376,10 @@ pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
         return Ok(0);
     }
 
-    for (id, status, msg_type) in &affected {
+    for row in &affected {
         info!(
             "[startup] Will skip message {} (status={}, type={})",
-            id, status, msg_type
+            row.id, row.status, row.msg_type
         );
     }
 

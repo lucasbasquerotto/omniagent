@@ -11,6 +11,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use sql_forge::sql_forge;
+use sqlx::FromRow;
 use sqlx::PgPool;
 use std::str::FromStr;
 use tokio::time::{sleep, Duration};
@@ -18,6 +19,15 @@ use tracing::{error, info, warn};
 
 use crate::db::types as queries;
 use crate::models::{MessageNew, MessageStatus};
+
+#[derive(Debug, FromRow)]
+struct CronJobDueRow {
+    id: String,
+    name: Option<String>,
+    display_name: String,
+    schedule: String,
+    prompt: Option<String>,
+}
 
 /// Spawn the cron scheduler loop as a background task.
 pub fn spawn(pool: PgPool) -> tokio::task::JoinHandle<()> {
@@ -40,7 +50,7 @@ async fn tick(pool: &PgPool) -> Result<()> {
     for job in jobs {
         let now = Utc::now();
         let display_name = if job.display_name.is_empty() {
-            &job.name
+            job.name.as_deref().unwrap_or("cron-job")
         } else {
             &job.display_name
         };
@@ -76,11 +86,11 @@ async fn tick(pool: &PgPool) -> Result<()> {
         let channel = ensure_cron_channel(pool).await?;
 
         // ── Insert a pending message for this job ──
-        let subtype = job.name.clone();
+        let subtype = job.name.clone().unwrap_or_default();
         let msg = MessageNew {
             channel_id: channel.id,
             role: "system".to_string(),
-            content: job.prompt.clone(),
+            content: job.prompt.clone().unwrap_or_default(),
             status: MessageStatus::Pending,
             thread_id: None,  // will be set to message id by init_thread_root
             thread_sequence: 0,
@@ -131,29 +141,23 @@ async fn tick(pool: &PgPool) -> Result<()> {
 }
 
 /// Fetch enabled jobs whose next_run_at is due (null or ≤ now).
-async fn fetch_due_jobs(pool: &PgPool) -> Result<Vec<CronJobRow>> {
-    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+async fn fetch_due_jobs(pool: &PgPool) -> Result<Vec<CronJobDueRow>> {
+    let rows: Vec<CronJobDueRow> = sql_forge!(
+        CronJobDueRow,
         r#"
         SELECT id, name, display_name, schedule, prompt
         FROM cron_jobs
         WHERE enabled = true
           AND (next_run_at IS NULL OR next_run_at <= NOW())
+          AND 1 = :_one
         ORDER BY created_at ASC
         "#,
+        ( :_one = 1i32 )
     )
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|(id, name, display_name, schedule, prompt)| CronJobRow {
-            id,
-            name,
-            display_name,
-            schedule,
-            prompt,
-        })
-        .collect())
+    Ok(rows)
 }
 
 /// Release the running flag and update timestamps.
@@ -163,30 +167,20 @@ async fn release_job(
     last_run: &DateTime<Utc>,
     next_run: &DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query(
+    sql_forge!(
         r#"
         UPDATE cron_jobs
         SET running = false,
-            last_run_at = $1::timestamptz,
-            next_run_at = $2::timestamptz
-        WHERE id = $3
+            last_run_at = :last_run,
+            next_run_at = :next_run
+        WHERE id = :id
         "#,
+        ( :last_run = *last_run, :next_run = *next_run, :id = job_id )
     )
-    .bind(last_run.to_rfc3339())
-    .bind(next_run.to_rfc3339())
-    .bind(job_id)
     .execute(pool)
     .await?;
 
     Ok(())
-}
-
-struct CronJobRow {
-    id: String,
-    name: String,
-    display_name: String,
-    schedule: String,
-    prompt: String,
 }
 
 /// Ensure a cron channel exists (upsert on conflict).
@@ -198,21 +192,14 @@ async fn ensure_cron_channel(pool: &PgPool) -> Result<crate::models::Channel> {
 fn calculate_next_run(expression: &str, now: &DateTime<Utc>) -> DateTime<Utc> {
     match Schedule::from_str(expression) {
         Ok(schedule) => {
-            if let Some(next) = schedule.upcoming(Utc).next() {
+            if let Some(next) = schedule.after(now).next() {
                 next
             } else {
-                warn!(
-                    "[cron-scheduler] Expression '{}' produced no upcoming times, defaulting to +1h",
-                    expression
-                );
                 *now + chrono::Duration::hours(1)
             }
         }
         Err(e) => {
-            warn!(
-                "[cron-scheduler] Failed to parse cron expression '{}': {}. Defaulting to +1h.",
-                expression, e
-            );
+            warn!("Invalid cron expression '{}': {}", expression, e);
             *now + chrono::Duration::hours(1)
         }
     }

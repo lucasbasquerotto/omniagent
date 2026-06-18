@@ -1,13 +1,24 @@
 # OmniAgent — AGENTS.md
 
-## Project Conventions
+## Guidelines
 
 ### SQL Queries: Always use sql_forge!()
-**Every SQL query (SELECT, INSERT, UPDATE, DELETE) MUST use `sql_forge!()`.**
-No raw `sqlx::query`, `sqlx::query_as`, or `sqlx::query_scalar`* except for:
-- **Migration files** (ALTER TABLE, CREATE TABLE, etc.) where DDL is not supported by sql_forge!
+**Every SQL query MUST use `sql_forge!()`.** No raw `sqlx::query`, `sqlx::query_as`, or `sqlx::query_scalar` except where sqlx's compile-time macros cannot handle the type:
 
-If a query cannot be expressed with sql_forge!() due to a pgvector operator (e.g., `<=>`), use an intermediate struct with `sqlx::FromRow` and convert in Rust. Never use raw sqlx for DML queries.
+- **pgvector `<=>` operator** — The `vector` type from pgvector is not in sqlx's hardcoded compile-time type registry. This affects `sqlx::query_as!` and `sql_forge!()` equally. Use `sqlx::query_as::<_, DbStruct>()` (runtime) with a comment explaining why.
+
+DDL (CREATE TABLE, ALTER TABLE, CREATE INDEX) works with `sql_forge!("SQL")` in execute-only form (no struct, no params) — it wraps `sqlx::query()` at runtime.
+
+Dynamic SQL (variable column sets) should be decomposed into individual static `sql_forge!()` UPDATEs per field rather than building SQL strings at runtime.
+
+**Type discipline:** Always match Rust types to the actual PostgreSQL column types:
+- `INT4` (INTEGER) → `i32` or `Option<i32>`
+- `INT8` (BIGINT) → `i64` or `Option<i64>`
+- `TEXT` / `VARCHAR` → `String` or `Option<String>`
+- `TIMESTAMPTZ` → `chrono::DateTime<Utc>` or `Option<...>`
+- `JSONB` → `serde_json::Value` or `String` (with `.to_string()` for jsonb casts)
+
+Never cast in Rust (`as i32`, `as i64`) when sql_forge can infer the correct type — use the right sql_forge scalar type instead.
 
 ### Column Aliases: No sqlx Proprietary Suffixes
 **NEVER use sqlx-proprietary `?` / `!` suffixes in column aliases** (`AS "column?"`, `AS "column!"`).

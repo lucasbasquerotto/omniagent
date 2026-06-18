@@ -266,5 +266,20 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // ── Summaries table for cross-thread thread summaries ──
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS summaries (
+            id              BIGSERIAL PRIMARY KEY,
+            channel_id      BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            next_thread_id  BIGINT NOT NULL,
+            content         TEXT NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

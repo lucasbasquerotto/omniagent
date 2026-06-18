@@ -46,6 +46,13 @@ pub struct AgentConfig {
     #[expect(dead_code)]
     pub summarize_after_days: u32,
     pub max_iterations: u32,
+    /// Number of threads per half-window for summary generation.
+    /// A summary is generated every 2*summary_window completed seq-0 threads.
+    pub summary_window: u32,
+    /// Max tokens for the summary generation LLM call.
+    pub summary_tokens: u32,
+    /// Days before old messages and summaries are deleted.
+    pub delete_after_days: u32,
 }
 
 impl AgentConfig {
@@ -82,6 +89,18 @@ impl AgentConfig {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .unwrap_or(60),
+            summary_window: std::env::var("SUMMARY_WINDOW")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .unwrap_or(10),
+            summary_tokens: std::env::var("SUMMARY_TOKENS")
+                .unwrap_or_else(|_| "4096".to_string())
+                .parse()
+                .unwrap_or(4096),
+            delete_after_days: std::env::var("DELETE_AFTER_DAYS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .unwrap_or(30),
         })
     }
 }
@@ -420,6 +439,185 @@ fn prune_old_tool_results(messages: &mut Vec<ChatMessage>) {
     }
 }
 
+/// Check if enough completed seq-0 threads have accumulated since the
+/// last summary for this channel, and if so, generate a new cross-thread summary.
+///
+/// Algorithm:
+/// 1. Get the `next_thread_id` from the latest summary (0 if none).
+/// 2. Count completed seq-0 messages with id > next_thread_id.
+/// 3. If count >= 2*N (where N = SUMMARY_WINDOW), generate a summary.
+/// 4. The first thread id = first seq-0, the last = last seq-0.
+/// 5. For each of the 2*N threads, fetch ALL its messages.
+/// 6. Build a summarization prompt with previous summary context.
+/// 7. Save with `next_thread_id` = the N-th thread's id (window slides by N).
+async fn check_and_generate_summary(
+    pool: &PgPool,
+    llm: &LLMClient,
+    config: &AgentConfig,
+    channel_id: i64,
+) {
+    let window = config.summary_window as i64;
+    if window == 0 {
+        return; // summaries disabled
+    }
+    let trigger_count = window * 2; // need 2*N threads to trigger
+
+    // 1. Get latest summary's next_thread_id
+    let since_id = match queries::get_latest_summary(pool, channel_id).await {
+        Ok(Some(summary)) => summary.next_thread_id,
+        _ => 0i64,
+    };
+
+    // 2. Fetch completed seq-0 messages since the last summary
+    let seq0_msgs = match queries::get_completed_seq0_messages_since(
+        pool, channel_id, since_id, trigger_count,
+    )
+    .await
+    {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            warn!(
+                "[thread-summary] Failed to fetch completed seq-0 messages for channel {}: {:?}",
+                channel_id, e
+            );
+            return;
+        }
+    };
+
+    if (seq0_msgs.len() as i64) < trigger_count {
+        // Not enough threads yet
+        return;
+    }
+
+    // We have 2*N threads. The first thread's id is seq0_msgs[0].id.
+    // The N-th thread's id (the sliding window point):
+    let pivot_thread_id = seq0_msgs[(window - 1) as usize].id;
+    let first_thread_id = seq0_msgs[0].id;
+    let last_thread_id = seq0_msgs[(trigger_count - 1) as usize].id;
+
+    info!(
+        "[thread-summary] Generating summary for channel {}: {} threads (id {} to {}), pivot={}",
+        channel_id, trigger_count, first_thread_id, last_thread_id, pivot_thread_id
+    );
+
+    // 3. For each of the 2*N threads, fetch ALL messages
+    let mut all_thread_content = String::new();
+    for seq0 in &seq0_msgs {
+        let tid = seq0.thread_id.unwrap_or(seq0.id);
+        match queries::get_thread_messages(pool, tid).await {
+            Ok(thread_msgs) => {
+                all_thread_content.push_str(&format!(
+                    "\n=== Thread #{} (started by {} at {}) ===\n",
+                    tid,
+                    seq0.role,
+                    seq0.created_at.as_deref().unwrap_or("?"),
+                ));
+                for m in &thread_msgs {
+                    let role_display = match m.role.as_str() {
+                        "user" => "User",
+                        "agent" => "Assistant",
+                        "system" => "System",
+                        _ => &m.role,
+                    };
+                    // Skip tool results to keep context manageable
+                    if m.msg_type == "tool_result" || m.msg_type == "tool" {
+                        continue;
+                    }
+                    all_thread_content.push_str(&format!(
+                        "[{}]: {}\n",
+                        role_display,
+                        m.content.chars().take(1000).collect::<String>()
+                    ));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[thread-summary] Failed to fetch messages for thread {}: {:?}",
+                    tid, e
+                );
+            }
+        }
+    }
+
+    // 4. Fetch the last summary for context (to avoid repeating info)
+    let previous_summary_text = match queries::get_latest_summary(pool, channel_id).await {
+        Ok(Some(s)) => s.content,
+        _ => String::new(),
+    };
+
+    // 5. Build summarization prompt
+    let summary_prompt = if previous_summary_text.is_empty() {
+        format!(
+            "Summarize the following conversations from a single channel. \
+             Focus on key topics, decisions, user requests, and agent actions. \
+             Be concise but comprehensive.\n\n{}",
+            all_thread_content
+        )
+    } else {
+        format!(
+            "The following is the previous summary of earlier conversations. \
+             Do NOT repeat information already covered there.\n\n\
+             PREVIOUS SUMMARY:\n{}\n\n\
+             ---\n\n\
+             Now summarize the following new conversations. \
+             Focus on key topics, decisions, user requests, and agent actions. \
+             Be concise but comprehensive, and connect to the previous summary if relevant.\n\n{}",
+            previous_summary_text, all_thread_content
+        )
+    };
+
+    // 6. Call LLM for summary
+    let summary_request = CompletionRequest {
+        messages: vec![
+            ChatMessage::system(
+                "You are a conversation summarizer. Create a concise but thorough \
+                 summary of the provided conversations.",
+            ),
+            ChatMessage::user(&summary_prompt),
+        ],
+        max_tokens: config.summary_tokens,
+        temperature: 0.3,
+        stream: false,
+        tools: None,
+    };
+
+    let summary_content = match llm.completion(summary_request).await {
+        Ok(resp) => {
+            info!(
+                "[thread-summary] Generated summary for channel {} ({} chars, {} tokens)",
+                channel_id,
+                resp.content.len(),
+                resp.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+            );
+            resp.content
+        }
+        Err(e) => {
+            warn!(
+                "[thread-summary] Failed to generate summary for channel {}: {:?}",
+                channel_id, e
+            );
+            return;
+        }
+    };
+
+    // 7. Save the summary with next_thread_id = the N-th thread's id
+    //    (window slides by N, so the next trigger will start from this pivot)
+    match queries::create_summary(pool, channel_id, pivot_thread_id, &summary_content).await {
+        Ok(summary) => {
+            info!(
+                "[thread-summary] Saved summary {} for channel {} (next_thread_id={}, covers {} threads)",
+                summary.id, channel_id, pivot_thread_id, trigger_count
+            );
+        }
+        Err(e) => {
+            warn!(
+                "[thread-summary] Failed to save summary for channel {}: {:?}",
+                channel_id, e
+            );
+        }
+    }
+}
+
 /// Process a single pending message through the state machine:
 ///
 /// 1. Update message status → `processing`
@@ -429,8 +627,9 @@ fn prune_old_tool_results(messages: &mut Vec<ChatMessage>) {
 /// 5. If tool calls are returned, execute them and loop back to LLM
 /// 6. If reasoning exists, save as a separate `reasoning` record
 /// 7. Save the main agent response (msg_type: `message`)
-/// 8. Generate a summary (outside iteration limit)
+/// 8. Generate a per-turn summary (outside iteration limit)
 /// 9. Update original message status → `completed`, record processing_time_ms + token_usage
+/// 10. Trigger cross-thread summary if enough threads have accumulated
 async fn process_message(
     pool: &PgPool,
     llm: &LLMClient,
@@ -521,6 +720,55 @@ async fn process_message(
             }
             Err(e) => {
                 tracing::warn!("Failed to retrieve thread context: {:?}", e);
+            }
+        }
+
+        // Add last summary for this channel as high-priority context
+        match queries::get_latest_summary(pool, msg.channel_id).await {
+            Ok(Some(summary)) => {
+                builder.add_block(ContextBlock::new(
+                    "last_summary",
+                    BlockPriority::High,
+                    &format!("Previous channel summary (covers threads up to id={}):\n{}", summary.next_thread_id, summary.content),
+                    4_000,
+                ));
+
+                // Also include seq-0 messages completed after the last summary, if any
+                match queries::get_completed_seq0_messages_since(
+                    pool,
+                    msg.channel_id,
+                    summary.next_thread_id,
+                    5, // include up to 5 recent thread roots for context
+                )
+                .await
+                {
+                    Ok(roots) if !roots.is_empty() => {
+                        let roots_content: String = roots
+                            .iter()
+                            .map(|m| {
+                                format!(
+                                    "[Thread #{} by user]: {}",
+                                    m.thread_id.unwrap_or(m.id),
+                                    m.content.chars().take(300).collect::<String>()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n---\n");
+                        builder.add_block(ContextBlock::new(
+                            "recent_thread_roots_since_summary",
+                            BlockPriority::Normal,
+                            &format!(
+                                "Recent threads (after last summary):\n{}",
+                                roots_content
+                            ),
+                            2_000,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                // No summary yet for this channel — OK, just skip
             }
         }
 
@@ -948,7 +1196,15 @@ async fn process_message(
     let saved = queries::create_message(pool, &agent_msg).await?;
 
     // ── Summary generation (outside iteration budget) ──
-    let mut summary_msgs = messages.clone();
+    // Strip tool results from summary context — the summary only needs
+    // the conversation flow (user requests + agent responses), not raw tool
+    // outputs. This keeps summary tokens low and avoids silent failures
+    // from oversized context windows.
+    let mut summary_msgs: Vec<ChatMessage> = messages
+        .iter()
+        .filter(|m| m.role != "tool")
+        .cloned()
+        .collect();
     summary_msgs.push(ChatMessage::system(if limit_reached {
         "The iteration limit was reached so the task may be incomplete. \
          Summarize what was accomplished and inform the user they can request to continue."
@@ -967,10 +1223,16 @@ async fn process_message(
     let summary_text = match llm.completion(summary_request).await {
         Ok(resp) => {
             merge_usage(&mut cumulative_usage, resp.usage);
+            info!(
+                "[summary] Generated summary for message {} ({} chars, limit_reached={})",
+                msg.id,
+                resp.content.len(),
+                limit_reached,
+            );
             resp.content
         }
         Err(e) => {
-            warn!("Failed to generate summary: {:?}", e);
+            warn!("[summary] Failed to generate summary for message {}: {:?}", msg.id, e);
             format!("Summary generation failed: {}", e)
         }
     };
@@ -998,6 +1260,10 @@ async fn process_message(
         iterations: current_iter,
     };
     let _ = queries::create_message(pool, &summary_msg).await;
+    info!(
+        "[summary] Saved summary message for message {} (thread_id={})",
+        msg.id, msg.thread_id,
+    );
 
     // 10. Serialize cumulative token usage and record on the original prompt
     let token_usage_json = cumulative_usage.as_ref().map(|u| {
@@ -1022,6 +1288,11 @@ async fn process_message(
     .bind(msg.id)
     .execute(pool)
     .await?;
+
+    // 10. Trigger cross-thread summary check
+    //     This runs after every completed message to see if 2*N seq-0 threads
+    //     have accumulated since the last summary for this channel.
+    check_and_generate_summary(pool, llm, config, msg.channel_id).await;
 
     Ok(saved)
 }

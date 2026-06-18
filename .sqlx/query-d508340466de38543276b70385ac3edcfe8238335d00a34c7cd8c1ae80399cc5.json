@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO channels (name, platform, external_id, cause)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (platform, external_id)\n        DO UPDATE SET updated_at = NOW()\n        RETURNING\n            id, name, platform, external_id, cause,\n            current_profile, current_model, current_provider,\n            metadata::text AS \"metadata?\", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at!\", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"updated_at!\"\n        ",
+  "query": "\n        SELECT\n            id, name, platform, external_id, cause,\n            current_profile, current_model, current_provider,\n            '{}'::text AS \"metadata\",\n            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at\",\n            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"updated_at\"\n        FROM channels\n        WHERE name = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -93,28 +93,25 @@
       },
       {
         "ordinal": 8,
-        "name": "metadata?",
+        "name": "metadata",
         "type_info": "Text",
         "origin": "Expression"
       },
       {
         "ordinal": 9,
-        "name": "created_at!",
+        "name": "created_at",
         "type_info": "Text",
         "origin": "Expression"
       },
       {
         "ordinal": 10,
-        "name": "updated_at!",
+        "name": "updated_at",
         "type_info": "Text",
         "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Text",
         "Text"
       ]
     },
@@ -132,5 +129,5 @@
       null
     ]
   },
-  "hash": "5c8fe758c9ba379ed0882147c9e6a1c36a8daf4214027f5a5a2f7cf7a17b44ed"
+  "hash": "d508340466de38543276b70385ac3edcfe8238335d00a34c7cd8c1ae80399cc5"
 }

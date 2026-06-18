@@ -49,3 +49,10 @@ cargo sqlx prepare -- --bin omniagent
 - Summary generation uses a separate LLM call with `SUMMARY_TOKENS` max tokens (default 4096)
 - Old summaries are deleted alongside old messages via the daily cleanup task
 - Config env vars: `SUMMARY_WINDOW` (default 10), `SUMMARY_TOKENS` (default 4096), `DELETE_AFTER_DAYS` (default 30)
+
+### Research Efficiency
+- Research tasks follow the RESEARCH_WORKFLOW: read input → search_messages → search_wiki → batch fetch → write output → verify
+- Target 2-4 tool-calling rounds max for research tasks
+- Batch all HTTP fetches into a single round — never fetch one URL at a time
+- Verify output by reading the written file back after writing
+- Full documentation at `wiki/Reference/Research.md`

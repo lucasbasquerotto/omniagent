@@ -37,13 +37,26 @@ Fetch all 12 in a SINGLE tool-calling round.\n\
 Do not re-fetch with different query params, do not try alternative APIs for the same data. \
 The data you have is sufficient.\n\
 4. TRUST YOUR RESULTS — once you have data, move forward. Don't second-guess.\n\
-5. COMPLETE in 3-5 tool-calling rounds max. More than 10 means you failed at batching.\n\
+5. COMPLETE in 2-4 tool-calling rounds max for research. More than 6 means you failed at batching.\n\
 6. READ the input file, DO the work, WRITE output, VERIFY, DONE. No detours.\n\
 7. BEFORE fetching external data, ALWAYS use search_messages (to check \
 past conversation history) and search_wiki (to check the project knowledge base). \
 Existing knowledge may already cover the topic.\n\
 8. Skip Critical-Instructions.md and Anti-Patterns.md — they are not needed for \
-normal research tasks.";
+normal research tasks.\n\
+9. OUTPUT QUALITY: When writing research-output.md, include clear headers, \
+comparison tables where appropriate, and cite sources. Verify the file was written \
+by reading it back with filesystem_read.";
+
+const RESEARCH_WORKFLOW: &str = "\
+RESEARCH WORKFLOW (follow this exact sequence for research tasks):\n\
+1. Read research-input.md to understand the requirements and output path.\n\
+2. search_messages for relevant past research and existing knowledge.\n\
+3. search_wiki for knowledge base articles on the topic.\n\
+4. Fetch ALL external data in ONE batch — combine all HTTP fetches into a single\n\
+   tool-calling round. Do NOT fetch one URL at a time.\n\
+5. Write research-output.md with structured headers, comparison tables, and cited sources.\n\
+6. Verify the output was written correctly by reading it back.";
 
 const SKILLS_GUIDANCE: &str = "";
 
@@ -224,6 +237,7 @@ pub fn build_system_prompt_parts(
 
     stable_parts.push(DEFAULT_AGENT_IDENTITY.to_string());
     stable_parts.push(TOOL_GUIDANCE.to_string());
+    stable_parts.push(RESEARCH_WORKFLOW.to_string());
     stable_parts.push(SKILLS_GUIDANCE.to_string());
     stable_parts.push(GROUNDING_POLICY.to_string());
 

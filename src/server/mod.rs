@@ -1,9 +1,12 @@
-//! HTTP server for external control (stop, health, etc.)
+//! HTTP server for external control (stop, close, open, status, health)
 //!
 //! Provides endpoints:
 //! - `GET /health` — health check
-//! - `POST /stop/{channel_id}` — stop processing for a channel
-//! - `GET /stop/{channel_id}` — same (for easier testing)
+//! - `POST|GET /stop/{channel_id}` — skip pending/processing threads (no channel state change)
+//! - `POST|GET /close/{channel_id}` — close channel (skip threads, cancel handler)
+//! - `POST|GET /open/{channel_id}` — open channel (allow handler to start)
+//! - `GET /status/{channel_id}` — channel status info
+//! - `GET /prompt/{channel_name}` — show system prompt for a channel
 
 use axum::{
     extract::{Path, State},
@@ -48,6 +51,11 @@ pub async fn start_server(
         .route("/health", get(health_handler))
         .route("/stop/:channel_id", post(stop_handler))
         .route("/stop/:channel_id", get(stop_handler))
+        .route("/close/:channel_id", post(close_handler))
+        .route("/close/:channel_id", get(close_handler))
+        .route("/open/:channel_id", post(open_handler))
+        .route("/open/:channel_id", get(open_handler))
+        .route("/status/:channel_id", get(status_handler))
         .route("/prompt/:channel_name", get(prompt_handler))
         .with_state(app_state);
 
@@ -68,65 +76,154 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
-/// Stop processing for a specific channel.
-///
-/// This will:
-/// 1. Mark all pending messages for the channel as `skipped`.
-/// 2. Record the stop in the `channel_stops` table.
-/// 3. Cancel the channel's processing task (if active).
+/// Stop — mark all pending/processing threads as skipped.
+/// Does NOT change channel state (open/closed). The handler continues running
+/// but will find no pending threads on its next iteration.
 async fn stop_handler(
     Path(channel_id): Path<i64>,
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    // 1. Mark all pending messages as skipped
-    match queries::skip_pending_messages(&state.pool, channel_id).await {
+    let skipped = match queries::skip_channel_threads(&state.pool, channel_id).await {
         Ok(count) => {
             info!(
-                "Skipped {} pending messages for channel {}",
+                "Stop: skipped {} pending/processing threads for channel {}",
                 count, channel_id
             );
+            count
         }
         Err(e) => {
-            error!(
-                "Failed to skip messages for channel {}: {:?}",
-                channel_id, e
-            );
+            error!("Stop: failed to skip threads for channel {}: {:?}", channel_id, e);
+            0
         }
-    }
+    };
 
-    // 2. Record the stop in the database
-    if let Err(e) = queries::stop_channel(&state.pool, channel_id).await {
-        error!("Failed to record stop for channel {}: {:?}", channel_id, e);
+    Json(serde_json::json!({
+        "action": "stop",
+        "channel_id": channel_id,
+        "skipped_threads": skipped,
+    }))
+}
+
+/// Close — close the channel (skips threads, cancels handler).
+/// The supervisor will not spawn a new handler until the channel is opened again.
+async fn close_handler(
+    Path(channel_id): Path<i64>,
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    // 1. Mark all pending/processing threads as skipped
+    let skipped = match queries::skip_channel_threads(&state.pool, channel_id).await {
+        Ok(count) => {
+            info!(
+                "Close: skipped {} pending/processing threads for channel {}",
+                count, channel_id
+            );
+            count
+        }
+        Err(e) => {
+            error!("Close: failed to skip threads for channel {}: {:?}", channel_id, e);
+            0
+        }
+    };
+
+    // 2. Set channel as closed
+    if let Err(e) = queries::close_channel(&state.pool, channel_id).await {
+        error!("Close: failed to close channel {}: {:?}", channel_id, e);
+        return Json(serde_json::json!({
+            "status": "error",
+            "error": e.to_string(),
+            "channel_id": channel_id,
+        }));
     }
 
     // 3. Cancel the channel's processing task (if running)
     let mut tokens = state.cancel_tokens.lock().await;
-    if let Some(token) = tokens.remove(&channel_id) {
+    let has_handler = if let Some(token) = tokens.remove(&channel_id) {
         token.cancel();
-        info!("Cancelled processing task for channel {}", channel_id);
-        Json(serde_json::json!({
-            "status": "stopped",
-            "channel_id": channel_id,
-        }))
+        info!("Close: cancelled processing task for channel {}", channel_id);
+        true
     } else {
-        Json(serde_json::json!({
-            "status": "no_active_task",
+        false
+    };
+
+    Json(serde_json::json!({
+        "action": "close",
+        "channel_id": channel_id,
+        "closed": true,
+        "skipped_threads": skipped,
+        "handler_cancelled": has_handler,
+    }))
+}
+
+/// Open — reopen a closed channel so the supervisor can spawn a handler.
+async fn open_handler(
+    Path(channel_id): Path<i64>,
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    match queries::open_channel(&state.pool, channel_id).await {
+        Ok(_) => {
+            info!("Open: reopened channel {}", channel_id);
+            Json(serde_json::json!({
+                "action": "open",
+                "channel_id": channel_id,
+                "closed": false,
+            }))
+        }
+        Err(e) => {
+            error!("Open: failed to open channel {}: {:?}", channel_id, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "error": e.to_string(),
+                "channel_id": channel_id,
+            }))
+        }
+    }
+}
+
+/// Status — show channel info and thread counts.
+async fn status_handler(
+    Path(channel_id): Path<i64>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match queries::get_channel_status(&state.pool, channel_id).await {
+        Ok(Some(status)) => {
+            let has_handler = {
+                let tokens = state.cancel_tokens.lock().await;
+                tokens.contains_key(&channel_id)
+            };
+            Json(serde_json::json!({
+                "channel_id": status.channel_id,
+                "name": status.name,
+                "platform": status.platform,
+                "closed": status.closed,
+                "handler_running": has_handler,
+                "current_profile": status.current_profile,
+                "current_model": status.current_model,
+                "current_provider": status.current_provider,
+                "pending_threads": status.pending_threads,
+                "processing_threads": status.processing_threads,
+            }))
+        }
+        Ok(None) => Json(serde_json::json!({
+            "status": "not_found",
             "channel_id": channel_id,
-        }))
+        })),
+        Err(e) => {
+            error!("Status: failed to get status for channel {}: {:?}", channel_id, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "error": e.to_string(),
+                "channel_id": channel_id,
+            }))
+        }
     }
 }
 
 /// Show the system prompt for a channel, using `<<<prompt>>>` as the
 /// placeholder for where the user's actual message would go.
-///
-/// This is a reference tool — it shows what the prompt preamble would
-/// look like when a user sends a message to this channel, without
-/// actually invoking the agent.
 async fn prompt_handler(
     Path(channel_name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // 1. Look up the channel by name
     let channel = match queries::get_channel_by_name(&state.pool, &channel_name).await {
         Ok(Some(ch)) => ch,
         Ok(None) => {
@@ -144,23 +241,19 @@ async fn prompt_handler(
         }
     };
 
-    // 2. Determine the profile name
     let profile_name = if channel.current_profile.is_empty() {
         "default"
     } else {
         &channel.current_profile
     };
 
-    // 3. Load the memory store for the profile
     let profile_path = format!("{}/profiles/{}", state.data_dir, profile_name);
     let mut memory_store = MemoryStore::new(&profile_path);
     memory_store.load_from_disk();
 
-    // 4. Build the system prompt (same as process_message would)
     let platform = channel.platform.as_str();
     let system_prompt = build_system_prompt(&memory_store, platform, None, profile_name);
 
-    // 5. Format the full messages array as it would be sent to the LLM
     let result = format!(
         "System Prompt:\n{}\n\n---\n\nMessages sent to LLM:\n\n{{\n  \"role\": \"system\",\n  \"content\": \"\"\"\n{}\n  \"\"\"\n}},\n{{\n  \"role\": \"user\",\n  \"content\": \"<<<prompt>>>\"\n}}",
         system_prompt, system_prompt

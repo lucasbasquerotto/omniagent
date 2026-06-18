@@ -39,20 +39,21 @@ async fn aggregate_metrics(
         TokenAggRow,
         r#"
         SELECT
-            profile,
-            provider,
-            model,
-            SUM(COALESCE((token_usage->>'prompt_tokens')::bigint, 0))::bigint AS total_prompt_tokens,
-            SUM(COALESCE((token_usage->>'completion_tokens')::bigint, 0))::bigint AS total_completion_tokens,
-            SUM(COALESCE(processing_time_ms, 0)::bigint)::bigint AS total_processing_ms,
+            t.profile,
+            t.provider,
+            t.model,
+            SUM(t.input_tokens)::bigint AS total_prompt_tokens,
+            SUM(t.output_tokens)::bigint AS total_completion_tokens,
+            SUM(t.duration_ms)::bigint AS total_processing_ms,
             COUNT(*)::bigint AS message_count,
-            AVG(COALESCE(processing_time_ms, 0)::float)::float AS avg_processing_ms
-        FROM messages
-        WHERE role = 'agent'
-          AND msg_type = 'message'
-          AND created_at >= :cutoff
-          AND (:profile_filter = '' OR profile = :profile_filter)
-        GROUP BY profile, provider, model
+            AVG(t.duration_ms)::float AS avg_processing_ms
+        FROM threads t
+        JOIN messages m ON m.thread_id = t.id
+        WHERE m.role = 'agent'
+          AND m.msg_type = 'message'
+          AND m.created_at >= :cutoff
+          AND (:profile_filter = '' OR t.profile = :profile_filter)
+        GROUP BY t.profile, t.provider, t.model
         ORDER BY total_processing_ms DESC
         "#,
         ( :cutoff = cutoff, :profile_filter = profile_filter )
@@ -75,11 +76,12 @@ async fn count_grounded_responses(
         scalar Option<i64>,
         r#"
         SELECT COUNT(*)::bigint
-        FROM messages
-        WHERE role = 'agent'
-          AND msg_type = 'message'
-          AND created_at >= :cutoff
-          AND (:profile_filter = '' OR profile = :profile_filter)
+        FROM messages m
+        JOIN threads t ON t.id = m.thread_id
+        WHERE m.role = 'agent'
+          AND m.msg_type = 'message'
+          AND m.created_at >= :cutoff
+          AND (:profile_filter = '' OR t.profile = :profile_filter)
         "#,
         ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
@@ -92,12 +94,13 @@ async fn count_grounded_responses(
         scalar Option<i64>,
         r#"
         SELECT COUNT(*)::bigint
-        FROM messages
-        WHERE role = 'agent'
-          AND msg_type = 'message'
-          AND created_at >= :cutoff
-          AND (metadata->'context'->>'total_chars') IS NOT NULL
-          AND (:profile_filter = '' OR profile = :profile_filter)
+        FROM messages m
+        JOIN threads t ON t.id = m.thread_id
+        WHERE m.role = 'agent'
+          AND m.msg_type = 'message'
+          AND m.created_at >= :cutoff
+          AND (m.metadata->'context'->>'total_chars') IS NOT NULL
+          AND (:profile_filter = '' OR t.profile = :profile_filter)
         "#,
         ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
@@ -121,12 +124,13 @@ async fn count_retrieval_events(
         scalar Option<i64>,
         r#"
         SELECT COUNT(*)::bigint
-        FROM messages
-        WHERE role = 'agent'
-          AND msg_type = 'tool_call'
-          AND msg_subtype IN ('search_messages', 'search_wiki')
-          AND created_at >= :cutoff
-          AND (:profile_filter = '' OR profile = :profile_filter)
+        FROM messages m
+        JOIN threads t ON t.id = m.thread_id
+        WHERE m.role = 'agent'
+          AND m.msg_type = 'tool_call'
+          AND m.msg_subtype IN ('search_messages', 'search_wiki')
+          AND m.created_at >= :cutoff
+          AND (:profile_filter = '' OR t.profile = :profile_filter)
         "#,
         ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
@@ -151,17 +155,19 @@ async fn count_corrections(
         scalar Option<i64>,
         r#"
         WITH agent_responses AS (
-            SELECT id, channel_id, thread_id, created_at
-            FROM messages
-            WHERE role = 'agent'
-              AND msg_type = 'message'
-              AND created_at >= :cutoff
-              AND (:profile_filter = '' OR profile = :profile_filter)
+            SELECT m.id, t.channel_id, m.thread_id, m.created_at
+            FROM messages m
+            JOIN threads t ON t.id = m.thread_id
+            WHERE m.role = 'agent'
+              AND m.msg_type = 'message'
+              AND m.created_at >= :cutoff
+              AND (:profile_filter = '' OR t.profile = :profile_filter)
         )
         SELECT COUNT(DISTINCT m.id)::bigint
         FROM messages m
+        JOIN threads t ON t.id = m.thread_id
         INNER JOIN agent_responses a
-            ON m.channel_id = a.channel_id
+            ON t.channel_id = a.channel_id
             AND m.thread_id = a.thread_id
             AND m.created_at > a.created_at
             AND m.created_at <= a.created_at + INTERVAL '5 minutes'

@@ -61,9 +61,108 @@ cargo sqlx prepare -- --bin omniagent
 - Old summaries are deleted alongside old messages via the daily cleanup task
 - Config env vars: `SUMMARY_WINDOW` (default 10), `SUMMARY_TOKENS` (default 4096), `DELETE_AFTER_DAYS` (default 30)
 
-### Research Efficiency
-- Research tasks follow the RESEARCH_WORKFLOW: read input → search_messages → search_wiki → batch fetch → write output → verify
-- Target 2-4 tool-calling rounds max for research tasks
-- Batch all HTTP fetches into a single round — never fetch one URL at a time
-- Verify output by reading the written file back after writing
-- Full documentation at `wiki/Reference/Research.md`
+### Provider/Model Stamping and Validation
+
+**Stamping at creation time** — When any seq-0 message is created (user message, cron job, kanban ready-task), `provider` and `model` are resolved and stamped on the **thread** using this chain:
+1. Channel `current_provider` / `current_model`
+2. Profile `provider` / `model`
+3. `LLM_PROVIDER` / `LLM_MODEL` env vars
+4. Built-in defaults: `opencode-go` / `deepseek-v4-flash`
+
+**Validation at execution time** — In `process_thread()` (src/agent/mod.rs), before calling the LLM, four checks run:
+1. `thread.profile` is non-empty → `no-profile` error
+2. Profile exists in `ProfileRegistry` → `invalid-profile` error (Note: ProfileRegistry.get() falls back to default profile, so this only fails if there's no default either)
+3. `thread.provider` is `None` or empty → `no-provider` error
+4. `thread.model` is `None` or empty → `no-model` error
+
+Failed validation inserts a `msg_type='error'` message into the thread and marks the thread as `failed`.
+
+### Thread Architecture
+
+Messages are organized into **threads** — a thread represents a single user request (or cron/kanban trigger) and its LLM processing loop.
+
+- `threads` table (Postgres): `id`, `status`, `cause`, `channel_id`, `profile`, `provider`, `model`, token usage, timestamps
+- `messages` table: `id`, `thread_id` (FK), `role`, `content`, `thread_sequence`, `msg_type`, `msg_subtype`
+- Profile/model/provider live on the **thread**, not individual messages
+
+**Thread statuses:** `created` → `pending` → `processing` → `completed`/`failed`/`skipped`/`interrupted`
+
+**Channel handlers** (one per channel, spawned by supervisor loop):
+- Poll for `pending` threads every 1 second
+- **Sequential** within a channel: threads are processed one at a time per channel (ordered by `created_at`)
+- **Parallel** across channels: each channel handler runs as an independent tokio task
+
+### Testing Guide
+
+#### Test 1: All causes in a single channel
+```sql
+-- Insert threads with different causes in the same channel
+INSERT INTO threads (status, cause, channel_id, profile, provider, model)
+VALUES ('created', 'user', <ch_id>, 'default', 'opencode-go', 'deepseek-v4-flash');
+-- repeat for 'cron' and 'kanban' causes
+
+-- Add cause messages
+INSERT INTO messages (thread_id, role, content, thread_sequence, msg_type)
+VALUES (<thread_id>, 'cause', 'your prompt', 0, 'message');  -- or 'cron', 'kanban'
+
+-- Set pending
+UPDATE threads SET status = 'pending' WHERE channel_id = <ch_id> AND status = 'created';
+```
+
+**Expected:** Threads processed **sequentially** (one after another) in the same channel. All complete with cause and msg_type preserved.
+
+#### Test 2: Different channels (parallelism)
+```sql
+-- Insert threads in DIFFERENT channels
+INSERT INTO threads (...) VALUES ('created', 'user',  <ch_a>, ...);
+INSERT INTO threads (...) VALUES ('created', 'cron',  <ch_b>, ...);
+INSERT INTO threads (...) VALUES ('created', 'kanban', <ch_c>, ...);
+UPDATE threads SET status = 'pending' WHERE channel_id IN (<ch_a>, <ch_b>, <ch_c>);
+```
+
+**Expected:** Threads started at the **same second** — parallel processing across channels. Each channel's handler runs independently.
+
+#### Test 3: Stop and Resume
+```bash
+# Stop a channel mid-processing
+curl http://localhost:8080/stop/<channel_id>
+
+# Check thread status — should be 'skipped'
+SELECT id, status, cause, started_at IS NOT NULL as started, ended_at IS NOT NULL as ended
+FROM threads WHERE channel_id = <channel_id> ORDER BY id DESC LIMIT 5;
+
+# Resume the channel
+curl http://localhost:8080/resume/<channel_id>
+
+# New message executes immediately after resume
+INSERT INTO threads (...) VALUES ('created', 'user', <ch_id>, ...);
+```
+
+**Expected:** Stopped threads get `skipped` status with `ended_at` set. After resume, new messages are picked up immediately by the next supervisor cycle.
+
+#### Test 4: Failure cases
+```sql
+-- Empty provider → should fail with clear error
+INSERT INTO threads (...) VALUES ('created', 'user', <ch>, 'default', '', 'deepseek-v4-flash');
+
+-- Empty model → should fail with clear error
+INSERT INTO threads (...) VALUES ('created', 'user', <ch>, 'default', 'opencode-go', '');
+
+-- Nonexistent profile → falls back to default profile (intentional feature)
+INSERT INTO threads (...) VALUES ('created', 'user', <ch>, 'nonexistent', 'opencode-go', 'deepseek-v4-flash');
+```
+
+**Expected:** Empty provider/model fail with clear error msg in thread. Nonexistent profile falls back to default.
+
+#### Monitoring
+```bash
+# Watch processing
+docker compose logs -f omniagent | grep -E "Processing|completed|summary"
+
+# Query threads state
+docker compose exec postgres psql -U omniagent -d omniagent -c "
+SELECT t.id, t.status, t.cause, c.name as ch,
+       (SELECT count(*) FROM messages m WHERE m.thread_id = t.id) as msg_count
+FROM threads t JOIN channels c ON t.channel_id = c.id
+WHERE t.channel_id = <ch_id> ORDER BY t.id;"
+```

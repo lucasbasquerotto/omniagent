@@ -46,7 +46,6 @@ services:
       - ./data:/opt/data:rw
       - /tmp/data/omni:/tmp/data/omni:rw
       - /var/run/docker.sock:/var/run/docker.sock:rw
-      - /usr/bin/docker:/usr/bin/docker:ro
       - /opt/workspace:/opt/workspace:rw
       - /opt/data/credentials:/opt/data/credentials:ro
       - /opt/data/.env:/opt/data/.env:ro

@@ -477,10 +477,80 @@ The backup container does not depend on the omniagent service. It only needs:
 - `backup.env` with valid S3 credentials
 - Network access to the S3 endpoint
 
-This allows restoring data onto a fresh machine before the agent is even built. Commands can be run imperatively:
+## Operator Runbook
+
+### Tuning Retrieval & Grounding
+
+#### Profile Knobs
+
+| Setting | Values | Effect |
+|---------|--------|--------|
+| `auto_retrieval_enabled` | `true` / `false` | Master switch for automatic context retrieval |
+| `retrieval_aggressiveness` | `0` (off) → `3` (aggressive) | Controls which sources are queried (see Hybrid Retrieval section) |
+| `grounding_required` | `true` / `false` | When true, agent is instructed to provide evidence for claims |
+
+#### When to Adjust Aggressiveness
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| Agent ignores past context | `retrieval_aggressiveness` too low | Set to `2` or `3` |
+| Token usage too high / slow responses | Too many context blocks | Reduce to `1` or lower budgets in `ContextBuilder` |
+| Agent hallucinates project-specific facts | `auto_retrieval_enabled` off | Enable with `retrieval_aggressiveness` >= `2` |
+| Irrelevant context in prompts | Budget too generous | Reduce `ContextBuilder` budget (default 4000) |
+
+### Running Evals
+
+The eval runner (`scripts/eval-runner.py`) runs test prompts and records results:
 
 ```bash
-# On a fresh machine with data/ empty:
-docker compose run --rm backup restore_backup
-docker compose up -d
+# Install dependency
+pip install psycopg2-binary
+
+# Run full suite
+python3 scripts/eval-runner.py --db-url "$DATABASE_URL" --channel 1
+
+# Run a specific case
+python3 scripts/eval-runner.py --db-url "$DATABASE_URL" --channel 1 --case basic_qna
+
+# Compare against baseline
+python3 scripts/eval-runner.py --db-url "$DATABASE_URL" --channel 1 --compare
+
+# Save current as baseline
+python3 scripts/eval-runner.py --db-url "$DATABASE_URL" --channel 1 --save-baseline
 ```
+
+### Checking Metrics
+
+Use the `get_metrics` MCP tool (available to the agent) to query:
+
+- Token usage (prompt/completion) by profile and model
+- Average processing time per message
+- Grounded response rate (how often evidence metadata is present)
+- Retrieval tool call frequency
+- User corrections proxy (potential hallucination indicator)
+
+Example metric queries:
+```
+get_metrics hours=24              # Last 24 hours, all profiles
+get_metrics hours=168 profile=research  # Last week, research profile only
+```
+
+### Setting Up External MCP Servers
+
+1. Create a JSON/YAML config file:
+   ```json
+   {
+     "servers": [
+       {
+         "name": "my-tool",
+         "transport": "stdio",
+         "command": "python3",
+         "args": ["/path/to/mcp_server.py"]
+       }
+     ]
+   }
+   ```
+2. Set `MCP_SERVERS_CONFIG` env var to the config path, or place at `<data_dir>/config/mcp-servers.json`
+3. Restart the agent — tools are auto-discovered and registered
+4. Verify in agent logs: "Registered N external tool(s) from 'my-tool'"
+

@@ -203,6 +203,9 @@ pub fn default_registry(ctx: &AppContext) -> McpRegistry {
     registry.register(tools::memory::list_memories_tool());
     registry.register(tools::memory::review_memories_tool());
 
+    // Metrics tool
+    registry.register(tools::metrics::get_metrics_tool());
+
     // External MCP servers (load from config, best-effort)
     let external_tools = external::client::initialize_external_tools(&ctx.data_dir);
     for tool in external_tools {

@@ -51,6 +51,7 @@ impl Profile {
                 "promote_to_memory".to_string(),
                 "list_memories".to_string(),
                 "review_memories".to_string(),
+                "get_metrics".to_string(),
             ],
             auto_retrieval_enabled: true,
             retrieval_aggressiveness: 2,

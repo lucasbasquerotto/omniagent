@@ -41,7 +41,7 @@ pub struct MessageDb {
     pub processing_time_ms: Option<i32>,
     pub token_usage: Option<String>,
     pub iterations: i32,
-    pub created_at: String,
+    pub created_at: Option<String>,
 }
 
 impl TryFrom<MessageDb> for Message {
@@ -75,8 +75,10 @@ impl TryFrom<MessageDb> for Message {
             iterations: db.iterations,
             created_at: db
                 .created_at
+                .as_deref()
+                .unwrap_or("")
                 .parse::<DateTime<Utc>>()
-                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.created_at, e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.created_at.as_deref().unwrap_or("?"), e))?,
         })
     }
 }
@@ -112,7 +114,7 @@ pub struct CreateMessageRow {
     pub processing_time_ms: Option<i32>,
     pub token_usage: Option<String>,
     pub iterations: i32,
-    pub created_at: String,
+    pub created_at: Option<String>,
 }
 
 impl From<CreateMessageRow> for MessageDb {
@@ -209,8 +211,8 @@ pub struct ChannelDb {
     pub current_model: Option<String>,
     pub current_provider: Option<String>,
     pub metadata: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 impl TryFrom<ChannelDb> for Channel {
@@ -229,12 +231,16 @@ impl TryFrom<ChannelDb> for Channel {
             metadata: db.metadata.as_deref().map(|s| serde_json::from_str(s).unwrap_or_default()).unwrap_or_default(),
             created_at: db
                 .created_at
+                .as_deref()
+                .unwrap_or("")
                 .parse::<DateTime<Utc>>()
-                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.created_at, e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.created_at.as_deref().unwrap_or("?"), e))?,
             updated_at: db
                 .updated_at
+                .as_deref()
+                .unwrap_or("")
                 .parse::<DateTime<Utc>>()
-                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.updated_at, e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.updated_at.as_deref().unwrap_or("?"), e))?,
         })
     }
 }
@@ -247,7 +253,7 @@ impl TryFrom<ChannelDb> for Channel {
 pub struct ChannelStopDb {
     pub id: i64,
     pub channel_id: i64,
-    pub stopped_at: String,
+    pub stopped_at: Option<String>,
 }
 
 impl TryFrom<ChannelStopDb> for ChannelStop {
@@ -259,10 +265,25 @@ impl TryFrom<ChannelStopDb> for ChannelStop {
             channel_id: db.channel_id,
             stopped_at: db
                 .stopped_at
+                .as_deref()
+                .unwrap_or("")
                 .parse::<DateTime<Utc>>()
-                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.stopped_at, e))?,
+                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.stopped_at.as_deref().unwrap_or("?"), e))?,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Summary DB struct (for SELECT results)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SummaryDb {
+    pub id: i64,
+    pub channel_id: i64,
+    pub next_thread_id: i64,
+    pub content: String,
+    pub created_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,11 +298,11 @@ pub async fn find_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Re
         SELECT
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata?", embedding, summary_text, is_summary,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
             iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE channel_id = :channel_id AND status = 'pending'
         ORDER BY created_at ASC
@@ -318,11 +339,11 @@ pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> anyhow::Result<M
         RETURNING
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata?", embedding, summary_text, is_summary,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
             iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         "#,
         ( :channel_id = db.channel_id, :role = &db.role, :content = &db.content, :status = &db.status, :thread_id = db.thread_id.unwrap_or(0), :thread_sequence = db.thread_sequence, :external_id = db.external_id.as_deref().unwrap_or(""), :metadata = &metadata_val, :embedding = db.embedding.as_deref().unwrap_or(""), :summary_text = db.summary_text.as_deref().unwrap_or(""), :is_summary = db.is_summary, :msg_type = &db.msg_type, :msg_subtype = db.msg_subtype.as_deref().unwrap_or(""), :iteration_count = db.iteration_count, :profile = &db.profile, :provider = db.provider.as_deref().unwrap_or(""), :model = db.model.as_deref().unwrap_or(""), :processing_time_ms = processing_time_ms_val, :token_usage = &token_usage_val, :iterations = db.iterations )
     )
@@ -355,11 +376,11 @@ pub async fn init_thread_root(pool: &PgPool, msg: &MessageNew) -> anyhow::Result
         SELECT
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata?", embedding, summary_text, is_summary,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
             iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE id = :id
         "#,
@@ -394,7 +415,9 @@ pub async fn find_all_channels(pool: &PgPool) -> anyhow::Result<Vec<Channel>> {
         SELECT
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
-            metadata::text AS "metadata?", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at!"
+            '{}'::text AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
         FROM channels
         ORDER BY name ASC
         "#
@@ -520,7 +543,7 @@ pub async fn find_stopped_channel(
     let row: Option<ChannelStopDb> = sql_forge!(
         ChannelStopDb,
         r#"
-        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at!"
+        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at"
         FROM channel_stops
         WHERE channel_id = :channel_id
         "#,
@@ -562,11 +585,11 @@ pub async fn get_recent_thread_messages(
         SELECT
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata?", embedding, summary_text, is_summary,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
             iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE thread_id = :thread_id
           AND role IN ('user', 'agent')
@@ -596,11 +619,11 @@ pub async fn search_messages_text(
         SELECT
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata?", embedding, summary_text, is_summary,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
             iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE channel_id = :channel_id
           AND content ILIKE :pattern
@@ -663,7 +686,9 @@ pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Op
         SELECT
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
-            metadata::text AS "metadata?", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at!"
+            '{}'::text AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
         FROM channels
         WHERE name = :name
         "#,
@@ -692,7 +717,9 @@ pub async fn create_channel(
         RETURNING
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
-            metadata::text AS "metadata?", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at!"
+            COALESCE(metadata::text, '{}') AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
         "#,
         ( :name = name, :platform = platform, :external_id = external_id, :cause = cause )
     )
@@ -721,11 +748,11 @@ pub async fn search_messages_semantic(
         SELECT
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata?", embedding, summary_text, is_summary,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
             iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE channel_id = $1
           AND embedding IS NOT NULL
@@ -872,7 +899,7 @@ pub async fn find_all_stopped_channels(pool: &PgPool) -> anyhow::Result<Vec<Chan
     let rows: Vec<ChannelStopDb> = sql_forge!(
         ChannelStopDb,
         r#"
-        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at!"
+        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at"
         FROM channel_stops
         ORDER BY stopped_at DESC
         "#
@@ -881,4 +908,159 @@ pub async fn find_all_stopped_channels(pool: &PgPool) -> anyhow::Result<Vec<Chan
     .await?;
 
     rows.into_iter().map(|r| r.try_into()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Summary query functions
+// ---------------------------------------------------------------------------
+
+/// Get the latest (most recent) summary for a channel.
+pub async fn get_latest_summary(
+    pool: &PgPool,
+    channel_id: i64,
+) -> anyhow::Result<Option<SummaryDb>> {
+    let row: Option<SummaryDb> = sql_forge!(
+        SummaryDb,
+        r#"
+        SELECT
+            id, channel_id, next_thread_id, content,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM summaries
+        WHERE channel_id = :channel_id
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+        ( :channel_id = channel_id )
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// Get the last N summaries for a channel (newest first).
+pub async fn get_recent_summaries(
+    pool: &PgPool,
+    channel_id: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<SummaryDb>> {
+    let rows: Vec<SummaryDb> = sql_forge!(
+        SummaryDb,
+        r#"
+        SELECT
+            id, channel_id, next_thread_id, content,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM summaries
+        WHERE channel_id = :channel_id
+        ORDER BY id DESC
+        LIMIT :limit
+        "#,
+        ( :channel_id = channel_id, :limit = limit )
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Get completed seq-0 messages (thread roots) with id > since_id,
+/// ordered by id ASC, limited to `limit` rows.
+pub async fn get_completed_seq0_messages_since(
+    pool: &PgPool,
+    channel_id: i64,
+    since_id: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<MessageDb>> {
+    let rows: Vec<MessageDb> = sql_forge!(
+        MessageDb,
+        r#"
+        SELECT
+            id, channel_id, role, content, status,
+            thread_id, thread_sequence, external_id,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
+            msg_type, msg_subtype, iteration_count,
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
+            iterations,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM messages
+        WHERE channel_id = :channel_id
+          AND thread_sequence = 0
+          AND status = 'completed'
+          AND id > :since_id
+        ORDER BY id ASC
+        LIMIT :limit
+        "#,
+        ( :channel_id = channel_id, :since_id = since_id, :limit = limit )
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Get all messages for a given thread, ordered by thread_sequence ASC.
+pub async fn get_thread_messages(
+    pool: &PgPool,
+    thread_id: i64,
+) -> anyhow::Result<Vec<MessageDb>> {
+    let rows: Vec<MessageDb> = sql_forge!(
+        MessageDb,
+        r#"
+        SELECT
+            id, channel_id, role, content, status,
+            thread_id, thread_sequence, external_id,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
+            msg_type, msg_subtype, iteration_count,
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
+            iterations,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM messages
+        WHERE thread_id = :thread_id
+        ORDER BY thread_sequence ASC, created_at ASC
+        "#,
+        ( :thread_id = thread_id )
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Create a new summary record.
+pub async fn create_summary(
+    pool: &PgPool,
+    channel_id: i64,
+    next_thread_id: i64,
+    content: &str,
+) -> anyhow::Result<SummaryDb> {
+    let row: SummaryDb = sql_forge!(
+        SummaryDb,
+        r#"
+        INSERT INTO summaries (channel_id, next_thread_id, content)
+        VALUES (:channel_id, :next_thread_id, :content)
+        RETURNING
+            id, channel_id, next_thread_id, content,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        "#,
+        ( :channel_id = channel_id, :next_thread_id = next_thread_id, :content = content )
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// Delete summaries older than the given cutoff date.
+pub async fn delete_old_summaries(
+    pool: &PgPool,
+    before: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<u64> {
+    let result = sql_forge!(
+        "DELETE FROM summaries WHERE created_at < :cutoff",
+        ( :cutoff = before )
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
 }

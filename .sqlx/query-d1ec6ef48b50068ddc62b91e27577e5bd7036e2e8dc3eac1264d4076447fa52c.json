@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, platform, external_id, cause,\n            current_profile, current_model, current_provider,\n            metadata::text AS \"metadata?\", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at!\", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"updated_at!\"\n        FROM channels\n        ORDER BY name ASC\n        ",
+  "query": "\n        INSERT INTO channels (name, platform, external_id, cause)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (platform, external_id)\n        DO UPDATE SET updated_at = NOW()\n        RETURNING\n            id, name, platform, external_id, cause,\n            current_profile, current_model, current_provider,\n            COALESCE(metadata::text, '{}') AS \"metadata\",\n            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at\",\n            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"updated_at\"\n        ",
   "describe": {
     "columns": [
       {
@@ -93,25 +93,30 @@
       },
       {
         "ordinal": 8,
-        "name": "metadata?",
+        "name": "metadata",
         "type_info": "Text",
         "origin": "Expression"
       },
       {
         "ordinal": 9,
-        "name": "created_at!",
+        "name": "created_at",
         "type_info": "Text",
         "origin": "Expression"
       },
       {
         "ordinal": 10,
-        "name": "updated_at!",
+        "name": "updated_at",
         "type_info": "Text",
         "origin": "Expression"
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
     },
     "nullable": [
       false,
@@ -127,5 +132,5 @@
       null
     ]
   },
-  "hash": "fabb64eedf465bb79fd44059886ee0d001ed37bb23a7b454a2fb872788eae603"
+  "hash": "d1ec6ef48b50068ddc62b91e27577e5bd7036e2e8dc3eac1264d4076447fa52c"
 }

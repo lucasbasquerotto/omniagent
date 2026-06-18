@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, channel_id, role, content, status,\n            thread_id, thread_sequence, external_id,\n            metadata::text AS \"metadata?\", embedding, summary_text, is_summary,\n            msg_type, msg_subtype, iteration_count,\n            profile, provider, model, processing_time_ms, token_usage::text AS \"token_usage?\",\n            iterations,\n            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at!\"\n        FROM messages\n        WHERE channel_id = $1 AND status = 'pending'\n        ORDER BY created_at ASC\n        ",
+  "query": "\n        SELECT\n            id, channel_id, role, content, status,\n            thread_id, thread_sequence, external_id,\n            metadata::text AS \"metadata\", embedding, summary_text, is_summary,\n            msg_type, msg_subtype, iteration_count,\n            profile, provider, model, processing_time_ms, token_usage::text AS \"token_usage\",\n            iterations,\n            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at\"\n        FROM messages\n        WHERE channel_id = $1 AND status = 'pending'\n        ORDER BY created_at ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -93,7 +93,7 @@
       },
       {
         "ordinal": 8,
-        "name": "metadata?",
+        "name": "metadata",
         "type_info": "Text",
         "origin": "Expression"
       },
@@ -209,7 +209,7 @@
       },
       {
         "ordinal": 19,
-        "name": "token_usage?",
+        "name": "token_usage",
         "type_info": "Text",
         "origin": "Expression"
       },
@@ -226,7 +226,7 @@
       },
       {
         "ordinal": 21,
-        "name": "created_at!",
+        "name": "created_at",
         "type_info": "Text",
         "origin": "Expression"
       }
@@ -261,5 +261,5 @@
       null
     ]
   },
-  "hash": "8cb0fc613fc04272dae4a56878f73e8537541f352a30d4c921e99f7d6f8d6b2e"
+  "hash": "678bf4cff7f05e3b9947725bf0b1f0879503e16608e9f6ff98583ddac3f597da"
 }

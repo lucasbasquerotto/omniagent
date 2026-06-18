@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     let mcp = mcp::default_registry(&ctx);
 
     // Build the agent with MCP context
-    let agent = agent::Agent::new(pool.clone(), agent_cfg, mcp, ctx);
+    let agent = agent::Agent::new(pool.clone(), agent_cfg.clone(), mcp, ctx);
 
     // ── STARTUP: Skip pending/processing messages BEFORE spawning any concurrent tasks ──
     if let Err(e) = agent::skip_on_startup(&pool).await {
@@ -113,15 +113,13 @@ async fn main() -> Result<()> {
 
     // Spawn old-message deletion task (daily cleanup)
     let pool_clean = pool.clone();
-    let delete_after_days = std::env::var("DELETE_AFTER_DAYS")
-        .unwrap_or_else(|_| "30".to_string())
-        .parse::<u32>()
-        .unwrap_or(30);
+    let delete_after_days = agent_cfg.delete_after_days;
     let cleanup_handle = tokio::spawn(async move {
         let interval = tokio::time::Duration::from_secs(86400); // daily
         loop {
             tokio::time::sleep(interval).await;
             let before = chrono::Utc::now() - chrono::Duration::days(delete_after_days as i64);
+            // Delete old messages
             match db::types::delete_old_messages(&pool_clean, before).await {
                 Ok(count) => {
                     if count > 0 {
@@ -133,6 +131,19 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => tracing::error!("Failed to delete old messages: {:?}", e),
+            }
+            // Delete old summaries
+            match db::types::delete_old_summaries(&pool_clean, before).await {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(
+                            "Deleted {} summaries older than {} days",
+                            count,
+                            delete_after_days
+                        );
+                    }
+                }
+                Err(e) => tracing::error!("Failed to delete old summaries: {:?}", e),
             }
         }
     });

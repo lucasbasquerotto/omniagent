@@ -31,7 +31,7 @@ Your tools: filesystem, HTTP fetch, search. Use minimum roundtrips.";
 
 const TOOL_GUIDANCE: &str = "TOOL USE RULES (fail the task if you violate these):\n\
 1. PLAN before acting — decide ALL data needed in one shot.\n\
-2. BATCH every fetch into ONE turn. Need 4 GitHub repos + 4 crates + 4 shields? \
+2. BATCH every fetch into ONE turn. Need 4 GitHub repos + 4 READMEs + 4 GitHub APIs? \
 Fetch all 12 in a SINGLE tool-calling round.\n\
 3. NEVER fetch the same URL twice. If you already fetched a URL, USE its result. \
 Do not re-fetch with different query params, do not try alternative APIs for the same data. \
@@ -39,7 +39,10 @@ The data you have is sufficient.\n\
 4. TRUST YOUR RESULTS — once you have data, move forward. Don't second-guess.\n\
 5. COMPLETE in 3-5 tool-calling rounds max. More than 10 means you failed at batching.\n\
 6. READ the input file, DO the work, WRITE output, VERIFY, DONE. No detours.\n\
-7. Skip Critical-Instructions.md and Anti-Patterns.md — they are not needed for \
+7. BEFORE fetching external data, ALWAYS use search_messages (to check \
+past conversation history) and search_wiki (to check the project knowledge base). \
+Existing knowledge may already cover the topic.\n\
+8. Skip Critical-Instructions.md and Anti-Patterns.md — they are not needed for \
 normal research tasks.";
 
 const SKILLS_GUIDANCE: &str = "";
@@ -55,7 +58,10 @@ whenever possible (message IDs, wiki file paths, tool call IDs).\n\
 4. If you lack sufficient evidence to answer, either ask a clarifying \
 question or trigger a search/retrieval tool before responding.";
 
-const WIKI_GUIDANCE: &str = "Your wiki at <data_dir>/profiles/<profile>/wiki/ stores long-term knowledge.";
+const WIKI_GUIDANCE: &str = "Your wiki at <data_dir>/profiles/<profile>/wiki/ stores long-term knowledge. \
+Use search_wiki to find relevant wiki pages. \
+Use search_messages to find past conversations and research results. \
+Both are available as MCP tools — check them before fetching external data.";
 
 const PROFILE_HINT: &str = "Active OmniAgent profile: default. \
 Your profile configuration determines which model, provider, and tools are available. \

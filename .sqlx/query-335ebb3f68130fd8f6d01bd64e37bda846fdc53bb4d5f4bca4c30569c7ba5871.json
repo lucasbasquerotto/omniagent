@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"stopped_at!\"\n        FROM channel_stops\n        WHERE channel_id = $1\n        ",
+  "query": "\n        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"stopped_at\"\n        FROM channel_stops\n        ORDER BY stopped_at DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -27,15 +27,13 @@
       },
       {
         "ordinal": 2,
-        "name": "stopped_at!",
+        "name": "stopped_at",
         "type_info": "Text",
         "origin": "Expression"
       }
     ],
     "parameters": {
-      "Left": [
-        "Int8"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -43,5 +41,5 @@
       null
     ]
   },
-  "hash": "fb2678652643669d39a4a85615186bbcf41f9c29752790a21e400b5d9ef4b0a3"
+  "hash": "335ebb3f68130fd8f6d01bd64e37bda846fdc53bb4d5f4bca4c30569c7ba5871"
 }

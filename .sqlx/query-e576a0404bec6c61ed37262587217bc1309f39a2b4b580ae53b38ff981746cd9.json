@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, channel_id, role, content, status,\n            thread_id, thread_sequence, external_id,\n            metadata::text AS \"metadata?\", embedding, summary_text, is_summary,\n            msg_type, msg_subtype, iteration_count,\n            profile, provider, model, processing_time_ms, token_usage::text AS \"token_usage?\",\n            iterations,\n            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at!\"\n        FROM messages\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT\n            id, channel_id, role, content, status,\n            thread_id, thread_sequence, external_id,\n            metadata::text AS \"metadata\", embedding, summary_text, is_summary,\n            msg_type, msg_subtype, iteration_count,\n            profile, provider, model, processing_time_ms, token_usage::text AS \"token_usage\",\n            iterations,\n            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US\"Z\"'), '') AS \"created_at\"\n        FROM messages\n        WHERE channel_id = $1\n          AND thread_sequence = 0\n          AND status = 'completed'\n          AND id > $2\n        ORDER BY id ASC\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
@@ -93,7 +93,7 @@
       },
       {
         "ordinal": 8,
-        "name": "metadata?",
+        "name": "metadata",
         "type_info": "Text",
         "origin": "Expression"
       },
@@ -209,7 +209,7 @@
       },
       {
         "ordinal": 19,
-        "name": "token_usage?",
+        "name": "token_usage",
         "type_info": "Text",
         "origin": "Expression"
       },
@@ -226,13 +226,15 @@
       },
       {
         "ordinal": 21,
-        "name": "created_at!",
+        "name": "created_at",
         "type_info": "Text",
         "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
+        "Int8",
+        "Int8",
         "Int8"
       ]
     },
@@ -261,5 +263,5 @@
       null
     ]
   },
-  "hash": "b155afedb55d3cca3affe6a2c274e0a1d2dac3b6a55cdc5f314c1799d2c125af"
+  "hash": "e576a0404bec6c61ed37262587217bc1309f39a2b4b580ae53b38ff981746cd9"
 }

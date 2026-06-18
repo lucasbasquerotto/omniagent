@@ -3,9 +3,10 @@
 //! complex types (DateTime, JSON, enums) as plain strings. Conversion to
 //! domain types is done explicitly in Rust — no SQL type casting.
 //!
-//! Currently uses raw sqlx queries (runtime-only validation). When the project
-//! upgrades sqlx to 0.9, replace `sqlx::query_as` calls with `sql_forge!(...)`
-//! macros for compile-time SQL validation.
+//! Currently uses `sql_forge!(...)` macros for compile-time SQL validation.
+//! DB structs use only primitive types (Strings for DateTime/JSON/enums) with
+//! Rust-side conversion. SQL columns that can return NULL use `Option<T>` in
+//! the struct with `AS "column?"` in the query.
 
 use chrono::{DateTime, Utc};
 use sql_forge::sql_forge;
@@ -27,7 +28,7 @@ pub struct MessageDb {
     pub thread_id: Option<i64>,
     pub thread_sequence: i32,
     pub external_id: Option<String>,
-    pub metadata: String,
+    pub metadata: Option<String>,
     pub embedding: Option<String>,
     pub summary_text: Option<String>,
     pub is_summary: bool,
@@ -59,7 +60,7 @@ impl TryFrom<MessageDb> for Message {
             thread_id: db.thread_id.unwrap_or(db.id),
             thread_sequence: db.thread_sequence,
             external_id: db.external_id,
-            metadata: serde_json::from_str(&db.metadata).unwrap_or(serde_json::json!({})),
+            metadata: db.metadata.as_deref().map(|s| serde_json::from_str(s).unwrap_or_default()).unwrap_or_default(),
             embedding: db.embedding,
             summary_text: db.summary_text,
             is_summary: db.is_summary,
@@ -148,7 +149,7 @@ pub struct ChannelDb {
     pub current_profile: String,
     pub current_model: Option<String>,
     pub current_provider: Option<String>,
-    pub metadata: String,
+    pub metadata: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -166,7 +167,7 @@ impl TryFrom<ChannelDb> for Channel {
             current_profile: db.current_profile,
             current_model: db.current_model,
             current_provider: db.current_provider,
-            metadata: serde_json::from_str(&db.metadata).unwrap_or(serde_json::json!({})),
+            metadata: db.metadata.as_deref().map(|s| serde_json::from_str(s).unwrap_or_default()).unwrap_or_default(),
             created_at: db
                 .created_at
                 .parse::<DateTime<Utc>>()
@@ -211,21 +212,23 @@ impl TryFrom<ChannelStopDb> for ChannelStop {
 // ---------------------------------------------------------------------------
 
 pub async fn find_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Result<Vec<Message>> {
-    let rows: Vec<MessageDb> = sqlx::query_as(
+    let rows: Vec<MessageDb> = sql_forge!(
+        MessageDb,
         r#"
         SELECT
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text, embedding, summary_text, is_summary,
+            metadata::text AS "metadata?", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text,
-            TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
+            iterations,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
         FROM messages
-        WHERE channel_id = $1 AND status = 'pending'
+        WHERE channel_id = :channel_id AND status = 'pending'
         ORDER BY created_at ASC
         "#,
+        ( :channel_id = channel_id )
     )
-    .bind(channel_id)
     .fetch_all(pool)
     .await?;
 
@@ -298,21 +301,22 @@ pub async fn init_thread_root(pool: &PgPool, msg: &MessageNew) -> anyhow::Result
     .await?;
 
     // Re-read with thread_id now populated
-    let row: MessageDb = sqlx::query_as(
+    let row: MessageDb = sql_forge!(
+        MessageDb,
         r#"
         SELECT
             id, channel_id, role, content, status,
             thread_id, thread_sequence, external_id,
-            metadata::text, embedding, summary_text, is_summary,
+            metadata::text AS "metadata?", embedding, summary_text, is_summary,
             msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text,
+            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage?",
             iterations,
-            TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!"
         FROM messages
-        WHERE id = $1
+        WHERE id = :id
         "#,
+        ( :id = inserted.id )
     )
-    .bind(inserted.id)
     .fetch_one(pool)
     .await?;
 
@@ -336,15 +340,16 @@ pub async fn update_message_status(
 }
 
 pub async fn find_all_channels(pool: &PgPool) -> anyhow::Result<Vec<Channel>> {
-    let rows: Vec<ChannelDb> = sqlx::query_as(
+    let rows: Vec<ChannelDb> = sql_forge!(
+        ChannelDb,
         r#"
         SELECT
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
-            metadata::text, TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
+            metadata::text AS "metadata?", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at!"
         FROM channels
         ORDER BY name ASC
-        "#,
+        "#
     )
     .fetch_all(pool)
     .await?;
@@ -384,12 +389,12 @@ pub async fn skip_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Re
 pub async fn skip_all_pending_processing(pool: &PgPool) -> anyhow::Result<u64> {
     // Safety pass: normalize any orphaned rows where thread_id IS NULL
     // (brief window between INSERT and init_thread_root UPDATE)
-    sqlx::query(r#"UPDATE messages SET thread_id = id WHERE thread_id IS NULL"#)
+    sql_forge!(r#"UPDATE messages SET thread_id = id WHERE thread_id IS NULL"#)
         .execute(pool)
         .await?;
 
     // First pass: update sequence-0 messages with aggregated thread stats, then mark skipped
-    let result = sqlx::query(
+    let result = sql_forge!(
         r#"
         WITH affected_threads AS (
             SELECT DISTINCT channel_id, thread_id
@@ -424,7 +429,7 @@ pub async fn skip_all_pending_processing(pool: &PgPool) -> anyhow::Result<u64> {
           AND m.thread_id = a.thread_id
           AND m.thread_sequence = 0
           AND m.status IN ('pending', 'processing')
-        "#,
+        "#
     )
     .execute(pool)
     .await?;
@@ -432,12 +437,12 @@ pub async fn skip_all_pending_processing(pool: &PgPool) -> anyhow::Result<u64> {
     let seq0_count = result.rows_affected();
 
     // Second pass: skip remaining pending/processing messages (non-sequence-0)
-    let remaining = sqlx::query(
+    let remaining = sql_forge!(
         r#"
         UPDATE messages
         SET status = 'skipped'
         WHERE status IN ('pending', 'processing')
-        "#,
+        "#
     )
     .execute(pool)
     .await?;
@@ -464,14 +469,15 @@ pub async fn find_stopped_channel(
     pool: &PgPool,
     channel_id: i64,
 ) -> anyhow::Result<Option<ChannelStop>> {
-    let row: Option<ChannelStopDb> = sqlx::query_as(
+    let row: Option<ChannelStopDb> = sql_forge!(
+        ChannelStopDb,
         r#"
-        SELECT id, channel_id, TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS stopped_at
+        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at!"
         FROM channel_stops
-        WHERE channel_id = $1
+        WHERE channel_id = :channel_id
         "#,
+        ( :channel_id = channel_id )
     )
-    .bind(channel_id)
     .fetch_optional(pool)
     .await?;
 
@@ -482,10 +488,12 @@ pub async fn delete_old_messages(
     pool: &PgPool,
     before: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<u64> {
-    let result = sqlx::query("DELETE FROM messages WHERE created_at < $1")
-        .bind(before)
-        .execute(pool)
-        .await?;
+    let result = sql_forge!(
+        "DELETE FROM messages WHERE created_at < :cutoff",
+        ( :cutoff = before )
+    )
+    .execute(pool)
+    .await?;
 
     Ok(result.rows_affected())
 }
@@ -531,17 +539,18 @@ pub async fn update_message_embedding(
 }
 
 pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Option<Channel>> {
-    let row: Option<ChannelDb> = sqlx::query_as(
+    let row: Option<ChannelDb> = sql_forge!(
+        ChannelDb,
         r#"
         SELECT
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
-            metadata::text, TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
+            metadata::text AS "metadata?", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at!"
         FROM channels
-        WHERE name = $1
+        WHERE name = :name
         "#,
+        ( :name = name )
     )
-    .bind(name)
     .fetch_optional(pool)
     .await?;
 
@@ -555,22 +564,20 @@ pub async fn create_channel(
     external_id: &str,
     cause: &str,
 ) -> anyhow::Result<Channel> {
-    let row: ChannelDb = sqlx::query_as(
+    let row: ChannelDb = sql_forge!(
+        ChannelDb,
         r#"
         INSERT INTO channels (name, platform, external_id, cause)
-        VALUES ($1, $2, $3, $4)
+        VALUES (:name, :platform, :external_id, :cause)
         ON CONFLICT (platform, external_id)
         DO UPDATE SET updated_at = NOW()
         RETURNING
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
-            metadata::text, TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at, TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
+            metadata::text AS "metadata?", COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at!", COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at!"
         "#,
+        ( :name = name, :platform = platform, :external_id = external_id, :cause = cause )
     )
-    .bind(name)
-    .bind(platform)
-    .bind(external_id)
-    .bind(cause)
     .fetch_one(pool)
     .await?;
 
@@ -588,12 +595,13 @@ pub async fn clear_channel_stop(pool: &PgPool, channel_id: i64) -> anyhow::Resul
 
 #[expect(dead_code)]
 pub async fn find_all_stopped_channels(pool: &PgPool) -> anyhow::Result<Vec<ChannelStop>> {
-    let rows: Vec<ChannelStopDb> = sqlx::query_as(
+    let rows: Vec<ChannelStopDb> = sql_forge!(
+        ChannelStopDb,
         r#"
-        SELECT id, channel_id, TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS stopped_at
+        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at!"
         FROM channel_stops
         ORDER BY stopped_at DESC
-        "#,
+        "#
     )
     .fetch_all(pool)
     .await?;

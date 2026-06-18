@@ -91,10 +91,8 @@ struct MessageResult {
     content: String,
     msg_type: String,
     msg_subtype: Option<String>,
-    channel_id: i64,
     thread_id: Option<i64>,
     thread_sequence: i32,
-    profile: String,
     created_at: Option<String>,
 }
 
@@ -207,15 +205,16 @@ fn handle_search_messages(pool: sqlx::PgPool, args: &Value) -> Result<McpToolRes
                 sqlx::query_as::<_, MessageResult>(
                     r#"
                     SELECT
-                        id, role, content, msg_type, msg_subtype,
-                        channel_id, thread_id, thread_sequence, profile,
-                        COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-                    FROM messages
-                    WHERE channel_id = $1
-                      AND embedding IS NOT NULL
-                      AND embedding != ''
-                      AND role IN ('user', 'agent')
-                    ORDER BY embedding::vector(1536) <=> $2::vector(1536)
+                        m.id, m.role, m.content, m.msg_type, m.msg_subtype,
+                        m.thread_id, m.thread_sequence,
+                        COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+                    FROM messages m
+                    JOIN threads t ON t.id = m.thread_id
+                    WHERE t.channel_id = $1
+                      AND m.embedding IS NOT NULL
+                      AND m.embedding != ''
+                      AND m.role IN ('user', 'agent')
+                    ORDER BY m.embedding::vector(1536) <=> $2::vector(1536)
                     LIMIT $3
                     "#,
                 )
@@ -229,14 +228,14 @@ fn handle_search_messages(pool: sqlx::PgPool, args: &Value) -> Result<McpToolRes
                 sqlx::query_as::<_, MessageResult>(
                     r#"
                     SELECT
-                        id, role, content, msg_type, msg_subtype,
-                        channel_id, thread_id, thread_sequence, profile,
-                        COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-                    FROM messages
-                    WHERE embedding IS NOT NULL
-                      AND embedding != ''
-                      AND role IN ('user', 'agent')
-                    ORDER BY embedding::vector(1536) <=> $1::vector(1536)
+                        m.id, m.role, m.content, m.msg_type, m.msg_subtype,
+                        m.thread_id, m.thread_sequence,
+                        COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+                    FROM messages m
+                    WHERE m.embedding IS NOT NULL
+                      AND m.embedding != ''
+                      AND m.role IN ('user', 'agent')
+                    ORDER BY m.embedding::vector(1536) <=> $1::vector(1536)
                     LIMIT $2
                     "#,
                 )
@@ -267,7 +266,7 @@ fn handle_search_thread_messages(pool: sqlx::PgPool, args: &Value) -> Result<Mcp
                 r#"
                 SELECT
                     id, role, content, msg_type, msg_subtype,
-                    channel_id, thread_id, thread_sequence, profile,
+                    thread_id, thread_sequence,
                     COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
                 FROM messages
                 WHERE thread_id = :thread_id
@@ -299,12 +298,13 @@ fn handle_search_channel_prompts(pool: sqlx::PgPool, args: &Value) -> Result<Mcp
                 MessageResult,
                 r#"
                 SELECT
-                    id, role, content, msg_type, msg_subtype,
-                    channel_id, thread_id, thread_sequence, profile,
-                    COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-                FROM messages
-                WHERE channel_id = :channel_id
-                  AND thread_sequence = 0
+                    m.id, m.role, m.content, m.msg_type, m.msg_subtype,
+                    m.thread_id, m.thread_sequence,
+                    COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+                FROM messages m
+                JOIN threads t ON t.id = m.thread_id
+                WHERE t.channel_id = :channel_id
+                  AND m.thread_sequence = 0
                 ORDER BY id DESC
                 LIMIT :limit
                 "#,
@@ -428,8 +428,8 @@ fn format_results(operation: &str, results: &[MessageResult], total_count: i64) 
         };
 
         lines.push(format!(
-            "#{} [{}]{} ch={}{}{}: {}",
-            r.id, r.role, type_info, r.channel_id, thread_info,
+            "#{} [{}]{} {}{}: {}",
+            r.id, r.role, type_info, thread_info,
             r.createdat_ref().map(|t| format!(" @{}", t)).unwrap_or_default(),
             preview
         ));

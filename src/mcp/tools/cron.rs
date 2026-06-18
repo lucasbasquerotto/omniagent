@@ -1,4 +1,5 @@
 use crate::mcp::{truncate_content, AppContext, McpTool, McpToolResult, DEFAULT_MAX_TOOL_OUTPUT_CHARS};
+use crate::db::types as queries;
 use anyhow::Result;
 use serde_json::Value;
 use sql_forge::sql_forge;
@@ -44,6 +45,14 @@ pub fn create_cron_job_tool() -> McpTool {
                 "skills": {
                     "type": "string",
                     "description": "Optional comma-separated list of skill names to enable for this job"
+                },
+                "channel_id": {
+                    "type": "integer",
+                    "description": "Optional channel ID to fire this cron job in. If omitted, uses the default cron channel."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Optional profile name to use when firing this cron job. If omitted, uses the channel's current_profile."
                 }
             },
             "required": ["name", "schedule", "prompt"]
@@ -65,6 +74,8 @@ pub fn create_cron_job_tool() -> McpTool {
             let skills_str = args["skills"].as_str().unwrap_or("");
             let display_name_owned = display_name.to_string();
             let name_owned = name.to_string();
+            let channel_id_arg = args["channel_id"].as_i64();
+            let profile_arg = args["profile"].as_str().map(|s| s.to_string());
 
             if name.is_empty() {
                 anyhow::bail!("Job name must not be empty");
@@ -102,12 +113,22 @@ pub fn create_cron_job_tool() -> McpTool {
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
+                    // Resolve channel_id: if not provided, find the default cron channel
+                    let resolved_channel_id = if let Some(cid) = channel_id_arg {
+                        cid
+                    } else {
+                        match queries::get_channel_by_platform_name(&pool, "cron", "cron-default").await {
+                            Ok(Some(ch)) => ch.id,
+                            _ => anyhow::bail!("No default cron channel found. Create a channel with platform='cron' and name='cron-default' first."),
+                        }
+                    };
+
                     sql_forge!(
                         r#"
-                        INSERT INTO cron_jobs (id, name, display_name, schedule, prompt, skills)
-                        VALUES (:id, :name, :display_name, :schedule, :prompt, :skills)
+                        INSERT INTO cron_jobs (id, name, display_name, schedule, prompt, skills, channel_id, profile)
+                        VALUES (:id, :name, :display_name, :schedule, :prompt, :skills, :channel_id, NULLIF(:profile, '')::text)
                         "#,
-                        ( :id = &id, :name = &name_owned, :display_name = &display_name_owned, :schedule = schedule, :prompt = prompt, :skills = skills_json.to_string() )
+                        ( :id = &id, :name = &name_owned, :display_name = &display_name_owned, :schedule = schedule, :prompt = prompt, :skills = skills_json.to_string(), :channel_id = resolved_channel_id, :profile = profile_arg.as_deref().unwrap_or("") )
                     )
                     .execute(&pool)
                     .await

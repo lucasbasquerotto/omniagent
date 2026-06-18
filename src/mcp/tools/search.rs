@@ -56,10 +56,11 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
                         sql_forge!(
                             SearchResult,
                             r#"
-                            SELECT id, role, content FROM messages
-                            WHERE channel_id = :channel_id
-                              AND content ILIKE '%' || :query || '%'
-                            ORDER BY created_at DESC
+                            SELECT m.id, m.role, m.content FROM messages m
+                            JOIN threads t ON t.id = m.thread_id
+                            WHERE t.channel_id = :channel_id
+                              AND m.content ILIKE '%' || :query || '%'
+                            ORDER BY m.created_at DESC
                             LIMIT :limit
                             "#,
                             ( :channel_id = cid, :query = &query_owned, :limit = limit )

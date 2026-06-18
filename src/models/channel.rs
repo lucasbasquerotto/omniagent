@@ -11,16 +11,14 @@ pub struct Channel {
     pub current_profile: String,
     pub current_model: Option<String>,
     pub current_provider: Option<String>,
+    pub readonly: bool,
+    pub closed: bool,
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 /// Tracks channels that have been stopped (paused).
-///
-/// When a channel is stopped, new messages are not processed until the
-/// stop is cleared. This is used for channels that are rate-limited or
-/// temporarily disabled.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ChannelStop {
     pub id: i64,

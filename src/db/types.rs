@@ -1,31 +1,90 @@
 //! DB-focused structs using only primitive types compatible with sql-forge's
 //! compile-time validation. Each struct mirrors a domain model but stores
-//! complex types (DateTime, JSON, enums) as plain strings. Conversion to
+//! complex types (DateTime, JSON) as plain strings. Conversion to
 //! domain types is done explicitly in Rust — no SQL type casting.
-//!
-//! Currently uses `sql_forge!(...)` macros for compile-time SQL validation.
-//! DB structs use only primitive types (Strings for DateTime/JSON/enums) with
-//! Rust-side conversion. SQL columns that can return NULL use `Option<T>` in
-//! the struct with `AS "column?"` in the query.
 
 use chrono::{DateTime, Utc};
 use sql_forge::sql_forge;
 use sqlx::PgPool;
 
-use crate::models::{Channel, ChannelStop, Message, MessageNew, MessageStatus};
+use crate::models::{Channel, ChannelStop, Message, MessageNew, Thread};
 
 // ---------------------------------------------------------------------------
-// Message DB struct (for SELECT results)
+// Thread DB struct (for SELECT results)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ThreadDb {
+    pub id: i64,
+    pub status: String,
+    pub cause: String,
+    pub channel_id: i64,
+    pub profile: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: Option<i32>,
+    pub cached_tokens: Option<i32>,
+    pub output_tokens: Option<i32>,
+    pub duration_ms: Option<i32>,
+    pub created_at: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+}
+
+impl TryFrom<ThreadDb> for Thread {
+    type Error = anyhow::Error;
+
+    fn try_from(db: ThreadDb) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: db.id,
+            status: db.status,
+            cause: db.cause,
+            channel_id: db.channel_id,
+            profile: db.profile,
+            provider: db.provider,
+            model: db.model,
+            input_tokens: db.input_tokens.unwrap_or(0),
+            cached_tokens: db.cached_tokens.unwrap_or(0),
+            output_tokens: db.output_tokens.unwrap_or(0),
+            duration_ms: db.duration_ms.unwrap_or(0),
+            created_at: db
+                .created_at
+                .as_deref()
+                .unwrap_or("")
+                .parse::<DateTime<Utc>>()
+                .map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", db.created_at.as_deref().unwrap_or("?"), e))?,
+            started_at: if let Some(ref s) = db.started_at {
+                if !s.is_empty() {
+                    Some(s.parse::<DateTime<Utc>>().map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", s, e))?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            },
+            ended_at: if let Some(ref s) = db.ended_at {
+                if !s.is_empty() {
+                    Some(s.parse::<DateTime<Utc>>().map_err(|e| anyhow::anyhow!("Invalid timestamp '{}': {}", s, e))?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message DB struct (for SELECT results) — simplified without per-thread fields
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MessageDb {
     pub id: i64,
-    pub channel_id: i64,
+    pub thread_id: i64,
     pub role: String,
     pub content: String,
-    pub status: String,
-    pub thread_id: Option<i64>,
     pub thread_sequence: i32,
     pub external_id: Option<String>,
     pub metadata: Option<String>,
@@ -34,13 +93,6 @@ pub struct MessageDb {
     pub is_summary: bool,
     pub msg_type: String,
     pub msg_subtype: Option<String>,
-    pub iteration_count: i32,
-    pub profile: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub processing_time_ms: Option<i32>,
-    pub token_usage: Option<String>,
-    pub iterations: i32,
     pub created_at: Option<String>,
 }
 
@@ -50,14 +102,9 @@ impl TryFrom<MessageDb> for Message {
     fn try_from(db: MessageDb) -> Result<Self, Self::Error> {
         Ok(Self {
             id: db.id,
-            channel_id: db.channel_id,
+            thread_id: db.thread_id,
             role: db.role,
             content: db.content,
-            status: db
-                .status
-                .parse::<MessageStatus>()
-                .map_err(|_| anyhow::anyhow!("Invalid status: {}", db.status))?,
-            thread_id: db.thread_id.unwrap_or(db.id),
             thread_sequence: db.thread_sequence,
             external_id: db.external_id,
             metadata: db.metadata.as_deref().map(|s| serde_json::from_str(s).unwrap_or_default()).unwrap_or_default(),
@@ -66,13 +113,6 @@ impl TryFrom<MessageDb> for Message {
             is_summary: db.is_summary,
             msg_type: db.msg_type,
             msg_subtype: db.msg_subtype,
-            iteration_count: db.iteration_count,
-            profile: db.profile,
-            provider: db.provider,
-            model: db.model,
-            processing_time_ms: db.processing_time_ms,
-            token_usage: db.token_usage.and_then(|v| serde_json::from_str(&v).ok()),
-            iterations: db.iterations,
             created_at: db
                 .created_at
                 .as_deref()
@@ -84,120 +124,7 @@ impl TryFrom<MessageDb> for Message {
 }
 
 // ---------------------------------------------------------------------------
-// MessageNew DB struct (for INSERT params)
-// ---------------------------------------------------------------------------
-
-/// Intermediate result type for create_message INSERT RETURNING.
-/// Mirrors the RETURNING columns exactly, used because `sql_forge!`
-/// compile-time validation via sqlx::query_as! can't infer nullability
-/// for computed expressions without a DB connection.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct CreateMessageRow {
-    pub id: i64,
-    pub channel_id: i64,
-    pub role: String,
-    pub content: String,
-    pub status: String,
-    pub thread_id: Option<i64>,
-    pub thread_sequence: i32,
-    pub external_id: Option<String>,
-    pub metadata: Option<String>,
-    pub embedding: Option<String>,
-    pub summary_text: Option<String>,
-    pub is_summary: bool,
-    pub msg_type: String,
-    pub msg_subtype: Option<String>,
-    pub iteration_count: i32,
-    pub profile: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub processing_time_ms: Option<i32>,
-    pub token_usage: Option<String>,
-    pub iterations: i32,
-    pub created_at: Option<String>,
-}
-
-impl From<CreateMessageRow> for MessageDb {
-    fn from(r: CreateMessageRow) -> Self {
-        Self {
-            id: r.id,
-            channel_id: r.channel_id,
-            role: r.role,
-            content: r.content,
-            status: r.status,
-            thread_id: r.thread_id,
-            thread_sequence: r.thread_sequence,
-            external_id: r.external_id,
-            metadata: r.metadata,
-            embedding: r.embedding,
-            summary_text: r.summary_text,
-            is_summary: r.is_summary,
-            msg_type: r.msg_type,
-            msg_subtype: r.msg_subtype,
-            iteration_count: r.iteration_count,
-            profile: r.profile,
-            provider: r.provider,
-            model: r.model,
-            processing_time_ms: r.processing_time_ms,
-            token_usage: r.token_usage,
-            iterations: r.iterations,
-            created_at: r.created_at,
-        }
-    }
-}
-
-pub struct MessageNewDb {
-    pub channel_id: i64,
-    pub role: String,
-    pub content: String,
-    pub status: String,
-    pub thread_id: Option<i64>,
-    pub thread_sequence: i32,
-    pub external_id: Option<String>,
-    pub metadata: String,
-    pub embedding: Option<String>,
-    pub summary_text: Option<String>,
-    pub is_summary: bool,
-    pub msg_type: String,
-    pub msg_subtype: Option<String>,
-    pub iteration_count: i32,
-    pub profile: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub processing_time_ms: Option<i32>,
-    pub token_usage: Option<String>,
-    pub iterations: i32,
-}
-
-impl From<&MessageNew> for MessageNewDb {
-    fn from(msg: &MessageNew) -> Self {
-        Self {
-            channel_id: msg.channel_id,
-            role: msg.role.clone(),
-            content: msg.content.clone(),
-            status: msg.status.to_string(),
-            thread_id: msg.thread_id,
-            thread_sequence: msg.thread_sequence,
-            external_id: msg.external_id.clone(),
-            metadata: msg.metadata.to_string(),
-            embedding: msg.embedding.clone(),
-            summary_text: msg.summary_text.clone(),
-            is_summary: msg.is_summary,
-            msg_type: msg.msg_type.clone(),
-            msg_subtype: msg.msg_subtype.clone(),
-            iteration_count: msg.iteration_count,
-            profile: msg.profile.clone(),
-            provider: msg.provider.clone(),
-            model: msg.model.clone(),
-            processing_time_ms: msg.processing_time_ms,
-            token_usage: msg.token_usage.as_ref().map(|v| v.to_string()),
-            iterations: msg.iterations,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Channel DB struct (for SELECT results)
+// Channel DB struct (for SELECT results) — unchanged
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -210,6 +137,8 @@ pub struct ChannelDb {
     pub current_profile: String,
     pub current_model: Option<String>,
     pub current_provider: Option<String>,
+    pub readonly: bool,
+    pub closed: Option<bool>,
     pub metadata: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -228,6 +157,8 @@ impl TryFrom<ChannelDb> for Channel {
             current_profile: db.current_profile,
             current_model: db.current_model,
             current_provider: db.current_provider,
+            readonly: db.readonly,
+            closed: db.closed.unwrap_or(false),
             metadata: db.metadata.as_deref().map(|s| serde_json::from_str(s).unwrap_or_default()).unwrap_or_default(),
             created_at: db
                 .created_at
@@ -246,7 +177,7 @@ impl TryFrom<ChannelDb> for Channel {
 }
 
 // ---------------------------------------------------------------------------
-// ChannelStop DB struct (for SELECT results)
+// ChannelStop DB struct (for SELECT results) — unchanged
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -274,7 +205,7 @@ impl TryFrom<ChannelStopDb> for ChannelStop {
 }
 
 // ---------------------------------------------------------------------------
-// Summary DB struct (for SELECT results)
+// Summary DB struct (for SELECT results) — unchanged
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -289,23 +220,64 @@ pub struct SummaryDb {
 }
 
 // ---------------------------------------------------------------------------
-// Query functions using raw sqlx (runtime-only validation)
-// Replace with sql_forge!(...) after upgrading sqlx to 0.9
+// Thread query functions
 // ---------------------------------------------------------------------------
 
-pub async fn find_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Result<Vec<Message>> {
-    let rows: Vec<MessageDb> = sql_forge!(
-        MessageDb,
+/// Create a new thread with status 'created'.
+pub async fn create_thread(
+    pool: &PgPool,
+    cause: &str,
+    channel_id: i64,
+    profile: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> anyhow::Result<Thread> {
+    let row: ThreadDb = sql_forge!(
+        ThreadDb,
+        r#"
+        INSERT INTO threads (status, cause, channel_id, profile, provider, model)
+        VALUES ('created', :cause, :channel_id, :profile, NULLIF(:provider, '')::text, NULLIF(:model, '')::text)
+        RETURNING
+            id, status, cause, channel_id, profile, provider, model,
+            input_tokens, cached_tokens, output_tokens, duration_ms,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            ''::text AS "started_at",
+            ''::text AS "ended_at"
+        "#,
+        ( :cause = cause, :channel_id = channel_id, :profile = profile, :provider = provider.unwrap_or(""), :model = model.unwrap_or("") )
+    )
+    .fetch_one(pool)
+    .await?;
+
+    row.try_into()
+}
+
+/// Set a thread's status to 'pending' so the executor picks it up.
+pub async fn set_thread_pending(pool: &PgPool, thread_id: i64) -> anyhow::Result<()> {
+    sql_forge!(
+        "UPDATE threads SET status = 'pending' WHERE id = :id",
+        ( :id = thread_id )
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Find pending threads for a channel.
+pub async fn find_pending_threads_by_channel(
+    pool: &PgPool,
+    channel_id: i64,
+) -> anyhow::Result<Vec<Thread>> {
+    let rows: Vec<ThreadDb> = sql_forge!(
+        ThreadDb,
         r#"
         SELECT
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata", embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
-            iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-        FROM messages
+            id, status, cause, channel_id, profile, provider, model,
+            input_tokens, cached_tokens, output_tokens, duration_ms,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(started_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "started_at",
+            COALESCE(TO_CHAR(ended_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "ended_at"
+        FROM threads
         WHERE channel_id = :channel_id AND status = 'pending'
         ORDER BY created_at ASC
         "#,
@@ -317,90 +289,142 @@ pub async fn find_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Re
     rows.into_iter().map(|r| r.try_into()).collect()
 }
 
-pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> anyhow::Result<Message> {
-    let db = MessageNewDb::from(msg);
-    let metadata_val: serde_json::Value = serde_json::from_str(&db.metadata).unwrap_or_default();
-    let processing_time_ms_val: i32 = db.processing_time_ms.unwrap_or(0);
-    let token_usage_val: serde_json::Value = db
-        .token_usage
-        .as_ref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::Value::Null);
-    let row: CreateMessageRow = sql_forge!(
-        CreateMessageRow,
+/// Atomically claim a thread by setting status to 'processing' and started_at to NOW().
+/// Returns true if the thread was successfully claimed.
+pub async fn claim_thread(pool: &PgPool, thread_id: i64) -> bool {
+    let result = sql_forge!(
+        "UPDATE threads SET status = 'processing', started_at = NOW() WHERE id = :id AND status = 'pending'",
+        ( :id = thread_id )
+    )
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => {
+            tracing::error!("Failed to claim thread {}: {:?}", thread_id, e);
+            false
+        }
+    }
+}
+
+/// Complete a thread with final status and usage stats.
+pub async fn complete_thread(
+    pool: &PgPool,
+    thread_id: i64,
+    status: &str,
+    input_tokens: i32,
+    cached_tokens: i32,
+    output_tokens: i32,
+    duration_ms: i32,
+) -> anyhow::Result<()> {
+    sql_forge!(
         r#"
-        INSERT INTO messages (
-            channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
-            metadata, embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage,
-            iterations
-        )
-        VALUES (:channel_id, :role, :content, :status, NULLIF(:thread_id, 0::bigint), :thread_sequence, NULLIF(:external_id, '')::text, :metadata, NULLIF(:embedding, '')::text, NULLIF(:summary_text, '')::text, :is_summary, :msg_type, NULLIF(:msg_subtype, '')::text, :iteration_count, :profile, NULLIF(:provider, '')::text, NULLIF(:model, '')::text, NULLIF(:processing_time_ms, 0)::int, :token_usage, :iterations)
-        RETURNING
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata", embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
-            iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        UPDATE threads
+        SET status = :status,
+            input_tokens = :input_tokens,
+            cached_tokens = :cached_tokens,
+            output_tokens = :output_tokens,
+            duration_ms = :duration_ms,
+            ended_at = NOW()
+        WHERE id = :id
         "#,
-        ( :channel_id = db.channel_id, :role = &db.role, :content = &db.content, :status = &db.status, :thread_id = db.thread_id.unwrap_or(0), :thread_sequence = db.thread_sequence, :external_id = db.external_id.as_deref().unwrap_or(""), :metadata = &metadata_val, :embedding = db.embedding.as_deref().unwrap_or(""), :summary_text = db.summary_text.as_deref().unwrap_or(""), :is_summary = db.is_summary, :msg_type = &db.msg_type, :msg_subtype = db.msg_subtype.as_deref().unwrap_or(""), :iteration_count = db.iteration_count, :profile = &db.profile, :provider = db.provider.as_deref().unwrap_or(""), :model = db.model.as_deref().unwrap_or(""), :processing_time_ms = processing_time_ms_val, :token_usage = &token_usage_val, :iterations = db.iterations )
+        ( :status = status, :input_tokens = input_tokens, :cached_tokens = cached_tokens, :output_tokens = output_tokens, :duration_ms = duration_ms, :id = thread_id )
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Set all pending/processing threads for a channel to 'skipped'.
+pub async fn skip_channel_threads(pool: &PgPool, channel_id: i64) -> anyhow::Result<u64> {
+    let result = sql_forge!(
+        "UPDATE threads SET status = 'skipped', ended_at = NOW() WHERE channel_id = :channel_id AND status IN ('pending', 'processing')",
+        ( :channel_id = channel_id )
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Count messages in a thread.
+pub async fn count_thread_messages(pool: &PgPool, thread_id: i64) -> anyhow::Result<i32> {
+    let count: Option<i64> = sql_forge!(
+        scalar Option<i64>,
+        "SELECT COUNT(*) FROM messages WHERE thread_id = :thread_id",
+        ( :thread_id = thread_id )
     )
     .fetch_one(pool)
     .await?;
 
-    MessageDb::from(row).try_into()
+    Ok(count.unwrap_or(0) as i32)
 }
 
-/// Insert a seq-0 message with thread_id=NULL using a CTE, then atomically
-/// backfill thread_id = id before the row is visible to any other reader.
-///
-/// The CTE runs as a single statement in Postgres, so there is no window
-/// where another transaction can see a seq-0 message with NULL thread_id.
-pub async fn init_thread_root(pool: &PgPool, msg: &MessageNew) -> anyhow::Result<Message> {
-    let db = MessageNewDb::from(msg);
-    let metadata_val: serde_json::Value = serde_json::from_str(&db.metadata).unwrap_or_default();
-    let processing_time_ms_val: i32 = db.processing_time_ms.unwrap_or(0);
-    let token_usage_val: serde_json::Value = db
-        .token_usage
-        .as_ref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::Value::Null);
+/// Skip all pending/processing threads on startup.
+pub async fn skip_all_pending_threads(pool: &PgPool) -> anyhow::Result<u64> {
+    let result = sql_forge!(
+        r#"
+        UPDATE threads
+        SET status = 'skipped', ended_at = NOW()
+        WHERE status IN ('pending', 'processing')
+        "#
+    )
+    .execute(pool)
+    .await?;
 
-    // CTE: INSERT with thread_id=NULL, then UPDATE to set thread_id = id
-    // The entire CTE is a single statement, so the row is never visible
-    // externally with a NULL thread_id.
+    Ok(result.rows_affected())
+}
+
+/// Get the cause message (first message, role='cause') for a thread.
+pub async fn get_cause_message(pool: &PgPool, thread_id: i64) -> anyhow::Result<Option<Message>> {
+    let row: Option<MessageDb> = sql_forge!(
+        MessageDb,
+        r#"
+        SELECT
+            id, thread_id, role, content, thread_sequence, external_id,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
+            msg_type, msg_subtype,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM messages
+        WHERE thread_id = :thread_id AND role = 'cause'
+        ORDER BY thread_sequence ASC, id ASC
+        LIMIT 1
+        "#,
+        ( :thread_id = thread_id )
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|r| r.try_into()).transpose()
+}
+
+// ---------------------------------------------------------------------------
+// Message query functions — simplified, no per-thread fields
+// ---------------------------------------------------------------------------
+
+/// Insert a new message (no status/channel/provider/model — those are on the thread).
+pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> anyhow::Result<Message> {
+    let metadata_val: serde_json::Value = serde_json::from_str(&msg.metadata.to_string()).unwrap_or_default();
     let row: MessageDb = sql_forge!(
         MessageDb,
         r#"
-        WITH ins AS (
-            INSERT INTO messages (
-                channel_id, role, content, status,
-                thread_id, thread_sequence, external_id,
-                metadata, embedding, summary_text, is_summary,
-                msg_type, msg_subtype, iteration_count,
-                profile, provider, model, processing_time_ms, token_usage,
-                iterations
-            )
-            VALUES (:channel_id, :role, :content, :status, NULLIF(0::bigint, 0::bigint), :thread_sequence, NULLIF(:external_id, '')::text, :metadata, NULLIF(:embedding, '')::text, NULLIF(:summary_text, '')::text, :is_summary, :msg_type, NULLIF(:msg_subtype, '')::text, :iteration_count, :profile, NULLIF(:provider, '')::text, NULLIF(:model, '')::text, NULLIF(:processing_time_ms, 0)::int, :token_usage, :iterations)
-            RETURNING id
+        INSERT INTO messages (
+            thread_id, role, content, thread_sequence, external_id,
+            metadata, embedding, summary_text, is_summary,
+            msg_type, msg_subtype
         )
-        UPDATE messages m SET thread_id = m.id
-        FROM ins
-        WHERE m.id = ins.id
+        VALUES (:thread_id, :role, :content, :thread_sequence, NULLIF(:external_id, '')::text,
+            :metadata, NULLIF(:embedding, '')::text, NULLIF(:summary_text, '')::text, :is_summary,
+            :msg_type, NULLIF(:msg_subtype, '')::text)
         RETURNING
-            m.id, m.channel_id, m.role, m.content, m.status,
-            m.thread_id, m.thread_sequence, m.external_id,
-            m.metadata::text AS "metadata", m.embedding, m.summary_text, m.is_summary,
-            m.msg_type, m.msg_subtype, m.iteration_count,
-            m.profile, m.provider, m.model, m.processing_time_ms, m.token_usage::text AS "token_usage",
-            m.iterations,
-            COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+            id, thread_id, role, content, thread_sequence, external_id,
+            metadata::text AS "metadata", embedding, summary_text, is_summary,
+            msg_type, msg_subtype,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         "#,
-        ( :channel_id = db.channel_id, :role = &db.role, :content = &db.content, :status = &db.status, :thread_sequence = db.thread_sequence, :external_id = db.external_id.as_deref().unwrap_or(""), :metadata = &metadata_val, :embedding = db.embedding.as_deref().unwrap_or(""), :summary_text = db.summary_text.as_deref().unwrap_or(""), :is_summary = db.is_summary, :msg_type = &db.msg_type, :msg_subtype = db.msg_subtype.as_deref().unwrap_or(""), :iteration_count = db.iteration_count, :profile = &db.profile, :provider = db.provider.as_deref().unwrap_or(""), :model = db.model.as_deref().unwrap_or(""), :processing_time_ms = processing_time_ms_val, :token_usage = &token_usage_val, :iterations = db.iterations )
+        ( :thread_id = msg.thread_id, :role = &msg.role, :content = &msg.content, :thread_sequence = msg.thread_sequence, :external_id = msg.external_id.as_deref().unwrap_or(""), :metadata = &metadata_val, :embedding = msg.embedding.as_deref().unwrap_or(""), :summary_text = msg.summary_text.as_deref().unwrap_or(""), :is_summary = msg.is_summary, :msg_type = &msg.msg_type, :msg_subtype = msg.msg_subtype.as_deref().unwrap_or("") )
     )
     .fetch_one(pool)
     .await?;
@@ -408,21 +432,9 @@ pub async fn init_thread_root(pool: &PgPool, msg: &MessageNew) -> anyhow::Result
     row.try_into()
 }
 
-pub async fn update_message_status(
-    pool: &PgPool,
-    id: i64,
-    status: &MessageStatus,
-) -> anyhow::Result<()> {
-    let status_str = status.to_string();
-    sql_forge!(
-        "UPDATE messages SET status = :status WHERE id = :id",
-        ( :status = &status_str, :id = id )
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// Channel query functions — mostly unchanged
+// ---------------------------------------------------------------------------
 
 pub async fn find_all_channels(pool: &PgPool) -> anyhow::Result<Vec<Channel>> {
     let rows: Vec<ChannelDb> = sql_forge!(
@@ -431,6 +443,8 @@ pub async fn find_all_channels(pool: &PgPool) -> anyhow::Result<Vec<Channel>> {
         SELECT
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
+            readonly,
+            COALESCE(closed, false) as "closed",
             '{}'::text AS "metadata",
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
             COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
@@ -444,157 +458,73 @@ pub async fn find_all_channels(pool: &PgPool) -> anyhow::Result<Vec<Channel>> {
     rows.into_iter().map(|r| r.try_into()).collect()
 }
 
-pub async fn count_thread_iterations(pool: &PgPool, thread_id: i64) -> anyhow::Result<i32> {
-    let count: Option<i32> = sql_forge!(
-        scalar Option<i32>,
+pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Option<Channel>> {
+    let row: Option<ChannelDb> = sql_forge!(
+        ChannelDb,
         r#"
-        SELECT COALESCE(MAX(iterations), 0) FROM messages
-        WHERE thread_id = :thread_id
+        SELECT
+            id, name, platform, external_id, cause,
+            current_profile, current_model, current_provider,
+            readonly,
+            COALESCE(closed, false) as "closed",
+            '{}'::text AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
+        FROM channels
+        WHERE name = :name
         "#,
-        ( :thread_id = thread_id )
+        ( :name = name )
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(count.unwrap_or(0))
+    row.map(|r| r.try_into()).transpose()
 }
 
-/// Atomically normalize NULL thread_ids for any pending messages.
-/// This is a safety net: ensures no pending message ever has a NULL
-/// thread_id before the agent tries to process it.
-pub async fn normalize_null_thread_ids(pool: &PgPool) -> anyhow::Result<u64> {
-    let result = sql_forge!(
-        "UPDATE messages SET thread_id = id WHERE thread_id IS NULL AND status = 'pending'"
-    )
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-/// Atomically claim a pending message for processing by updating its
-/// status to 'processing' only if it's still 'pending'.
-/// Returns true if the message was successfully claimed, false if
-/// another worker already claimed it (or it was already processed).
-pub async fn try_claim_message(pool: &PgPool, msg_id: i64) -> bool {
-    let result = sql_forge!(
-        "UPDATE messages SET status = 'processing' WHERE id = :id AND status = 'pending'",
-        ( :id = msg_id )
-    )
-    .execute(pool)
-    .await;
-
-    match result {
-        Ok(r) => r.rows_affected() > 0,
-        Err(e) => {
-            tracing::error!("Failed to claim message {}: {:?}", msg_id, e);
-            false
-        }
-    }
-}
-
-pub async fn skip_pending_messages(pool: &PgPool, channel_id: i64) -> anyhow::Result<u64> {
-    let result = sql_forge!(
-        "UPDATE messages SET status = 'skipped' WHERE channel_id = :channel_id AND status = 'pending'",
-        ( :channel_id = channel_id )
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected())
-}
-
-/// Mark ALL pending and processing messages as skipped (run on startup).
-/// Also aggregates thread-level stats (processing time, token usage, message count)
-/// and writes them back to the sequence-0 message before skipping.
-pub async fn skip_all_pending_processing(pool: &PgPool) -> anyhow::Result<u64> {
-    // Safety pass: normalize any orphaned rows where thread_id IS NULL
-    // (brief window between INSERT and init_thread_root UPDATE)
-    sql_forge!(r#"UPDATE messages SET thread_id = id WHERE thread_id IS NULL"#)
-        .execute(pool)
-        .await?;
-
-    // First pass: update sequence-0 messages with aggregated thread stats, then mark skipped
-    let result = sql_forge!(
+pub async fn get_channel_by_platform_name(
+    pool: &PgPool,
+    platform: &str,
+    name: &str,
+) -> anyhow::Result<Option<Channel>> {
+    let row: Option<ChannelDb> = sql_forge!(
+        ChannelDb,
         r#"
-        WITH affected_threads AS (
-            SELECT DISTINCT channel_id, thread_id
-            FROM messages
-            WHERE status IN ('pending', 'processing') AND thread_sequence = 0
-        ),
-        aggregates AS (
-            SELECT
-                m.channel_id,
-                m.thread_id,
-                SUM(m.processing_time_ms) AS total_time,
-                COUNT(*) AS msg_count,
-                jsonb_build_object(
-                    'prompt_tokens',
-                    SUM(COALESCE((token_usage->>'prompt_tokens')::int, 0)),
-                    'completion_tokens',
-                    SUM(COALESCE((token_usage->>'completion_tokens')::int, 0))
-                ) AS total_tokens
-            FROM messages m
-            INNER JOIN affected_threads t
-                ON m.channel_id = t.channel_id AND m.thread_id = t.thread_id
-            GROUP BY m.channel_id, m.thread_id
-        )
-        UPDATE messages m
-        SET
-            status = 'skipped',
-            processing_time_ms = a.total_time,
-            iteration_count = a.msg_count,
-            token_usage = a.total_tokens
-        FROM aggregates a
-        WHERE m.channel_id = a.channel_id
-          AND m.thread_id = a.thread_id
-          AND m.thread_sequence = 0
-          AND m.status IN ('pending', 'processing')
-        "#
-    )
-    .execute(pool)
-    .await?;
-
-    let seq0_count = result.rows_affected();
-
-    // Second pass: skip remaining pending/processing messages (non-sequence-0)
-    let remaining = sql_forge!(
-        r#"
-        UPDATE messages
-        SET status = 'skipped'
-        WHERE status IN ('pending', 'processing')
-        "#
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(seq0_count + remaining.rows_affected())
-}
-
-pub async fn stop_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<()> {
-    sql_forge!(
-        r#"
-        INSERT INTO channel_stops (channel_id)
-        VALUES (:channel_id)
-        ON CONFLICT (channel_id) DO UPDATE SET stopped_at = NOW()
+        SELECT
+            id, name, platform, external_id, cause,
+            current_profile, current_model, current_provider,
+            readonly,
+            COALESCE(closed, false) as "closed",
+            '{}'::text AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
+        FROM channels
+        WHERE platform = :platform AND name = :name
         "#,
-        ( :channel_id = channel_id )
+        ( :platform = platform, :name = name )
     )
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(())
+    row.map(|r| r.try_into()).transpose()
 }
 
-pub async fn find_stopped_channel(
+pub async fn find_channel_by_id(
     pool: &PgPool,
     channel_id: i64,
-) -> anyhow::Result<Option<ChannelStop>> {
-    let row: Option<ChannelStopDb> = sql_forge!(
-        ChannelStopDb,
+) -> anyhow::Result<Option<Channel>> {
+    let row: Option<ChannelDb> = sql_forge!(
+        ChannelDb,
         r#"
-        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at"
-        FROM channel_stops
-        WHERE channel_id = :channel_id
+        SELECT
+            id, name, platform, external_id, cause,
+            current_profile, current_model, current_provider,
+            readonly,
+            COALESCE(closed, false) as "closed",
+            '{}'::text AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
+        FROM channels
+        WHERE id = :channel_id
         "#,
         ( :channel_id = channel_id )
     )
@@ -604,22 +534,140 @@ pub async fn find_stopped_channel(
     row.map(|r| r.try_into()).transpose()
 }
 
-pub async fn delete_old_messages(
+pub async fn create_channel(
     pool: &PgPool,
-    before: chrono::DateTime<chrono::Utc>,
-) -> anyhow::Result<u64> {
-    let result = sql_forge!(
-        "DELETE FROM messages WHERE created_at < :cutoff",
-        ( :cutoff = before )
+    name: &str,
+    platform: &str,
+    external_id: &str,
+    cause: &str,
+) -> anyhow::Result<Channel> {
+    let row: ChannelDb = sql_forge!(
+        ChannelDb,
+        r#"
+        INSERT INTO channels (name, platform, external_id, cause)
+        VALUES (:name, :platform, :external_id, :cause)
+        ON CONFLICT (platform, external_id)
+        DO UPDATE SET updated_at = NOW()
+        RETURNING
+            id, name, platform, external_id, cause,
+            current_profile, current_model, current_provider,
+            readonly,
+            COALESCE(closed, false) as "closed",
+            COALESCE(metadata::text, '{}') AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
+        "#,
+        ( :name = name, :platform = platform, :external_id = external_id, :cause = cause )
     )
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
 
-    Ok(result.rows_affected())
+    row.try_into()
 }
 
 // ---------------------------------------------------------------------------
-// Context retrieval helper functions
+// Channel open/close/status queries
+// ---------------------------------------------------------------------------
+
+/// Close a channel — sets closed=true and skips pending/processing threads.
+pub async fn close_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<()> {
+    sql_forge!(
+        "UPDATE channels SET closed = true, updated_at = NOW() WHERE id = :id",
+        ( :id = channel_id )
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Open a channel — sets closed=false so the supervisor spawns a handler.
+pub async fn open_channel(pool: &PgPool, channel_id: i64) -> anyhow::Result<()> {
+    sql_forge!(
+        "UPDATE channels SET closed = false, updated_at = NOW() WHERE id = :id",
+        ( :id = channel_id )
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Check if a channel is closed.
+pub async fn is_channel_closed(pool: &PgPool, channel_id: i64) -> anyhow::Result<bool> {
+    let row: Option<ChannelDb> = sql_forge!(
+        ChannelDb,
+        r#"
+        SELECT
+            id, name, platform, external_id, cause,
+            current_profile, current_model, current_provider,
+            readonly,
+            COALESCE(closed, false) as "closed",
+            '{}'::text AS "metadata",
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
+        FROM channels
+        WHERE id = :channel_id
+        "#,
+        ( :channel_id = channel_id )
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|r| r.closed).unwrap_or(false))
+}
+
+/// Status info for a channel: open/closed, thread counts, config.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelStatus {
+    pub channel_id: i64,
+    pub name: String,
+    pub platform: String,
+    pub closed: bool,
+    pub current_profile: String,
+    pub current_model: Option<String>,
+    pub current_provider: Option<String>,
+    pub pending_threads: i64,
+    pub processing_threads: i64,
+}
+
+/// Get channel status with thread counts.
+pub async fn get_channel_status(pool: &PgPool, channel_id: i64) -> anyhow::Result<Option<ChannelStatus>> {
+    let ch = find_channel_by_id(pool, channel_id).await?;
+    let ch = match ch {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    let pending: Option<i64> = sql_forge!(
+        scalar Option<i64>,
+        "SELECT COUNT(*) FROM threads WHERE channel_id = :cid AND status = 'pending'",
+        ( :cid = channel_id )
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let processing: Option<i64> = sql_forge!(
+        scalar Option<i64>,
+        "SELECT COUNT(*) FROM threads WHERE channel_id = :cid AND status = 'processing'",
+        ( :cid = channel_id )
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(Some(ChannelStatus {
+        channel_id: ch.id,
+        name: ch.name,
+        platform: ch.platform,
+        closed: ch.closed,
+        current_profile: ch.current_profile,
+        current_model: ch.current_model,
+        current_provider: ch.current_provider,
+        pending_threads: pending.unwrap_or(0),
+        processing_threads: processing.unwrap_or(0),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Context retrieval helper functions — updated for new message schema
 // ---------------------------------------------------------------------------
 
 /// Get recent messages from a thread for context assembly.
@@ -632,12 +680,9 @@ pub async fn get_recent_thread_messages(
         MessageDb,
         r#"
         SELECT
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
+            id, thread_id, role, content, thread_sequence, external_id,
             metadata::text AS "metadata", embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
-            iterations,
+            msg_type, msg_subtype,
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE thread_id = :thread_id
@@ -666,18 +711,16 @@ pub async fn search_messages_text(
         MessageDb,
         r#"
         SELECT
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata", embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
-            iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-        FROM messages
-        WHERE channel_id = :channel_id
-          AND content ILIKE :pattern
-          AND role IN ('user', 'agent')
-        ORDER BY created_at DESC
+            m.id, m.thread_id, m.role, m.content, m.thread_sequence, m.external_id,
+            m.metadata::text AS "metadata", m.embedding, m.summary_text, m.is_summary,
+            m.msg_type, m.msg_subtype,
+            COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM messages m
+        JOIN threads t ON t.id = m.thread_id
+        WHERE t.channel_id = :channel_id
+          AND m.content ILIKE :pattern
+          AND m.role IN ('user', 'agent')
+        ORDER BY m.created_at DESC
         LIMIT :limit
         "#,
         ( :channel_id = channel_id, :pattern = &pattern, :limit = limit )
@@ -689,7 +732,6 @@ pub async fn search_messages_text(
 }
 
 /// Find messages where embedding IS NULL, ordered by created_at, with a limit.
-/// Only returns messages with role='user' or role='agent'.
 pub async fn find_messages_without_embeddings(
     pool: &PgPool,
     limit: usize,
@@ -728,86 +770,30 @@ pub async fn update_message_embedding(
     Ok(())
 }
 
-pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Option<Channel>> {
-    let row: Option<ChannelDb> = sql_forge!(
-        ChannelDb,
-        r#"
-        SELECT
-            id, name, platform, external_id, cause,
-            current_profile, current_model, current_provider,
-            '{}'::text AS "metadata",
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
-            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
-        FROM channels
-        WHERE name = :name
-        "#,
-        ( :name = name )
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    row.map(|r| r.try_into()).transpose()
-}
-
-pub async fn create_channel(
-    pool: &PgPool,
-    name: &str,
-    platform: &str,
-    external_id: &str,
-    cause: &str,
-) -> anyhow::Result<Channel> {
-    let row: ChannelDb = sql_forge!(
-        ChannelDb,
-        r#"
-        INSERT INTO channels (name, platform, external_id, cause)
-        VALUES (:name, :platform, :external_id, :cause)
-        ON CONFLICT (platform, external_id)
-        DO UPDATE SET updated_at = NOW()
-        RETURNING
-            id, name, platform, external_id, cause,
-            current_profile, current_model, current_provider,
-            COALESCE(metadata::text, '{}') AS "metadata",
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
-            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
-        "#,
-        ( :name = name, :platform = platform, :external_id = external_id, :cause = cause )
-    )
-    .fetch_one(pool)
-    .await?;
-
-    row.try_into()
-}
-
 // ---------------------------------------------------------------------------
-// Hybrid retrieval: pgvector semantic search for messages
+// Hybrid retrieval: pgvector semantic search for messages — unchanged
 // ---------------------------------------------------------------------------
 
 /// Search messages by embedding similarity (pgvector cosine distance).
-/// Returns messages sorted by similarity (closest first).
 pub async fn search_messages_semantic(
     pool: &PgPool,
     embedding_str: &str,
     channel_id: i64,
     limit: i64,
 ) -> anyhow::Result<Vec<Message>> {
-    // Runtime-only sqlx::query_as — the `vector` type from pgvector is not in
-    // sqlx's compile-time type registry. Both sqlx::query_as! and sql_forge!()
-    // share this limitation. Only sqlx::query_as (runtime) works here.
     let rows: Vec<MessageDb> = sqlx::query_as(
         r#"
         SELECT
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata", embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
-            iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-        FROM messages
-        WHERE channel_id = $1
-          AND embedding IS NOT NULL
-          AND role IN ('user', 'agent')
-        ORDER BY embedding::vector(1536) <=> $2::vector(1536)
+            m.id, m.thread_id, m.role, m.content, m.thread_sequence, m.external_id,
+            m.metadata::text AS "metadata", m.embedding, m.summary_text, m.is_summary,
+            m.msg_type, m.msg_subtype,
+            COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM messages m
+        JOIN threads t ON t.id = m.thread_id
+        WHERE t.channel_id = $1
+          AND m.embedding IS NOT NULL
+          AND m.role IN ('user', 'agent')
+        ORDER BY m.embedding::vector(1536) <=> $2::vector(1536)
         LIMIT $3
         "#,
     )
@@ -821,147 +807,120 @@ pub async fn search_messages_semantic(
 }
 
 // ---------------------------------------------------------------------------
-// Wiki text search (walkdir-based)
+// Delete old messages/summaries
 // ---------------------------------------------------------------------------
 
-/// Search wiki markdown files by text content using walkdir.
-/// Searches for the query string in file contents (case-insensitive).
+pub async fn delete_old_messages(
+    pool: &PgPool,
+    before: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<u64> {
+    let result = sql_forge!(
+        "DELETE FROM messages WHERE created_at < :cutoff",
+        ( :cutoff = before )
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn delete_old_summaries(
+    pool: &PgPool,
+    before: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<u64> {
+    let result = sql_forge!(
+        "DELETE FROM summaries WHERE created_at < :cutoff",
+        ( :cutoff = before )
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 pub fn search_wiki_text(wiki_dir: &str, query: &str, limit: usize) -> Vec<(String, String, String)> {
+    use std::fs;
     let query_lower = query.to_lowercase();
-    let wiki_path = std::path::Path::new(wiki_dir);
-    if !wiki_path.exists() {
-        return vec![];
-    }
-
     let mut results = Vec::new();
-    let mut count = 0usize;
 
-    for entry in walkdir::WalkDir::new(wiki_path)
+    let walker = walkdir::WalkDir::new(wiki_dir)
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
+        .filter(|e| e.file_type().is_file() && e.path().extension().map(|ext| ext == "md").unwrap_or(false));
+
+    for entry in walker.take(limit * 10) {
+        if results.len() >= limit {
+            break;
         }
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("md")).unwrap_or(false) {
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    if content.to_lowercase().contains(&query_lower) {
-                        let file_path = path.to_string_lossy().to_string();
-                        let title = path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("untitled")
-                            .to_string();
-                        // Find the matching section (first ~200 chars around match)
-                        let snippet = if let Some(idx) = content.to_lowercase().find(&query_lower) {
-                            let start = idx.saturating_sub(100);
-                            let end = (idx + query.len() + 200).min(content.len());
-                            let snippet: String = content[start..end].chars().collect();
-                            format!("...{}...", snippet.trim())
-                        } else {
-                            content.chars().take(300).collect()
-                        };
-                        results.push((file_path, title, snippet));
-                        count += 1;
-                        if count >= limit {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to read wiki file {:?}: {}", path, e);
+        let relative = path.strip_prefix(wiki_dir).unwrap_or(path).display().to_string();
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let title = content.lines()
+            .find(|l| l.starts_with("# "))
+            .map(|l| l.trim_start_matches("# ").to_string())
+            .unwrap_or_else(|| path.file_stem().unwrap_or_default().to_string_lossy().to_string());
+
+        for line in content.lines() {
+            if line.to_lowercase().contains(&query_lower) {
+                let snippet = line.trim().chars().take(200).collect::<String>();
+                results.push((relative.clone(), title.clone(), snippet));
+                if results.len() >= limit {
+                    break;
                 }
             }
         }
     }
+
     results
 }
 
-// ---------------------------------------------------------------------------
-// Qdrant semantic search for wiki
-// ---------------------------------------------------------------------------
-
-/// Search wiki documents in Qdrant by vector similarity.
 pub async fn search_wiki_qdrant(
     qdrant_url: &str,
     embedding: &[f32],
     limit: usize,
-) -> anyhow::Result<Vec<(String, String, f32)>> {
-    let url = format!("{}/collections/wiki/points/search", qdrant_url);
-    let client = reqwest::Client::new();
+) -> anyhow::Result<Vec<(String, String, f64)>> {
+    use serde_json::json;
 
-    let body = serde_json::json!({
+    let client = reqwest::Client::new();
+    let payload = json!({
         "vector": embedding,
-        "limit": limit,
+        "limit": limit as u64,
         "with_payload": true,
     });
 
     let resp = client
-        .post(&url)
-        .json(&body)
+        .post(format!("{}/collections/wiki/points/search", qdrant_url))
+        .json(&payload)
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Qdrant search request failed: {}", e))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Qdrant search failed ({}): {}", status, text);
-    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Qdrant search response parse failed: {}", e))?;
 
-    let data: serde_json::Value = resp.json().await?;
     let mut results = Vec::new();
-
-    if let Some(result_array) = data.get("result").and_then(|r| r.as_array()) {
-        for point in result_array {
-            let score = point.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0) as f32;
-            let payload = point.get("payload").and_then(|p| p.as_object());
-            let file_path = payload
-                .and_then(|p| p.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let title = payload
-                .and_then(|p| p.get("title"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("untitled")
-                .to_string();
-            results.push((file_path, title, score));
+    if let Some(points) = body["result"].as_array() {
+        for point in points {
+            let score = point["score"].as_f64().unwrap_or(0.0);
+            let payload = &point["payload"];
+            let path = payload["path"].as_str().unwrap_or("").to_string();
+            let title = payload["title"].as_str().unwrap_or("").to_string();
+            results.push((path, title, score));
         }
     }
 
     Ok(results)
 }
 
-#[expect(dead_code)]
-pub async fn clear_channel_stop(pool: &PgPool, channel_id: i64) -> anyhow::Result<()> {
-    sql_forge!("DELETE FROM channel_stops WHERE channel_id = :channel_id", ( :channel_id = channel_id ))
-        .execute(pool)
-        .await?;
-
-    Ok(())
-}
-
-#[expect(dead_code)]
-pub async fn find_all_stopped_channels(pool: &PgPool) -> anyhow::Result<Vec<ChannelStop>> {
-    let rows: Vec<ChannelStopDb> = sql_forge!(
-        ChannelStopDb,
-        r#"
-        SELECT id, channel_id, COALESCE(TO_CHAR(stopped_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "stopped_at"
-        FROM channel_stops
-        ORDER BY stopped_at DESC
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter().map(|r| r.try_into()).collect()
-}
-
 // ---------------------------------------------------------------------------
-// Summary query functions
+// Summary query functions — unchanged
 // ---------------------------------------------------------------------------
 
 /// Get the latest (most recent) summary for a channel.
@@ -1014,28 +973,26 @@ pub async fn get_recent_summaries(
     Ok(rows)
 }
 
-/// Get completed seq-0 messages (thread roots) with id > since_id,
+/// Get completed seq-0 threads (thread roots) with id > since_id,
 /// ordered by id ASC, limited to `limit` rows.
-pub async fn get_completed_seq0_messages_since(
+/// Now queries the threads table instead of messages.
+pub async fn get_completed_seq0_threads_since(
     pool: &PgPool,
     channel_id: i64,
     since_id: i64,
     limit: i64,
-) -> anyhow::Result<Vec<MessageDb>> {
-    let rows: Vec<MessageDb> = sql_forge!(
-        MessageDb,
+) -> anyhow::Result<Vec<ThreadDb>> {
+    let rows: Vec<ThreadDb> = sql_forge!(
+        ThreadDb,
         r#"
         SELECT
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
-            metadata::text AS "metadata", embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
-            iterations,
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-        FROM messages
+            id, status, cause, channel_id, profile, provider, model,
+            input_tokens, cached_tokens, output_tokens, duration_ms,
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(started_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "started_at",
+            COALESCE(TO_CHAR(ended_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "ended_at"
+        FROM threads
         WHERE channel_id = :channel_id
-          AND thread_sequence = 0
           AND status = 'completed'
           AND id > :since_id
         ORDER BY id ASC
@@ -1058,12 +1015,9 @@ pub async fn get_thread_messages(
         MessageDb,
         r#"
         SELECT
-            id, channel_id, role, content, status,
-            thread_id, thread_sequence, external_id,
+            id, thread_id, role, content, thread_sequence, external_id,
             metadata::text AS "metadata", embedding, summary_text, is_summary,
-            msg_type, msg_subtype, iteration_count,
-            profile, provider, model, processing_time_ms, token_usage::text AS "token_usage",
-            iterations,
+            msg_type, msg_subtype,
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE thread_id = :thread_id
@@ -1101,17 +1055,4 @@ pub async fn create_summary(
     Ok(row)
 }
 
-/// Delete summaries older than the given cutoff date.
-pub async fn delete_old_summaries(
-    pool: &PgPool,
-    before: chrono::DateTime<chrono::Utc>,
-) -> anyhow::Result<u64> {
-    let result = sql_forge!(
-        "DELETE FROM summaries WHERE created_at < :cutoff",
-        ( :cutoff = before )
-    )
-    .execute(pool)
-    .await?;
 
-    Ok(result.rows_affected())
-}

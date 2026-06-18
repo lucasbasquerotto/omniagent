@@ -76,16 +76,6 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Create indexes
-    sql_forge!(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_messages_channel_status
-            ON messages(channel_id, status, created_at);
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
     // Migration: add msg_type, msg_subtype, iteration_count columns
     // (idempotent — skips if columns already exist)
     sql_forge!(
@@ -173,16 +163,6 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Index on messages for profile/model queries
-    sql_forge!(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_messages_profile
-            ON messages(profile, model);
         "#,
     )
     .execute(pool)
@@ -297,6 +277,48 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await?;
 
+    // ── Add channel_id and profile to kanban_tasks ──
+    sql_forge!(
+        r#"
+        ALTER TABLE kanban_tasks
+        ADD COLUMN IF NOT EXISTS channel_id BIGINT REFERENCES channels(id),
+        ADD COLUMN IF NOT EXISTS profile TEXT
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Add channel_id and profile to cron_jobs ──
+    sql_forge!(
+        r#"
+        ALTER TABLE cron_jobs
+        ADD COLUMN IF NOT EXISTS channel_id BIGINT REFERENCES channels(id),
+        ADD COLUMN IF NOT EXISTS profile TEXT
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Add readonly column to channels ──
+    sql_forge!(
+        r#"
+        ALTER TABLE channels
+        ADD COLUMN IF NOT EXISTS readonly BOOLEAN NOT NULL DEFAULT false
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Add updated_at to cron_jobs for stale-lock detection ──
+    sql_forge!(
+        r#"
+        ALTER TABLE cron_jobs
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // ── Summaries table for cross-thread thread summaries ──
     sql_forge!(
         r#"
@@ -308,6 +330,168 @@ pub async fn run(pool: &PgPool) -> Result<()> {
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Threads table migration ──
+    // Creates the threads table and migrates data from the old flat messages table.
+    sql_forge!(
+        r#"
+        CREATE TABLE IF NOT EXISTS threads (
+            id              BIGSERIAL PRIMARY KEY,
+            status          TEXT NOT NULL DEFAULT 'created',
+            cause           TEXT NOT NULL,
+            channel_id      BIGINT NOT NULL REFERENCES channels(id),
+            profile         TEXT NOT NULL DEFAULT 'default',
+            provider        TEXT,
+            model           TEXT,
+            input_tokens    INT DEFAULT 0,
+            cached_tokens   INT DEFAULT 0,
+            output_tokens   INT DEFAULT 0,
+            duration_ms     INT DEFAULT 0,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            started_at      TIMESTAMPTZ,
+            ended_at        TIMESTAMPTZ
+        );
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    sql_forge!(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_threads_channel_status ON threads(channel_id, status);
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    // Data migration: create threads for every distinct thread_id in messages
+    // Uses runtime sqlx::query to avoid compile-time validation errors when
+    // old columns have already been dropped by a previous migration run.
+    // This is safe because the migration is idempotent via ON CONFLICT DO NOTHING.
+    {
+        let has_old_columns: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='channel_id')"
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+
+        if has_old_columns {
+            sqlx::query(
+                r#"
+                INSERT INTO threads (id, status, cause, channel_id, profile, provider, model, created_at)
+                SELECT DISTINCT 
+                    COALESCE(m.thread_id, m.id) as id,
+                    CASE 
+                        WHEN m.status = 'completed' THEN 'completed'
+                        WHEN m.status = 'failed' THEN 'failed'
+                        WHEN m.status = 'skipped' THEN 'skipped'
+                        WHEN m.status = 'processing' THEN 'interrupted'
+                        ELSE 'completed'
+                    END as status,
+                    CASE 
+                        WHEN m.role = 'user' THEN 'user'
+                        WHEN m.msg_type = 'cron' THEN 'cron'
+                        WHEN m.msg_type = 'kanban' THEN 'kanban'
+                        ELSE 'user'
+                    END as cause,
+                    m.channel_id,
+                    COALESCE(m.profile, 'default') as profile,
+                    m.provider,
+                    m.model,
+                    m.created_at
+                FROM messages m
+                WHERE (m.thread_sequence = 0 OR m.thread_id IS NULL)
+                  AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.id = COALESCE(m.thread_id, m.id))
+                ON CONFLICT (id) DO NOTHING
+                "#
+            )
+            .execute(pool)
+            .await?;
+
+            // Update messages where thread_id was NULL
+            sqlx::query("UPDATE messages SET thread_id = id WHERE thread_id IS NULL")
+                .execute(pool)
+                .await?;
+
+            // Make thread_id NOT NULL
+            sqlx::query("ALTER TABLE messages ALTER COLUMN thread_id SET NOT NULL")
+                .execute(pool)
+                .await?;
+
+            // Drop columns that moved to threads table
+            sqlx::query(
+                r#"
+                ALTER TABLE messages 
+                    DROP COLUMN IF EXISTS status,
+                    DROP COLUMN IF EXISTS channel_id,
+                    DROP COLUMN IF EXISTS profile,
+                    DROP COLUMN IF EXISTS provider,
+                    DROP COLUMN IF EXISTS model,
+                    DROP COLUMN IF EXISTS processing_time_ms,
+                    DROP COLUMN IF EXISTS token_usage,
+                    DROP COLUMN IF EXISTS iterations,
+                    DROP COLUMN IF EXISTS iteration_count
+                "#
+            )
+            .execute(pool)
+            .await?;
+
+            // Drop old indexes
+            sqlx::query("DROP INDEX IF EXISTS idx_messages_channel_status").execute(pool).await?;
+            sqlx::query("DROP INDEX IF EXISTS idx_messages_profile").execute(pool).await?;
+        }
+    }
+
+    // Add foreign key (safe: won't fail if constraint already exists)
+    sql_forge!(
+        r#"
+        DO $$ BEGIN
+            ALTER TABLE messages ADD CONSTRAINT fk_messages_thread FOREIGN KEY (thread_id) REFERENCES threads(id);
+        EXCEPTION
+            WHEN duplicate_object THEN NULL;
+        END $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Ensure messages.thread_id is NOT NULL (in case the migration block above was skipped)
+    sql_forge!(
+        r#"
+        DO $$ BEGIN
+            ALTER TABLE messages ALTER COLUMN thread_id SET NOT NULL;
+        EXCEPTION
+            WHEN others THEN NULL;
+        END $$;
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    // Add closed column to channels (default false — channels start opened)
+    sql_forge!(
+        r#"
+        ALTER TABLE channels
+        ADD COLUMN IF NOT EXISTS closed BOOLEAN NOT NULL DEFAULT false
+        "#
+    )
+    .execute(pool)
+    .await?;
+
+    // Index on threads for channel_id + status queries
+    sql_forge!(
+        r#"
+        DO $$ BEGIN
+            CREATE INDEX IF NOT EXISTS idx_threads_channel_status
+            ON threads(channel_id, status);
+        EXCEPTION
+            WHEN duplicate_table THEN NULL;
+        END $$;
+        "#
     )
     .execute(pool)
     .await?;

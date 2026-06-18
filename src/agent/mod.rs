@@ -1,7 +1,7 @@
 //! Agent module — parallel channel processing supervisor.
 //!
 //! The agent supervisor runs a loop that:
-//! 1. Recovers stale `processing` messages on startup.
+//! 1. Recovers stale `processing` threads on startup.
 //! 2. Lists all channels and spawns a dedicated `channel_handler` task for
 //!    each channel that isn't already running.
 //! 3. Checks for stopped channels and cancels their handlers via
@@ -9,7 +9,7 @@
 //! 4. Sleeps 5 seconds between iterations.
 //!
 //! Each `channel_handler` independently polls its channel for pending
-//! messages, processes them via the LLM, and respects cancellation
+//! threads, processes them via the LLM, and respects cancellation
 //! requests from the `/stop` HTTP endpoint.
 
 use anyhow::Result;
@@ -34,7 +34,7 @@ use crate::vectorizer::Vectorizer;
 use crate::mcp::{
     truncate_content, AppContext, McpRegistry, McpToolCall, DEFAULT_MAX_TOOL_OUTPUT_CHARS,
 };
-use crate::models::{Message, MessageNew, MessageStatus};
+use crate::models::{Message, MessageNew, Thread};
 
 /// Configuration for the agent's LLM interactions.
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ pub struct AgentConfig {
     pub summarize_after_days: u32,
     pub max_iterations: u32,
     /// Number of threads per half-window for summary generation.
-    /// A summary is generated every 2*summary_window completed seq-0 threads.
+    /// A summary is generated every 2*summary_window completed threads.
     pub summary_window: u32,
     /// Max tokens for the summary generation LLM call.
     pub summary_tokens: u32,
@@ -171,7 +171,7 @@ impl Agent {
     /// Run the agent supervisor loop.
     ///
     /// This method:
-    /// 1. Recovers stale `processing` messages on startup.
+    /// 1. Recovers stale `processing` threads on startup.
     /// 2. Continuously polls all channels.
     /// 3. Spawns a [`channel_handler`] for each new channel.
     /// 4. Cancels handlers for stopped channels.
@@ -204,6 +204,12 @@ impl Agent {
             // Spawn handlers for channels not yet being processed
             for &channel_id in &channel_ids {
                 if let std::collections::hash_map::Entry::Vacant(e) = tokens.entry(channel_id) {
+                    // Skip spawning if the channel is closed — it will be spawned
+                    // when the channel is opened via the /open endpoint
+                    if let Ok(true) = queries::is_channel_closed(&pool, channel_id).await {
+                        continue;
+                    }
+
                     let token = CancellationToken::new();
                     let handler_token = token.clone();
                     e.insert(token);
@@ -244,10 +250,10 @@ impl Agent {
             for &channel_id in &stopped_ids {
                 if let Some(token) = tokens.get(&channel_id) {
                     if !token.is_cancelled() {
-                        if let Ok(Some(_)) = queries::find_stopped_channel(&pool, channel_id).await
+                        if let Ok(true) = queries::is_channel_closed(&pool, channel_id).await
                         {
                             info!(
-                                "Channel {} has been stopped, cancelling handler",
+                                "Channel {} has been closed, cancelling handler",
                                 channel_id
                             );
                             token.cancel();
@@ -255,6 +261,10 @@ impl Agent {
                     }
                 }
             }
+
+            // Remove cancelled tokens so the next iteration can spawn fresh handlers
+            // for channels that are no longer stopped.
+            tokens.retain(|_, t| !t.is_cancelled());
 
             // Prune tokens for channels that no longer exist in the DB
             let active_ids: Vec<i64> = channels.iter().map(|c| c.id).collect();
@@ -266,13 +276,13 @@ impl Agent {
     }
 }
 
-/// Per-channel message processing loop.
+/// Per-channel thread processing loop.
 ///
 /// This function runs as a separate tokio task for each channel. It:
 /// 1. Checks cancellation at the start of each iteration.
 /// 2. Checks if the channel has been stopped.
-/// 3. Fetches pending messages for this channel.
-/// 4. Processes each message via [`process_message`].
+/// 3. Fetches pending threads for this channel.
+/// 4. Processes each thread via [`process_thread`].
 /// 5. Sleeps 1 second between iterations.
 ///
 /// The loop exits cleanly when the cancellation token is triggered or
@@ -294,115 +304,88 @@ async fn channel_handler(
         tokio::select! {
             _ = cancel.cancelled() => {
                 info!("Channel {} handler cancelled", channel_id);
-                let _ = queries::skip_pending_messages(&pool, channel_id).await;
+                let _ = queries::skip_channel_threads(&pool, channel_id).await;
                 break;
             }
             _ = async {
-                // Check if the channel has been stopped in the DB
-                if let Ok(Some(_)) = queries::find_stopped_channel(&pool, channel_id).await {
-                    info!("Channel {} is stopped in DB, handler exiting", channel_id);
-                    let _ = queries::skip_pending_messages(&pool, channel_id).await;
+                // Check if the channel has been closed in the DB
+                if let Ok(true) = queries::is_channel_closed(&pool, channel_id).await {
+                    info!("Channel {} is closed in DB, handler exiting", channel_id);
+                    let _ = queries::skip_channel_threads(&pool, channel_id).await;
                     return;
                 }
 
-                // Fetch pending messages for this channel
-                let messages = match queries::find_pending_messages(&pool, channel_id).await {
-                    Ok(msgs) => msgs,
+                // Fetch pending threads for this channel
+                let threads = match queries::find_pending_threads_by_channel(&pool, channel_id).await {
+                    Ok(threads) => threads,
                     Err(e) => {
-                        error!("Error fetching pending messages for channel {}: {:?}", channel_id, e);
+                        error!("Error fetching pending threads for channel {}: {:?}", channel_id, e);
                         return;
                     }
                 };
 
-                for msg in &messages {
-                    // Best-effort cancellation check before each message
+                for thread in &threads {
+                    // Best-effort cancellation check before each thread
                     if cancel.is_cancelled() {
-                        let _ = queries::skip_pending_messages(&pool, channel_id).await;
+                        let _ = queries::skip_channel_threads(&pool, channel_id).await;
                         return;
                     }
 
-                    // Check if the channel was stopped between batches
-                    if let Ok(Some(_)) = queries::find_stopped_channel(&pool, channel_id).await {
-                        info!("Channel {} stopped during batch processing", channel_id);
-                        let _ = queries::skip_pending_messages(&pool, channel_id).await;
+                    // Check if the channel was closed between batches
+                    if let Ok(true) = queries::is_channel_closed(&pool, channel_id).await {
+                        info!("Channel {} closed during batch processing", channel_id);
+                        let _ = queries::skip_channel_threads(&pool, channel_id).await;
                         return;
                     }
 
-                    info!("Processing message {} in channel {}", msg.id, channel_id);
+                    info!("Processing thread {} in channel {}", thread.id, channel_id);
 
-                    // Safety: normalize any pending message whose thread_id is
-                    // still NULL (should be extremely rare now that init_thread_root
-                    // uses an atomic CTE, but this catches edge cases from external
-                    // scripts or old data).
-                    let _ = queries::normalize_null_thread_ids(&pool).await;
+                    // Get the cause message for this thread
+                    let cause_msg = match queries::get_cause_message(&pool, thread.id).await {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => {
+                            error!("Thread {} has no cause message, skipping", thread.id);
+                            // Mark thread as interrupted
+                            let _ = queries::complete_thread(&pool, thread.id, "interrupted", 0, 0, 0, 0).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("Failed to get cause message for thread {}: {:?}", thread.id, e);
+                            continue;
+                        }
+                    };
 
-                    // Check iteration limit before claiming the message
-                    match queries::count_thread_iterations(&pool, msg.thread_id).await {
+                    // Check message count limit before claiming the thread
+                    match queries::count_thread_messages(&pool, thread.id).await {
                         Ok(count) if count >= config.max_iterations as i32 => {
                             info!(
-                                "Thread {} has reached iteration limit ({}/{}), skipping message {}",
-                                msg.thread_id, count, config.max_iterations, msg.id
+                                "Thread {} has reached message limit ({}/{}), skipping",
+                                thread.id, count, config.max_iterations
                             );
-                            let _ = queries::update_message_status(
-                                &pool, msg.id, &MessageStatus::Skipped,
-                            ).await;
+                            let _ = queries::complete_thread(&pool, thread.id, "skipped", 0, 0, 0, 0).await;
                             continue;
                         }
                         Ok(_) => {} // under limit, proceed
                         Err(e) => {
-                            error!("Failed to count thread iterations: {:?}", e);
+                            error!("Failed to count thread messages: {:?}", e);
                         }
                     }
 
-                    // Anti-double-execute guard: atomically claim this message by
+                    // Anti-double-execute guard: atomically claim this thread by
                     // updating its status to 'processing' only if it's still 'pending'.
                     // If another agent instance claimed it first, skip.
-                    if !queries::try_claim_message(&pool, msg.id).await {
+                    if !queries::claim_thread(&pool, thread.id).await {
                         debug!(
-                            "Message {} was already claimed by another worker, skipping",
-                            msg.id
+                            "Thread {} was already claimed by another worker, skipping",
+                            thread.id
                         );
                         continue;
                     }
 
-                    if let Err(e) = process_message(&pool, &llm, &config, &mcp, &ctx, msg).await {
-                        error!("Failed to process message {}: {:?}", msg.id, e);
-                        // Report error as a message in the same thread
-                        let err_msg = MessageNew {
-                            channel_id: msg.channel_id,
-                            role: "system".to_string(),
-                            content: format!(
-                                "Error processing message {}: {}",
-                                msg.id, e
-                            ),
-                            status: MessageStatus::Completed,
-                            thread_id: Some(msg.thread_id),
-                            thread_sequence: msg.thread_sequence + 1,
-                            external_id: Some(format!("error:{}:{}", msg.id, chrono::Utc::now().timestamp())),
-                            metadata: serde_json::json!({
-                                "error_type": "processing",
-                                "original_msg_id": msg.id,
-                            }),
-                            embedding: None,
-                            summary_text: None,
-                            is_summary: false,
-                            msg_type: "tool".to_string(),
-                            msg_subtype: Some("error".to_string()),
-                            iteration_count: 0,
-                            iterations: 0,
-                            profile: msg.profile.clone(),
-                            provider: None,
-                            model: None,
-                            processing_time_ms: None,
-                            token_usage: None,
-                        };
-                        if let Err(e2) = crate::db::types::create_message(&pool, &err_msg).await {
-                            error!("Failed to insert error message for {}: {:?}", msg.id, e2);
-                        }
-                        // Mark original message as failed
-                        let _ = crate::db::types::update_message_status(
-                            &pool, msg.id, &MessageStatus::Failed,
-                        ).await;
+                    if let Err(e) = process_thread(&pool, &llm, &config, &mcp, &ctx, thread, &cause_msg).await {
+                        error!("Failed to process thread {}: {:?}", thread.id, e);
+                        // Mark thread as failed
+                        let _ = queries::complete_thread(&pool, thread.id, "failed", 0, 0, 0, 0).await;
                     }
                 }
 
@@ -430,8 +413,48 @@ fn merge_usage(cumulative: &mut Option<Usage>, new_usage: Option<Usage>) {
     }
 }
 
+/// Check if a database error is a foreign key violation (PostgreSQL code 23503).
+/// These indicate the thread was deleted or the FK constraint was broken —
+/// the thread should be marked as failed rather than retried.
+fn is_fk_violation(e: &anyhow::Error) -> bool {
+    if let Some(db_err) = e.downcast_ref::<sqlx::Error>() {
+        if let sqlx::Error::Database(ref dberr) = db_err {
+            return dberr.code().as_deref() == Some("23503");
+        }
+    }
+    false
+}
+
+/// Persist a message and detect FK violations that should abort thread processing.
+/// Returns Ok on success, Err(FkViolation) if the FK constraint fails (thread deleted/missing),
+/// or propagates other errors.
+enum CreateMessageResult {
+    Success,
+    FkViolation,
+    OtherError(anyhow::Error),
+}
+
+async fn persist_or_abort(
+    pool: &PgPool,
+    msg: &MessageNew,
+    thread_id: i64,
+) -> CreateMessageResult {
+    match queries::create_message(pool, msg).await {
+        Ok(_) => CreateMessageResult::Success,
+        Err(e) if is_fk_violation(&e) => {
+            error!(
+                "FK violation inserting message for thread {} — marking thread as failed",
+                thread_id
+            );
+            // Mark the thread as failed
+            let _ = queries::complete_thread(pool, thread_id, "failed", 0, 0, 0, 0).await;
+            CreateMessageResult::FkViolation
+        }
+        Err(e) => CreateMessageResult::OtherError(e),
+    }
+}
+
 /// Prune old tool results from the conversation history when the total
-/// exceeds `TOOL_RESULT_HISTORY_BUDGET` chars (Layer 3).
 ///
 /// Keeps the most recent turn's results intact and strips old tool result
 /// bodies, replacing them with a short summary, while preserving all
@@ -476,14 +499,14 @@ fn prune_old_tool_results(messages: &mut Vec<ChatMessage>) {
     }
 }
 
-/// Check if enough completed seq-0 threads have accumulated since the
+/// Check if enough completed threads have accumulated since the
 /// last summary for this channel, and if so, generate a new cross-thread summary.
 ///
 /// Algorithm:
 /// 1. Get the `next_thread_id` from the latest summary (0 if none).
-/// 2. Count completed seq-0 messages with id > next_thread_id.
+/// 2. Count completed threads with id > next_thread_id.
 /// 3. If count >= 2*N (where N = SUMMARY_WINDOW), generate a summary.
-/// 4. The first thread id = first seq-0, the last = last seq-0.
+/// 4. The first thread id = first thread, the last = last thread.
 /// 5. For each of the 2*N threads, fetch ALL its messages.
 /// 6. Build a summarization prompt with previous summary context.
 /// 7. Save with `next_thread_id` = the N-th thread's id (window slides by N).
@@ -505,32 +528,32 @@ async fn check_and_generate_summary(
         _ => 0i64,
     };
 
-    // 2. Fetch completed seq-0 messages since the last summary
-    let seq0_msgs = match queries::get_completed_seq0_messages_since(
+    // 2. Fetch completed threads since the last summary
+    let completed_threads = match queries::get_completed_seq0_threads_since(
         pool, channel_id, since_id, trigger_count,
     )
     .await
     {
-        Ok(msgs) => msgs,
+        Ok(threads) => threads,
         Err(e) => {
             warn!(
-                "[thread-summary] Failed to fetch completed seq-0 messages for channel {}: {:?}",
+                "[thread-summary] Failed to fetch completed threads for channel {}: {:?}",
                 channel_id, e
             );
             return;
         }
     };
 
-    if (seq0_msgs.len() as i64) < trigger_count {
+    if (completed_threads.len() as i64) < trigger_count {
         // Not enough threads yet
         return;
     }
 
-    // We have 2*N threads. The first thread's id is seq0_msgs[0].id.
+    // We have 2*N threads. The first thread's id is completed_threads[0].id.
     // The N-th thread's id (the sliding window point):
-    let pivot_thread_id = seq0_msgs[(window - 1) as usize].id;
-    let first_thread_id = seq0_msgs[0].id;
-    let last_thread_id = seq0_msgs[(trigger_count - 1) as usize].id;
+    let pivot_thread_id = completed_threads[(window - 1) as usize].id;
+    let first_thread_id = completed_threads[0].id;
+    let last_thread_id = completed_threads[(trigger_count - 1) as usize].id;
 
     info!(
         "[thread-summary] Generating summary for channel {}: {} threads (id {} to {}), pivot={}",
@@ -539,15 +562,15 @@ async fn check_and_generate_summary(
 
     // 3. For each of the 2*N threads, fetch ALL messages
     let mut all_thread_content = String::new();
-    for seq0 in &seq0_msgs {
-        let tid = seq0.thread_id.unwrap_or(seq0.id);
+    for thread_db in &completed_threads {
+        let tid = thread_db.id;
         match queries::get_thread_messages(pool, tid).await {
             Ok(thread_msgs) => {
                 all_thread_content.push_str(&format!(
-                    "\n=== Thread #{} (started by {} at {}) ===\n",
+                    "\n=== Thread #{} (cause: {} at {}) ===\n",
                     tid,
-                    seq0.role,
-                    seq0.created_at.as_deref().unwrap_or("?"),
+                    thread_db.cause,
+                    thread_db.created_at.as_deref().unwrap_or("?"),
                 ));
                 for m in &thread_msgs {
                     let role_display = match m.role.as_str() {
@@ -655,59 +678,155 @@ async fn check_and_generate_summary(
     }
 }
 
-/// Process a single pending message through the state machine:
+/// Process a single pending thread through the state machine:
 ///
-/// 1. Update message status → `processing`
-/// 2. Get current iteration count for the thread
-/// 3. Resolve profile, provider, model from channel
+/// 1. Claim the thread (status → 'processing')
+/// 2. Get current message count for the thread
+/// 3. Resolve profile, provider, model from thread
 /// 4. Call the LLM with system + user messages (and tools if enabled)
 /// 5. If tool calls are returned, execute them and loop back to LLM
 /// 6. If reasoning exists, save as a separate `reasoning` record
 /// 7. Save the main agent response (msg_type: `message`)
 /// 8. Generate a per-turn summary (outside iteration limit)
-/// 9. Update original message status → `completed`, record processing_time_ms + token_usage
+/// 9. Update thread status → completed/failed, record token_usage + duration
 /// 10. Trigger cross-thread summary if enough threads have accumulated
-async fn process_message(
+async fn process_thread(
     pool: &PgPool,
     llm: &LLMClient,
     config: &AgentConfig,
     mcp: &McpRegistry,
     ctx: &AppContext,
-    msg: &Message,
+    thread: &Thread,
+    cause_msg: &Message,
 ) -> Result<Message> {
     let start_time = std::time::Instant::now();
 
-    // 1. Mark the message as 'processing'
-    queries::update_message_status(pool, msg.id, &MessageStatus::Processing).await?;
+    // 1. Mark the thread as 'processing' (already done by claim_thread, but verify)
+    // The claim_thread function already set status='processing' and started_at=NOW()
 
-    // 2. Get current iteration count for this thread
-    let current_max = queries::count_thread_iterations(pool, msg.thread_id)
+    // 2. Get current message count for this thread
+    let current_msg_count = queries::count_thread_messages(pool, thread.id)
         .await
         .unwrap_or(0);
 
-    // 3. Resolve profile, provider, model for this message
-    let profile_name = if msg.profile.is_empty() {
-        "default".to_string()
-    } else {
-        msg.profile.clone()
-    };
+    // 3. Read profile, provider, model from the thread (not from messages)
+    let profile_name = thread.profile.clone();
+    let provider_name = thread.provider.clone();
+    let model_name = thread.model.clone();
 
-    // Load the profile so its model/provider can be used as fallback
     let profile_registry = crate::profile::ProfileRegistry::new(&ctx.data_dir);
+
+    // 3a. Check profile name is present
+    if profile_name.is_empty() {
+        let err_msg = MessageNew {
+            thread_id: thread.id,
+            role: "system".to_string(),
+            content: format!(
+                "Invalid configuration: profile='{}', provider={:?}, model={:?} — profile name is empty. Set a profile on the channel or thread.",
+                profile_name, provider_name, model_name
+            ),
+            thread_sequence: cause_msg.thread_sequence + 1,
+            external_id: Some(format!("validation-error:{}:{}", thread.id, chrono::Utc::now().timestamp())),
+            metadata: serde_json::json!({
+                "error_type": "configuration",
+            }),
+            embedding: None,
+            summary_text: None,
+            is_summary: false,
+            msg_type: "error".to_string(),
+            msg_subtype: Some("no-profile".to_string()),
+        };
+        let saved = queries::create_message(pool, &err_msg).await?;
+        let _ = queries::complete_thread(pool, thread.id, "failed", 0, 0, 0, 0).await;
+        return Ok(saved);
+    }
+
+    // 3b. Check profile exists
+    if profile_registry.get(&profile_name).is_none() {
+        let err_msg = MessageNew {
+            thread_id: thread.id,
+            role: "system".to_string(),
+            content: format!(
+                "Invalid configuration: profile='{}' does not exist.",
+                profile_name
+            ),
+            thread_sequence: cause_msg.thread_sequence + 1,
+            external_id: Some(format!("validation-error:{}:{}", thread.id, chrono::Utc::now().timestamp())),
+            metadata: serde_json::json!({
+                "error_type": "configuration",
+                "original_thread_id": thread.id,
+            }),
+            embedding: None,
+            summary_text: None,
+            is_summary: false,
+            msg_type: "error".to_string(),
+            msg_subtype: Some("invalid-profile".to_string()),
+        };
+        let saved = queries::create_message(pool, &err_msg).await?;
+        let _ = queries::complete_thread(pool, thread.id, "failed", 0, 0, 0, 0).await;
+        return Ok(saved);
+    }
+
+    // 3c. Check provider is set on the thread
+    if provider_name.as_ref().map_or(true, |s| s.is_empty()) {
+        let err_msg = MessageNew {
+            thread_id: thread.id,
+            role: "system".to_string(),
+            content: format!(
+                "Invalid configuration: provider is not set on thread {}. Ensure the thread has a provider stamped at creation time. Check channel.current_provider, profile provider, or LLM_PROVIDER env var.",
+                thread.id
+            ),
+            thread_sequence: cause_msg.thread_sequence + 1,
+            external_id: Some(format!("validation-error:{}:{}", thread.id, chrono::Utc::now().timestamp())),
+            metadata: serde_json::json!({
+                "error_type": "configuration",
+                "original_thread_id": thread.id,
+            }),
+            embedding: None,
+            summary_text: None,
+            is_summary: false,
+            msg_type: "error".to_string(),
+            msg_subtype: Some("no-provider".to_string()),
+        };
+        let saved = queries::create_message(pool, &err_msg).await?;
+        let _ = queries::complete_thread(pool, thread.id, "failed", 0, 0, 0, 0).await;
+        return Ok(saved);
+    }
+
+    // 3d. Check model is set on the thread
+    if model_name.as_ref().map_or(true, |s| s.is_empty()) {
+        let err_msg = MessageNew {
+            thread_id: thread.id,
+            role: "system".to_string(),
+            content: format!(
+                "Invalid configuration: model is not set on thread {}. Ensure the thread has a model stamped at creation time. Check channel.current_model, profile model, or LLM_MODEL env var.",
+                thread.id
+            ),
+            thread_sequence: cause_msg.thread_sequence + 1,
+            external_id: Some(format!("validation-error:{}:{}", thread.id, chrono::Utc::now().timestamp())),
+            metadata: serde_json::json!({
+                "error_type": "configuration",
+                "original_thread_id": thread.id,
+            }),
+            embedding: None,
+            summary_text: None,
+            is_summary: false,
+            msg_type: "error".to_string(),
+            msg_subtype: Some("no-model".to_string()),
+        };
+        let saved = queries::create_message(pool, &err_msg).await?;
+        let _ = queries::complete_thread(pool, thread.id, "failed", 0, 0, 0, 0).await;
+        return Ok(saved);
+    }
+
+    // Validation passed — load the profile for its settings (auto_retrieval_enabled, etc.)
     let prof = profile_registry.get(&profile_name).cloned().unwrap_or_else(|| {
-        crate::profile::Profile::default("default")
+        crate::profile::Profile::default(&profile_name)
     });
 
-    let provider_name = msg
-        .provider
-        .clone()
-        .or_else(|| prof.provider.clone())
-        .or_else(|| Some(config.llm_provider.clone()));
-    let model_name = msg
-        .model
-        .clone()
-        .or_else(|| prof.model.clone())
-        .or_else(|| Some(config.llm_model.clone()));
+    // Use provider/model directly from the thread stamp (no fallback chain)
+    let provider_name = provider_name;
+    let model_name = model_name;
 
     // 4. Build the initial message history with the structured system prompt
     let system_prompt = crate::prompt_builder::build_system_prompt(
@@ -724,7 +843,7 @@ async fn process_message(
 
         // Classify the user message to determine retrieval needs
         let (_query_class, needs_retrieval) =
-            crate::context_builder::classify_query(&msg.content);
+            crate::context_builder::classify_query(&cause_msg.content);
 
         // Determine retrieval aggressiveness from profile
         let use_retrieval = needs_retrieval && prof.auto_retrieval_enabled;
@@ -735,13 +854,13 @@ async fn process_message(
         };
 
         // Add recent thread messages as a high-priority context block
-        match queries::get_recent_thread_messages(pool, msg.thread_id, 10).await {
+        match queries::get_recent_thread_messages(pool, thread.id, 10).await {
             Ok(recent_msgs) => {
                 if !recent_msgs.is_empty() {
                     let thread_content: String = recent_msgs
                         .iter()
                         .rev() // oldest first
-                        .filter(|m| m.id != msg.id) // exclude the current message
+                        .filter(|m| m.id != cause_msg.id) // exclude the current cause message
                         .map(|m| format!("[{}]: {}", m.role, m.content))
                         .collect::<Vec<_>>()
                         .join("\n");
@@ -761,7 +880,7 @@ async fn process_message(
         }
 
         // Add last summary for this channel as high-priority context
-        match queries::get_latest_summary(pool, msg.channel_id).await {
+        match queries::get_latest_summary(pool, thread.channel_id).await {
             Ok(Some(summary)) => {
                 builder.add_block(ContextBlock::new(
                     "last_summary",
@@ -770,10 +889,10 @@ async fn process_message(
                     4_000,
                 ));
 
-                // Also include seq-0 messages completed after the last summary, if any
-                match queries::get_completed_seq0_messages_since(
+                // Also include threads completed after the last summary, if any
+                match queries::get_completed_seq0_threads_since(
                     pool,
-                    msg.channel_id,
+                    thread.channel_id,
                     summary.next_thread_id,
                     5, // include up to 5 recent thread roots for context
                 )
@@ -782,11 +901,10 @@ async fn process_message(
                     Ok(roots) if !roots.is_empty() => {
                         let roots_content: String = roots
                             .iter()
-                            .map(|m| {
+                            .map(|t| {
                                 format!(
-                                    "[Thread #{} by user]: {}",
-                                    m.thread_id.unwrap_or(m.id),
-                                    m.content.chars().take(300).collect::<String>()
+                                    "[Thread #{} by {}]: cause message available",
+                                    t.id, t.cause,
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -811,7 +929,7 @@ async fn process_message(
 
         // Add retrieved past messages + wiki if retrieval is indicated
         if aggressiveness > 0 {
-            let user_content = &msg.content;
+            let user_content = &cause_msg.content;
             let search_terms: Vec<&str> = user_content
                 .split_whitespace()
                 .filter(|w| w.len() > 4)
@@ -822,7 +940,7 @@ async fn process_message(
                 let search_query = search_terms.join(" ");
 
                 // ILIKE text search in messages (always when retrieval is on)
-                match queries::search_messages_text(pool, &search_query, msg.channel_id, 5).await {
+                match queries::search_messages_text(pool, &search_query, thread.channel_id, 5).await {
                     Ok(matched_msgs) => {
                         if !matched_msgs.is_empty() {
                             let retrieved: String = matched_msgs
@@ -868,7 +986,7 @@ async fn process_message(
                     let emb_str = crate::vectorizer::vector_to_string(&query_embedding);
 
                     // Pgvector semantic search over messages
-                    match queries::search_messages_semantic(pool, &emb_str, msg.channel_id, 3).await {
+                    match queries::search_messages_semantic(pool, &emb_str, thread.channel_id, 3).await {
                         Ok(semantic_msgs) => {
                             if !semantic_msgs.is_empty() {
                                 let semantic: String = semantic_msgs
@@ -936,7 +1054,7 @@ async fn process_message(
                 &ctx.memory_store,
                 "",   // platform
                 &profile_name,
-                &msg.content,
+                &cause_msg.content,
                 iter,
                 max_iter,
                 last_plan.as_deref(),
@@ -962,16 +1080,16 @@ async fn process_message(
                     // Check if the LLM accepted the plan (refinement mode)
                     if content.trim() == "PLAN_ACCEPTED" {
                         info!(
-                            "[plan] Plan accepted after {} iteration(s) for message {}",
-                            iter, msg.id
+                            "[plan] Plan accepted after {} iteration(s) for thread {}",
+                            iter, thread.id
                         );
                         accepted = true;
                         break;
                     }
 
                     info!(
-                        "[plan] Generated plan for message {} ({} chars, iteration {}/{})",
-                        msg.id,
+                        "[plan] Generated plan for thread {} ({} chars, iteration {}/{})",
+                        thread.id,
                         content.len(),
                         iter + 1,
                         max_iter + 1,
@@ -979,12 +1097,10 @@ async fn process_message(
 
                     // Save the plan as a plan-type message
                     let plan_msg = MessageNew {
-                        channel_id: msg.channel_id,
+                        thread_id: thread.id,
                         role: "agent".to_string(),
                         content: content.clone(),
-                        status: MessageStatus::Completed,
-                        thread_id: Some(msg.thread_id),
-                        thread_sequence: msg.thread_sequence + 1,
+                        thread_sequence: cause_msg.thread_sequence + 1,
                         external_id: None,
                         metadata: serde_json::json!({
                             "plan_iteration": iter,
@@ -995,15 +1111,11 @@ async fn process_message(
                         is_summary: false,
                         msg_type: "plan".to_string(),
                         msg_subtype: Some("markdown".to_string()),
-                        iteration_count: current_max,
-                        iterations: current_max,
-                        profile: profile_name.clone(),
-                        provider: provider_name.clone(),
-                        model: model_name.clone(),
-                        processing_time_ms: None,
-                        token_usage: None,
                     };
-                    let _ = queries::create_message(pool, &plan_msg).await;
+                    match queries::create_message(pool, &plan_msg).await {
+                        Ok(_) => {},
+                        Err(e) => warn!("[plan] Failed to persist plan for thread {}: {:?}", thread.id, e),
+                    }
 
                     last_plan = Some(content);
 
@@ -1013,7 +1125,7 @@ async fn process_message(
                     }
                 }
                 Err(e) => {
-                    warn!("[plan] Failed to generate plan for message {}: {:?}", msg.id, e);
+                    warn!("[plan] Failed to generate plan for thread {}: {:?}", thread.id, e);
                     break;
                 }
             }
@@ -1055,26 +1167,26 @@ async fn process_message(
             plan
         )));
         info!(
-            "[plan] Injected plan as context for message {} ({} chars)",
-            msg.id,
+            "[plan] Injected plan as context for thread {} ({} chars)",
+            thread.id,
             plan.len(),
         );
     }
 
-    // Add the user message
-    messages.push(ChatMessage::user(&msg.content));
+    // Add the user message (from the cause message)
+    messages.push(ChatMessage::user(&cause_msg.content));
 
     // 5. Build tool definitions from the profile's allowed tools
     let tools_def = mcp.to_openai_tools(&prof.allowed_tools);
 
     // 6. Tool-calling loop — max iterations controls total LLM calls
-    let remaining = config.max_iterations as i32 - current_max;
+    let remaining = config.max_iterations as i32 - current_msg_count;
     let max_llm_calls = remaining.max(0).min(25) as u32; // safety cap — 25 max
     let mut final_content = String::new();
     let mut final_reasoning: Option<String> = None;
     let mut final_tool_call: bool = false;
     let mut limit_reached: bool = false;
-    let mut current_iter = current_max;
+    let mut current_iter = current_msg_count;
 
     for _turn in 0..max_llm_calls {
         current_iter += 1;  // increment before each LLM call
@@ -1147,12 +1259,10 @@ async fn process_message(
 
             // Persist the tool call as an agent message with msg_type="tool"
             let tool_call_msg = MessageNew {
-                channel_id: msg.channel_id,
+                thread_id: thread.id,
                 role: "agent".to_string(),
                 content: tool_args,
-                status: MessageStatus::Completed,
-                thread_id: Some(msg.thread_id),
-                thread_sequence: msg.thread_sequence + 1,
+                thread_sequence: cause_msg.thread_sequence + 1,
                 external_id: None,
                 metadata: serde_json::json!({}),
                 embedding: None,
@@ -1160,16 +1270,11 @@ async fn process_message(
                 is_summary: false,
                 msg_type: "tool".to_string(),
                 msg_subtype: Some(tool_name.clone()),
-                iteration_count: current_iter,
-                iterations: current_iter,
-                profile: profile_name.clone(),
-                provider: provider_name.clone(),
-                model: model_name.clone(),
-                processing_time_ms: None,
-                token_usage: None,
             };
-            if let Err(e) = queries::create_message(pool, &tool_call_msg).await {
-                error!("Failed to persist tool call '{}': {:?}", tool_name, e);
+            match persist_or_abort(pool, &tool_call_msg, thread.id).await {
+                CreateMessageResult::FkViolation => anyhow::bail!("FK violation — thread {} no longer exists", thread.id),
+                CreateMessageResult::OtherError(e) => error!("Failed to persist tool call '{}': {:?}", tool_name, e),
+                CreateMessageResult::Success => {}
             }
 
             let mcp_call = McpToolCall {
@@ -1190,12 +1295,10 @@ async fn process_message(
 
                     // Persist the tool result as an agent message with msg_type="tool_result"
                     let tool_result_msg = MessageNew {
-                        channel_id: msg.channel_id,
+                        thread_id: thread.id,
                         role: "agent".to_string(),
                         content: content.clone(),
-                        status: MessageStatus::Completed,
-                        thread_id: Some(msg.thread_id),
-                        thread_sequence: msg.thread_sequence + 1,
+                        thread_sequence: cause_msg.thread_sequence + 1,
                         external_id: None,
                         metadata: serde_json::json!({}),
                         embedding: None,
@@ -1203,16 +1306,11 @@ async fn process_message(
                         is_summary: false,
                         msg_type: "tool_result".to_string(),
                         msg_subtype: Some(tool_name.clone()),
-                        iteration_count: current_iter,
-                        iterations: current_iter,
-                        profile: profile_name.clone(),
-                        provider: provider_name.clone(),
-                        model: model_name.clone(),
-                        processing_time_ms: Some(tool_elapsed_ms),
-                        token_usage: None,
                     };
-                    if let Err(e) = queries::create_message(pool, &tool_result_msg).await {
-                        error!("Failed to persist tool result '{}': {:?}", tool_name, e);
+                    match persist_or_abort(pool, &tool_result_msg, thread.id).await {
+                        CreateMessageResult::FkViolation => anyhow::bail!("FK violation — thread {} no longer exists", thread.id),
+                        CreateMessageResult::OtherError(e) => error!("Failed to persist tool result '{}': {:?}", tool_name, e),
+                        CreateMessageResult::Success => {}
                     }
 
                     messages.push(ChatMessage::tool_result(
@@ -1226,12 +1324,10 @@ async fn process_message(
 
                     // Persist error as tool result
                     let tool_result_msg = MessageNew {
-                        channel_id: msg.channel_id,
+                        thread_id: thread.id,
                         role: "agent".to_string(),
                         content: err_msg.clone(),
-                        status: MessageStatus::Completed,
-                        thread_id: Some(msg.thread_id),
-                        thread_sequence: msg.thread_sequence + 1,
+                        thread_sequence: cause_msg.thread_sequence + 1,
                         external_id: None,
                         metadata: serde_json::json!({}),
                         embedding: None,
@@ -1239,16 +1335,11 @@ async fn process_message(
                         is_summary: false,
                         msg_type: "tool_result".to_string(),
                         msg_subtype: Some(tool_name.clone()),
-                        iteration_count: current_iter,
-                        iterations: current_iter,
-                        profile: profile_name.clone(),
-                        provider: provider_name.clone(),
-                        model: model_name.clone(),
-                        processing_time_ms: Some(tool_elapsed_ms),
-                        token_usage: None,
                     };
-                    if let Err(e2) = queries::create_message(pool, &tool_result_msg).await {
-                        error!("Failed to persist tool error '{}': {:?}", tool_name, e2);
+                    match persist_or_abort(pool, &tool_result_msg, thread.id).await {
+                        CreateMessageResult::FkViolation => anyhow::bail!("FK violation — thread {} no longer exists", thread.id),
+                        CreateMessageResult::OtherError(e2) => error!("Failed to persist tool error '{}': {:?}", tool_name, e2),
+                        CreateMessageResult::Success => {}
                     }
 
                     messages.push(ChatMessage::tool_result(
@@ -1267,7 +1358,7 @@ async fn process_message(
             "I've completed the requested operations using my available tools.".to_string();
     }
 
-    // 7. Serialize cumulative token usage to JSON for storage
+    // 7. Serialize cumulative token usage
     let token_usage_json = cumulative_usage.as_ref().map(|u| {
         serde_json::json!({
             "prompt_tokens": u.prompt_tokens,
@@ -1305,12 +1396,10 @@ async fn process_message(
     if let Some(ref reasoning_text) = final_reasoning {
         if !reasoning_text.is_empty() {
             let reasoning_msg = MessageNew {
-                channel_id: msg.channel_id,
+                thread_id: thread.id,
                 role: "agent".to_string(),
                 content: reasoning_text.clone(),
-                status: MessageStatus::Completed,
-                thread_id: Some(msg.thread_id),
-                thread_sequence: msg.thread_sequence + 1,
+                thread_sequence: cause_msg.thread_sequence + 1,
                 external_id: None,
                 metadata: serde_json::json!({
                     "context": evidence_metadata["context"],
@@ -1321,13 +1410,6 @@ async fn process_message(
                 is_summary: false,
                 msg_type: "reasoning".to_string(),
                 msg_subtype: None,
-                iteration_count: current_iter,
-                iterations: current_iter,
-                profile: profile_name.clone(),
-                provider: provider_name.clone(),
-                model: model_name.clone(),
-                processing_time_ms: None,
-                token_usage: token_usage_json.clone(),
             };
             queries::create_message(pool, &reasoning_msg).await?;
         }
@@ -1335,12 +1417,10 @@ async fn process_message(
 
     // 9. Save the main agent response
     let agent_msg = MessageNew {
-        channel_id: msg.channel_id,
+        thread_id: thread.id,
         role: "agent".to_string(),
         content: final_content,
-        status: MessageStatus::Completed,
-        thread_id: Some(msg.thread_id),
-        thread_sequence: msg.thread_sequence + 1,
+        thread_sequence: cause_msg.thread_sequence + 1,
         external_id: None,
         metadata: serde_json::json!({
             "context": evidence_metadata["context"],
@@ -1351,13 +1431,6 @@ async fn process_message(
         is_summary: false,
         msg_type: "message".to_string(),
         msg_subtype: None,
-        iteration_count: current_iter,
-        iterations: current_iter,
-        profile: profile_name.clone(),
-        provider: provider_name.clone(),
-        model: model_name.clone(),
-        processing_time_ms: None,
-        token_usage: token_usage_json.clone(),
     };
 
     let saved = queries::create_message(pool, &agent_msg).await?;
@@ -1367,9 +1440,6 @@ async fn process_message(
     // the conversation flow (user requests + agent responses), not raw tool
     // outputs. This keeps summary tokens low and avoids silent failures
     // from oversized context windows.
-    // CRITICAL: Also strip tool_calls from assistant messages, otherwise
-    // DeepSeek rejects the request with 'assistant message with tool_calls
-    // must be followed by tool messages responding to each tool_call_id'.
     let mut summary_msgs: Vec<ChatMessage> = messages
         .iter()
         .filter(|m| m.role != "tool")
@@ -1403,26 +1473,24 @@ async fn process_message(
         Ok(resp) => {
             merge_usage(&mut cumulative_usage, resp.usage);
             info!(
-                "[summary] Generated summary for message {} ({} chars, limit_reached={})",
-                msg.id,
+                "[summary] Generated summary for thread {} ({} chars, limit_reached={})",
+                thread.id,
                 resp.content.len(),
                 limit_reached,
             );
             resp.content
         }
         Err(e) => {
-            warn!("[summary] Failed to generate summary for message {}: {:?}", msg.id, e);
+            warn!("[summary] Failed to generate summary for thread {}: {:?}", thread.id, e);
             format!("Summary generation failed: {}", e)
         }
     };
 
     let summary_msg = MessageNew {
-        channel_id: msg.channel_id,
+        thread_id: thread.id,
         role: "agent".to_string(),
         content: summary_text,
-        status: MessageStatus::Completed,
-        thread_id: Some(msg.thread_id),
-        thread_sequence: msg.thread_sequence + 2, // after reasoning (1) and message (1)
+        thread_sequence: cause_msg.thread_sequence + 2, // after reasoning (1) and message (1)
         external_id: None,
         metadata: serde_json::json!({}),
         embedding: None,
@@ -1430,73 +1498,46 @@ async fn process_message(
         is_summary: true,
         msg_type: "summary".to_string(),
         msg_subtype: None,
-        iteration_count: current_iter,
-        profile: profile_name.clone(),
-        provider: provider_name.clone(),
-        model: model_name.clone(),
-        processing_time_ms: None,
-        token_usage: None,
-        iterations: current_iter,
     };
-    let _ = queries::create_message(pool, &summary_msg).await;
-    info!(
-        "[summary] Saved summary message for message {} (thread_id={})",
-        msg.id, msg.thread_id,
-    );
+    match queries::create_message(pool, &summary_msg).await {
+        Ok(_) => {
+            info!(
+                "[summary] Saved summary message for thread {}",
+                thread.id,
+            );
+        }
+        Err(e) => warn!("[summary] Failed to save summary for thread {}: {:?}", thread.id, e),
+    }
 
-    // 10. Serialize cumulative token usage and record on the original prompt
-    let token_usage_json = cumulative_usage.as_ref().map(|u| {
-        serde_json::json!({
-            "prompt_tokens": u.prompt_tokens,
-            "completion_tokens": u.completion_tokens,
-            "cached_tokens": u.cached_tokens,
-            "reasoning_tokens": u.reasoning_tokens,
-        })
-    });
-
+    // 10. Complete the thread with final token counts and duration
     let final_status = if limit_reached { "interrupted" } else { "completed" };
     let elapsed_ms = start_time.elapsed().as_millis() as i32;
-    let token_usage_val = token_usage_json.unwrap_or(serde_json::Value::Null);
-    sql_forge!(
-        r#"
-        UPDATE messages
-        SET processing_time_ms = :elapsed_ms,
-            token_usage = :token_usage,
-            status = :status::text,
-            iterations = :iterations
-        WHERE id = :msg_id AND status = 'processing'
-        "#,
-        ( :elapsed_ms = elapsed_ms, :token_usage = token_usage_val, :status = final_status, :iterations = current_iter, :msg_id = msg.id )
-    )
-    .execute(pool)
-    .await?;
+    let input_tokens = cumulative_usage.as_ref().map(|u| u.prompt_tokens as i32).unwrap_or(0);
+    let cached_tokens = cumulative_usage.as_ref().and_then(|u| u.cached_tokens.map(|c| c as i32)).unwrap_or(0);
+    let output_tokens = cumulative_usage.as_ref().map(|u| u.completion_tokens as i32).unwrap_or(0);
 
-    // 10. Trigger cross-thread summary check
-    //     This runs after every completed message to see if 2*N seq-0 threads
-    //     have accumulated since the last summary for this channel.
-    check_and_generate_summary(pool, llm, config, msg.channel_id).await;
+    queries::complete_thread(pool, thread.id, final_status, input_tokens, cached_tokens, output_tokens, elapsed_ms).await?;
+
+    // 11. Trigger cross-thread summary check
+    check_and_generate_summary(pool, llm, config, thread.channel_id).await;
 
     Ok(saved)
 }
 
-/// On startup, find any messages that are still `processing` but were created
-/// more than 5 minutes ago — mark them as `failed` to unblock the channel.
-///
-/// Returns the number of recovered messages.
-/// On startup, skip all messages left in pending or processing state.
-/// Called from main.rs BEFORE spawning any concurrent tasks.
+/// On startup, find any threads that are still `processing` and mark them as `failed`.
+/// Also skip all pending/processing threads.
+/// Returns the number of recovered threads.
 pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
-    // Debug: check specific message 122
+    // Debug: check specific message 122 still works (for backward compat)
     #[derive(Debug, FromRow)]
     struct MsgRow {
         id: i64,
-        status: String,
         msg_type: String,
     }
 
     let specific: Result<MsgRow, _> = sql_forge!(
         MsgRow,
-        "SELECT id, status, msg_type FROM messages WHERE id = :msg_id",
+        "SELECT id, msg_type FROM messages WHERE id = :msg_id",
         ( :msg_id = 122i64 )
     )
     .fetch_one(pool)
@@ -1505,8 +1546,8 @@ pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
     match &specific {
         Ok(row) => {
             info!(
-                "[startup] DEBUG message {}: status={}, type={}",
-                row.id, row.status, row.msg_type
+                "[startup] DEBUG message {}: type={}",
+                row.id, row.msg_type
             );
         }
         Err(e) => {
@@ -1514,19 +1555,18 @@ pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
         }
     }
 
-    // Debug: list ALL pending/processing messages before skipping
+    // Debug: list ALL pending/processing threads before skipping
     #[derive(Debug, FromRow)]
-    struct PendingRow {
+    struct PendingThreadRow {
         id: i64,
         status: String,
-        msg_type: String,
     }
 
-    let affected: Vec<PendingRow> = sql_forge!(
-        PendingRow,
+    let affected: Vec<PendingThreadRow> = sql_forge!(
+        PendingThreadRow,
         r#"
-        SELECT id, status, msg_type
-        FROM messages
+        SELECT id, status
+        FROM threads
         WHERE 1 = :_one
           AND status IN ('pending', 'processing')
         ORDER BY id
@@ -1537,23 +1577,24 @@ pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
     .await?;
 
     if affected.is_empty() {
-        info!("[startup] No pending/processing messages to skip");
+        info!("[startup] No pending/processing threads to skip");
         return Ok(0);
     }
 
     for row in &affected {
         info!(
-            "[startup] Will skip message {} (status={}, type={})",
-            row.id, row.status, row.msg_type
+            "[startup] Will skip thread {} (status={})",
+            row.id, row.status
         );
     }
 
-    let count = queries::skip_all_pending_processing(pool).await?;
+    let count = queries::skip_all_pending_threads(pool).await?;
     if count > 0 {
         info!(
-            "[startup] Skipped {} pending/processing messages on startup",
+            "[startup] Skipped {} pending/processing threads on startup",
             count
         );
     }
+
     Ok(count)
 }

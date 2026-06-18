@@ -59,9 +59,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Determine data directory (default: /opt/data)
+    let data_dir = std::env::var("OMNI_DATA_DIR").unwrap_or_else(|_| "/opt/data".to_string());
+
     match cli.command.unwrap_or(Command::Server) {
         Command::Server => run_server().await,
-        Command::Cli { channel, profile, model, provider } => run_cli(channel, profile, model, provider).await,
+        Command::Cli { channel, profile, model, provider } => run_cli(channel, profile, model, provider, &data_dir).await,
     }
 }
 
@@ -199,12 +202,13 @@ async fn run_server() -> Result<()> {
 
     // Spawn vectorization workers if enabled
     let pool_vectorizer = pool.clone();
+    let data_dir_for_vectorizer = data_dir.clone();
     let vectorizer_handle = tokio::spawn(async move {
-        vectorizer::spawn_vectorizers(pool_vectorizer, &cfg, &data_dir).await;
+        vectorizer::spawn_vectorizers(pool_vectorizer, &cfg, &data_dir_for_vectorizer).await;
     });
 
     // Spawn cron scheduler
-    let cron_handle = scheduler::spawn(pool.clone());
+    let cron_handle = scheduler::spawn(pool.clone(), data_dir.clone());
 
     // Graceful shutdown
     tokio::select! {
@@ -240,7 +244,7 @@ use std::io::{self, BufRead, Write};
 /// Run the interactive CLI client.
 /// Connects to Postgres, creates/finds a CLI channel, reads stdin, sends
 /// messages as pending, polls for agent responses, and prints them.
-async fn run_cli(channel_name: String, profile_name: String, model: Option<String>, provider: Option<String>) -> Result<()> {
+async fn run_cli(channel_name: String, profile_name: String, model: Option<String>, provider: Option<String>, data_dir: &str) -> Result<()> {
     let database_url = std::env::var("DATABASE_URL")?;
     let pool = db::connect(&database_url).await?;
 
@@ -248,13 +252,28 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
     let channel = ensure_cli_channel(&pool, &channel_name, &profile_name, model.as_deref(), provider.as_deref()).await?;
     let channel_id = channel.id;
 
+    // Resolve provider+model for stamping on all seq-0 messages in this session
+    // Order: channel.current_provider → profile provider → env → default
+    let profile_registry_cfg = crate::profile::ProfileRegistry::new(data_dir);
+    let cli_prof = profile_registry_cfg.get(&profile_name).cloned().unwrap_or_else(|| {
+        crate::profile::Profile::default("default")
+    });
+    let resolved_provider: String = channel.current_provider.clone()
+        .or_else(|| cli_prof.provider.clone())
+        .or_else(|| Some(std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "opencode-go".to_string())))
+        .unwrap_or_else(|| "opencode-go".to_string());
+    let resolved_model: String = channel.current_model.clone()
+        .or_else(|| cli_prof.model.clone())
+        .or_else(|| Some(std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())))
+        .unwrap_or_else(|| "deepseek-v4-flash".to_string());
+
     println!("\n┌─────────────────────────────────────────────────────────┐");
     println!("│  OmniAgent CLI — channel: {}, profile: {}  │", channel.name, channel.current_profile);
     println!("│  Type your messages. /exit to quit. /new for new thread  │");
     println!("└─────────────────────────────────────────────────────────┘\n");
 
     // Get or create the current thread
-    let mut thread_id = get_or_create_thread(&pool, channel_id).await?;
+    let mut thread_id = get_or_create_thread(&pool, channel_id, &profile_name, &resolved_provider, &resolved_model).await?;
     let mut next_sequence = get_next_sequence(&pool, channel_id, thread_id).await?;
 
     let stdin = io::stdin();
@@ -283,12 +302,19 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
             }
             "/new" => {
                 // Start a new thread
-                let root_msg = models::MessageNew {
+                let thread = db::types::create_thread(
+                    &pool,
+                    "user",
                     channel_id,
-                    role: "user".to_string(),
+                    &profile_name,
+                    Some(&resolved_provider),
+                    Some(&resolved_model),
+                ).await?;
+
+                let root_msg = models::MessageNew {
+                    thread_id: thread.id,
+                    role: "cause".to_string(),
                     content: "/new".to_string(),
-                    status: models::MessageStatus::Completed,
-                    thread_id: None,
                     thread_sequence: 0,
                     external_id: None,
                     metadata: serde_json::json!({"cli_new_thread": true}),
@@ -297,15 +323,10 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
                     is_summary: false,
                     msg_type: "message".to_string(),
                     msg_subtype: None,
-                    iteration_count: 0,
-                    profile: profile_name.clone(),
-                    provider: channel.current_provider.clone(),
-                    model: channel.current_model.clone(),
-                    processing_time_ms: None,
-                    token_usage: None,
-                    iterations: 0,
                 };
-                let saved = db::types::init_thread_root(&pool, &root_msg).await?;
+                let saved = db::types::create_message(&pool, &root_msg).await?;
+                // Set thread pending so the executor can process it
+                let _ = db::types::set_thread_pending(&pool, thread.id).await;
                 thread_id = saved.thread_id;
                 next_sequence = 1;
                 println!("┌─ New conversation thread #{} ────────────────────────┐", thread_id);
@@ -314,14 +335,22 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
             _ => {}
         }
 
-        // Insert user message as pending
-        let msg = models::MessageNew {
+        // Insert user message as pending (it will be picked up by the executor)
+        // For the CLI, we create a new thread for each user message
+        let thread = db::types::create_thread(
+            &pool,
+            "user",
             channel_id,
-            role: "user".to_string(),
+            &profile_name,
+            Some(&resolved_provider),
+            Some(&resolved_model),
+        ).await?;
+
+        let msg = models::MessageNew {
+            thread_id: thread.id,
+            role: "cause".to_string(),
             content: input.clone(),
-            status: models::MessageStatus::Pending,
-            thread_id: Some(thread_id),
-            thread_sequence: next_sequence,
+            thread_sequence: 0,
             external_id: None,
             metadata: serde_json::json!({}),
             embedding: None,
@@ -329,16 +358,11 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
             is_summary: false,
             msg_type: "message".to_string(),
             msg_subtype: None,
-            iteration_count: 0,
-            profile: profile_name.clone(),
-            provider: channel.current_provider.clone(),
-            model: channel.current_model.clone(),
-            processing_time_ms: None,
-            token_usage: None,
-            iterations: 0,
         };
         db::types::create_message(&pool, &msg).await?;
-        let _user_msg_id = next_sequence;
+        // Set thread pending so executor picks it up
+        let _ = db::types::set_thread_pending(&pool, thread.id).await;
+        let _user_msg_id = 0;
 
         // Poll for agent responses
         poll_for_response(&pool, channel_id, thread_id, _user_msg_id).await?;
@@ -368,6 +392,8 @@ async fn ensure_cli_channel(
         SELECT
             id, name, platform, external_id, cause,
             current_profile, current_model, current_provider,
+            readonly,
+            COALESCE(closed, false) as "closed",
             '{}'::text AS "metadata",
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
             COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
@@ -408,6 +434,8 @@ async fn ensure_cli_channel(
             current_profile: profile_name.to_string(),
             current_model: model.map(|m| m.to_string()),
             current_provider: provider.map(|p| p.to_string()),
+            readonly: false,
+            closed: false,
             metadata: serde_json::json!({}),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -440,6 +468,8 @@ async fn ensure_cli_channel(
         current_profile: profile_name.to_string(),
         current_model: model.map(|m| m.to_string()),
         current_provider: provider.map(|p| p.to_string()),
+        readonly: false,
+        closed: false,
         metadata: serde_json::json!({}),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -447,8 +477,9 @@ async fn ensure_cli_channel(
 }
 
 /// Get or create a thread for the CLI session.
-async fn get_or_create_thread(pool: &PgPool, channel_id: i64) -> Result<i64> {
+async fn get_or_create_thread(pool: &PgPool, channel_id: i64, profile_name: &str, resolved_provider: &str, resolved_model: &str) -> Result<i64> {
     use sql_forge::sql_forge;
+    use crate::db::types as queries;
 
     // Find the latest completed thread for this channel
     #[derive(Debug, sqlx::FromRow)]
@@ -461,11 +492,12 @@ async fn get_or_create_thread(pool: &PgPool, channel_id: i64) -> Result<i64> {
     let latest: Option<LastThread> = sql_forge!(
         LastThread,
         r#"
-        SELECT thread_id, id FROM messages
-        WHERE channel_id = :channel_id
-          AND thread_sequence = 0
-          AND status = 'completed'
-        ORDER BY id DESC
+        SELECT m.thread_id, m.id FROM messages m
+        JOIN threads t ON t.id = m.thread_id
+        WHERE t.channel_id = :channel_id
+          AND m.thread_sequence = 0
+          AND t.status = 'completed'
+        ORDER BY m.id DESC
         LIMIT 1
         "#,
         ( :channel_id = channel_id )
@@ -479,13 +511,20 @@ async fn get_or_create_thread(pool: &PgPool, channel_id: i64) -> Result<i64> {
         }
     }
 
-    // Create a new thread by inserting a seq-0 message
-    let root_msg = models::MessageNew {
+    // Create a new thread
+    let thread = queries::create_thread(
+        pool,
+        "user",
         channel_id,
-        role: "user".to_string(),
+        profile_name,
+        Some(resolved_provider),
+        Some(resolved_model),
+    ).await?;
+
+    let root_msg = models::MessageNew {
+        thread_id: thread.id,
+        role: "cause".to_string(),
         content: "/start".to_string(),
-        status: models::MessageStatus::Completed,
-        thread_id: None,
         thread_sequence: 0,
         external_id: None,
         metadata: serde_json::json!({"cli_start": true}),
@@ -494,15 +533,8 @@ async fn get_or_create_thread(pool: &PgPool, channel_id: i64) -> Result<i64> {
         is_summary: false,
         msg_type: "message".to_string(),
         msg_subtype: None,
-        iteration_count: 0,
-        profile: "default".to_string(),
-        provider: None,
-        model: None,
-        processing_time_ms: None,
-        token_usage: None,
-        iterations: 0,
     };
-    let saved = db::types::init_thread_root(pool, &root_msg).await?;
+    let saved = queries::create_message(pool, &root_msg).await?;
     Ok(saved.thread_id)
 }
 
@@ -517,7 +549,7 @@ async fn get_next_sequence(pool: &PgPool, channel_id: i64, thread_id: i64) -> Re
 
     let row: MaxSeq = sql_forge!(
         MaxSeq,
-        "SELECT MAX(thread_sequence) AS \"max_seq\" FROM messages WHERE channel_id = :channel_id AND thread_id = :thread_id",
+        "SELECT MAX(m.thread_sequence) AS \"max_seq\" FROM messages m JOIN threads t ON t.id = m.thread_id WHERE t.channel_id = :channel_id AND m.thread_id = :thread_id",
         ( :channel_id = channel_id, :thread_id = thread_id )
     )
     .fetch_one(pool)
@@ -567,12 +599,13 @@ async fn poll_for_response(
         let responses: Vec<ResponseMsg> = sql_forge!(
             ResponseMsg,
             r#"
-            SELECT id, role, content, msg_type, msg_subtype, thread_sequence
-            FROM messages
-            WHERE channel_id = :channel_id
-              AND thread_id = :thread_id
-              AND thread_sequence > :after_sequence
-            ORDER BY thread_sequence ASC
+            SELECT m.id, m.role, m.content, m.msg_type, m.msg_subtype, m.thread_sequence
+            FROM messages m
+            JOIN threads t ON t.id = m.thread_id
+            WHERE t.channel_id = :channel_id
+              AND m.thread_id = :thread_id
+              AND m.thread_sequence > :after_sequence
+            ORDER BY m.thread_sequence ASC
             "#,
             ( :channel_id = channel_id, :thread_id = thread_id, :after_sequence = seen_up_to )
         )

@@ -5,13 +5,15 @@
 - [ ] Create a `ContextBuilder` pipeline before each LLM call in `agent::process_message`.
 - [ ] Assemble prompt context from ordered blocks:
   - [ ] System/profile instructions
-  - [ ] `MEMORY.md` (always include, hard cap <= 5000 chars)
+  - [ ] `MEMORY.md` (always include, size-capped by user config; default < 5000 chars)
   - [ ] Recent thread messages (recency window)
   - [ ] Last user messages (pinned)
   - [ ] Retrieved past messages (relevance-ranked)
   - [ ] Retrieved wiki snippets (relevance-ranked)
   - [ ] Allowed tool definitions only
 - [ ] Add token budgeting per block (reserve output tokens, trim lowest-priority blocks first).
+  - [ ] Never trim: System/profile instructions
+  - [ ] Never trim: `MEMORY.md`
 - [ ] Persist context assembly metadata in `messages.metadata` (selected message IDs, wiki files, token counts).
 
 ## 2) Retrieval Strategy (Past Messages + Wiki)
@@ -19,6 +21,11 @@
 - [ ] Implement hybrid retrieval for historical context:
   - [ ] Semantic retrieval (pgvector / embeddings)
   - [ ] Keyword fallback (ILIKE / lexical)
+- [ ] Reflect project defaults in retrieval sources:
+  - [ ] postgres messages (objective facts, focus on recent conversations)
+  - [ ] pgvector over messages (subjective/semantic facts over objective message facts)
+  - [ ] wiki (long-term objective facts)
+  - [ ] qdrant over wiki (vectorized wikis)
 - [ ] Add re-ranking step favoring:
   - [ ] Recency
   - [ ] Same thread/channel
@@ -51,7 +58,8 @@
   - [ ] Store provenance (source message IDs / tool outputs)
   - [ ] Store confidence and `last_verified_at`
 - [ ] Add review/expiry workflow for long-term memory entries.
-- [ ] Keep `MEMORY.md` user-authored and always-included (size-capped).
+- [ ] Keep `MEMORY.md` user-authored and always-included (size-capped by user config).
+- [ ] Evaluate adding an episodic/hindsight memory layer for relationship-over-time summaries with provenance and confidence.
 
 ## 5) “Remember to Retrieve” Behavior
 
@@ -121,4 +129,3 @@
   - [ ] Memory promotion criteria
   - [ ] MCP extension model (built-in vs external)
 - [ ] Add operator runbook for tuning retrieval and grounding settings.
-

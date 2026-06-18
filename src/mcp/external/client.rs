@@ -351,9 +351,15 @@ impl McpServerClient for StdioMcpClient {
             );
         }
 
-        // Step 2: Send initialized notification
+        // Step 2: Send initialized notification (no response expected)
         let notif = build_initialized_notification();
-        Self::send_request_locked(child, &notif, server_name)?;
+        let stdin = child.stdin.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Failed to open stdin for MCP server"))?;
+        stdin.write_all(notif.as_bytes())
+            .with_context(|| format!("Failed to write notification to MCP server '{}' stdin", server_name))?;
+        stdin.write_all(b"\n")
+            .context("Failed to write newline to MCP server stdin")?;
+        stdin.flush()?;
 
         // Step 3: List tools
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);

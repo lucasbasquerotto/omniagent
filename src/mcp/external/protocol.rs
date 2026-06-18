@@ -84,6 +84,7 @@ pub struct Implementation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(dead_code)]
 pub struct InitializeResult {
     #[serde(rename = "protocolVersion")]
     pub protocol_version: String,

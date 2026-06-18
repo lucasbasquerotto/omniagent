@@ -35,10 +35,11 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgres://omniagent:omniagent@postgres:5432/omniagent
+      DATABASE_URL: postgres://omniagent:***@postgres:5432/omniagent
       QDRANT_URL: http://qdrant:6333
       HOST: 0.0.0.0
       PORT: 8080
+      WORKSPACE_DIR: /opt/workspace
     volumes:
       - ./:/app
       - cargo-registry:/usr/local/cargo/registry

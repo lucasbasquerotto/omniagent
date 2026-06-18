@@ -6,6 +6,7 @@
 use crate::mcp::{AppContext, McpTool, McpToolResult};
 use anyhow::Result;
 use serde_json::Value;
+use sql_forge::sql_forge;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -30,32 +31,32 @@ struct TokenAggRow {
 async fn aggregate_metrics(
     pool: &PgPool,
     hours: i64,
-    profile_filter: Option<&str>,
+    profile_filter: &str,
 ) -> Result<Vec<TokenAggRow>> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
 
-    let rows: Vec<TokenAggRow> = sqlx::query_as(
+    let rows: Vec<TokenAggRow> = sql_forge!(
+        TokenAggRow,
         r#"
         SELECT
             profile,
             provider,
             model,
-            SUM(COALESCE((token_usage->>'prompt_tokens')::bigint, 0)) AS total_prompt_tokens,
-            SUM(COALESCE((token_usage->>'completion_tokens')::bigint, 0)) AS total_completion_tokens,
-            SUM(COALESCE(processing_time_ms, 0)::bigint) AS total_processing_ms,
-            COUNT(*) AS message_count,
-            AVG(COALESCE(processing_time_ms, 0)::float) AS avg_processing_ms
+            SUM(COALESCE((token_usage->>'prompt_tokens')::bigint, 0))::bigint AS total_prompt_tokens,
+            SUM(COALESCE((token_usage->>'completion_tokens')::bigint, 0))::bigint AS total_completion_tokens,
+            SUM(COALESCE(processing_time_ms, 0)::bigint)::bigint AS total_processing_ms,
+            COUNT(*)::bigint AS message_count,
+            AVG(COALESCE(processing_time_ms, 0)::float)::float AS avg_processing_ms
         FROM messages
         WHERE role = 'agent'
           AND msg_type = 'message'
-          AND created_at >= $1
-          AND ($2::text IS NULL OR profile = $2)
+          AND created_at >= :cutoff
+          AND (:profile_filter = '' OR profile = :profile_filter)
         GROUP BY profile, provider, model
         ORDER BY total_processing_ms DESC
         "#,
+        ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
-    .bind(cutoff)
-    .bind(profile_filter)
     .fetch_all(pool)
     .await?;
 
@@ -66,40 +67,40 @@ async fn aggregate_metrics(
 async fn count_grounded_responses(
     pool: &PgPool,
     hours: i64,
-    profile_filter: Option<&str>,
+    profile_filter: &str,
 ) -> Result<(i64, i64)> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
 
-    let total: Option<i64> = sqlx::query_scalar(
+    let total: Option<i64> = sql_forge!(
+        scalar Option<i64>,
         r#"
         SELECT COUNT(*)::bigint
         FROM messages
         WHERE role = 'agent'
           AND msg_type = 'message'
-          AND created_at >= $1
-          AND ($2::text IS NULL OR profile = $2)
+          AND created_at >= :cutoff
+          AND (:profile_filter = '' OR profile = :profile_filter)
         "#,
+        ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
-    .bind(cutoff)
-    .bind(profile_filter)
     .fetch_one(pool)
     .await
     .ok()
     .flatten();
 
-    let grounded: Option<i64> = sqlx::query_scalar(
+    let grounded: Option<i64> = sql_forge!(
+        scalar Option<i64>,
         r#"
         SELECT COUNT(*)::bigint
         FROM messages
         WHERE role = 'agent'
           AND msg_type = 'message'
-          AND created_at >= $1
+          AND created_at >= :cutoff
           AND (metadata->'context'->>'total_chars') IS NOT NULL
-          AND ($2::text IS NULL OR profile = $2)
+          AND (:profile_filter = '' OR profile = :profile_filter)
         "#,
+        ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
-    .bind(cutoff)
-    .bind(profile_filter)
     .fetch_one(pool)
     .await
     .ok()
@@ -112,23 +113,23 @@ async fn count_grounded_responses(
 async fn count_retrieval_events(
     pool: &PgPool,
     hours: i64,
-    profile_filter: Option<&str>,
+    profile_filter: &str,
 ) -> Result<i64> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
 
-    let count: Option<i64> = sqlx::query_scalar(
+    let count: Option<i64> = sql_forge!(
+        scalar Option<i64>,
         r#"
         SELECT COUNT(*)::bigint
         FROM messages
         WHERE role = 'agent'
           AND msg_type = 'tool_call'
           AND msg_subtype IN ('search_messages', 'search_wiki')
-          AND created_at >= $1
-          AND ($2::text IS NULL OR profile = $2)
+          AND created_at >= :cutoff
+          AND (:profile_filter = '' OR profile = :profile_filter)
         "#,
+        ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
-    .bind(cutoff)
-    .bind(profile_filter)
     .fetch_one(pool)
     .await
     .ok()
@@ -141,20 +142,21 @@ async fn count_retrieval_events(
 async fn count_corrections(
     pool: &PgPool,
     hours: i64,
-    profile_filter: Option<&str>,
+    profile_filter: &str,
 ) -> Result<i64> {
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
 
     // Look for user messages containing correction keywords after an agent message
-    let count: Option<i64> = sqlx::query_scalar(
+    let count: Option<i64> = sql_forge!(
+        scalar Option<i64>,
         r#"
         WITH agent_responses AS (
             SELECT id, channel_id, thread_id, created_at
             FROM messages
             WHERE role = 'agent'
               AND msg_type = 'message'
-              AND created_at >= $1
-              AND ($2::text IS NULL OR profile = $2)
+              AND created_at >= :cutoff
+              AND (:profile_filter = '' OR profile = :profile_filter)
         )
         SELECT COUNT(DISTINCT m.id)::bigint
         FROM messages m
@@ -174,9 +176,8 @@ async fn count_corrections(
               OR LOWER(m.content) LIKE '%try again%'
           )
         "#,
+        ( :cutoff = cutoff, :profile_filter = profile_filter )
     )
-    .bind(cutoff)
-    .bind(profile_filter)
     .fetch_one(pool)
     .await
     .ok()
@@ -214,18 +215,19 @@ pub fn get_metrics_tool() -> McpTool {
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
             let hours = args.get("hours").and_then(|v| v.as_i64()).unwrap_or(24);
             let profile = args.get("profile").and_then(|v| v.as_str());
+            let profile_owned = profile.map(|s| s.to_string()).unwrap_or_default();
 
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| anyhow::anyhow!("Failed to create runtime: {}", e))?;
 
             let metrics = rt.block_on(async {
-                let usage = aggregate_metrics(&ctx.pool, hours, profile).await?;
+                let usage = aggregate_metrics(&ctx.pool, hours, &profile_owned).await?;
                 let (total_responses, grounded_responses) =
-                    count_grounded_responses(&ctx.pool, hours, profile).await?;
+                    count_grounded_responses(&ctx.pool, hours, &profile_owned).await?;
                 let retrieval_count =
-                    count_retrieval_events(&ctx.pool, hours, profile).await?;
+                    count_retrieval_events(&ctx.pool, hours, &profile_owned).await?;
                 let correction_count =
-                    count_corrections(&ctx.pool, hours, profile).await?;
+                    count_corrections(&ctx.pool, hours, &profile_owned).await?;
 
                 Ok::<_, anyhow::Error>((usage, total_responses, grounded_responses, retrieval_count, correction_count))
             })?;

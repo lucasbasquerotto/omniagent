@@ -1,8 +1,16 @@
 use crate::mcp::{truncate_content, AppContext, McpTool, McpToolResult, DEFAULT_MAX_TOOL_OUTPUT_CHARS};
 use anyhow::Result;
 use serde_json::Value;
-
+use sql_forge::sql_forge;
+use sqlx::FromRow;
 use std::sync::Arc;
+
+#[derive(Debug, FromRow)]
+struct SearchResult {
+    id: i64,
+    role: String,
+    content: String,
+}
 
 pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
     let pool = ctx.pool.clone();
@@ -39,27 +47,36 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
             let channel_id = args["channel_id"].as_i64();
 
             let pool = pool.clone();
+            let query_owned = query.to_string();
 
-            // Use block_in_place + Handle::current() to run async sqlx from sync handler.
-            // The async block returns sqlx::Error; converted to anyhow::Error via map_err.
-            let results: Vec<(i64, String, String)> = tokio::task::block_in_place(|| {
+            let results: Vec<SearchResult> = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     if let Some(cid) = channel_id {
-                        sqlx::query_as::<_, (i64, String, String)>(
-                            "SELECT id, role, content FROM messages WHERE channel_id = $1 AND content ILIKE '%' || $2 || '%' ORDER BY created_at DESC LIMIT $3",
+                        sql_forge!(
+                            SearchResult,
+                            r#"
+                            SELECT id, role, content FROM messages
+                            WHERE channel_id = :channel_id
+                              AND content ILIKE '%' || :query || '%'
+                            ORDER BY created_at DESC
+                            LIMIT :limit
+                            "#,
+                            ( :channel_id = cid, :query = &query_owned, :limit = limit )
                         )
-                        .bind(cid)
-                        .bind(query)
-                        .bind(limit)
                         .fetch_all(&pool)
                         .await
                     } else {
-                        sqlx::query_as::<_, (i64, String, String)>(
-                            "SELECT id, role, content FROM messages WHERE content ILIKE '%' || $1 || '%' ORDER BY created_at DESC LIMIT $2",
+                        sql_forge!(
+                            SearchResult,
+                            r#"
+                            SELECT id, role, content FROM messages
+                            WHERE content ILIKE '%' || :query || '%'
+                            ORDER BY created_at DESC
+                            LIMIT :limit
+                            "#,
+                            ( :query = &query_owned, :limit = limit )
                         )
-                        .bind(query)
-                        .bind(limit)
                         .fetch_all(&pool)
                         .await
                     }
@@ -76,19 +93,18 @@ pub fn search_messages_tool(ctx: &AppContext) -> McpTool {
             }
 
             let mut lines = Vec::new();
-            for (id, role, content) in &results {
-                // Safe UTF-8 slicing: find the char boundary closest to 200
-                let preview = if content.len() > 200 {
-                    let truncate_to = content
+            for r in &results {
+                let preview = if r.content.len() > 200 {
+                    let truncate_to = r.content
                         .char_indices()
                         .nth(200)
                         .map(|(i, _)| i)
-                        .unwrap_or(content.len());
-                    format!("{}...", &content[..truncate_to])
+                        .unwrap_or(r.content.len());
+                    format!("{}...", &r.content[..truncate_to])
                 } else {
-                    content.clone()
+                    r.content.clone()
                 };
-                lines.push(format!("#{} [{}]: {}", id, role, preview));
+                lines.push(format!("#{} [{}]: {}", r.id, r.role, preview));
             }
 
             let output = format!("Found {} result(s):\n{}", results.len(), lines.join("\n\n"));

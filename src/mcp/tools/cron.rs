@@ -2,7 +2,21 @@ use crate::mcp::{truncate_content, AppContext, McpTool, McpToolResult, DEFAULT_M
 use anyhow::Result;
 use serde_json::Value;
 use sql_forge::sql_forge;
+use sqlx::FromRow;
 use std::sync::Arc;
+use chrono::{DateTime, Utc};
+
+#[derive(Debug, FromRow)]
+struct CronJobListRow {
+    id: String,
+    name: Option<String>,
+    schedule: String,
+    prompt: Option<String>,
+    enabled: Option<bool>,
+    last_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<DateTime<Utc>>,
+    created_at: Option<DateTime<Utc>>,
+}
 
 pub fn create_cron_job_tool() -> McpTool {
     McpTool {
@@ -127,11 +141,18 @@ pub fn list_cron_jobs_tool() -> McpTool {
         handler: Arc::new(|_: Value, ctx: AppContext| -> Result<McpToolResult> {
             let pool = ctx.pool.clone();
 
-            let rows = tokio::task::block_in_place(|| {
+            let rows: Vec<CronJobListRow> = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
-                    sqlx::query_as::<_, (String, String, String, String, bool, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)>(
-                        "SELECT id, name, schedule, prompt, enabled, last_run_at, next_run_at, created_at FROM cron_jobs ORDER BY created_at DESC",
+                    sql_forge!(
+                        CronJobListRow,
+                        r#"
+                        SELECT id, name, schedule, prompt, enabled, last_run_at, next_run_at, created_at
+                        FROM cron_jobs
+                        WHERE 1 = :_one
+                        ORDER BY created_at DESC
+                        "#,
+                        ( :_one = 1i32 )
                     )
                     .fetch_all(&pool)
                     .await
@@ -141,33 +162,22 @@ pub fn list_cron_jobs_tool() -> McpTool {
 
             let jobs: Vec<serde_json::Value> = rows
                 .into_iter()
-                .map(
-                    |(
-                        id,
-                        name,
-                        schedule,
-                        prompt,
-                        enabled,
-                        last_run_at,
-                        next_run_at,
-                        created_at,
-                    )| {
-                        serde_json::json!({
-                            "id": id,
-                            "name": name,
-                            "schedule": schedule,
-                            "prompt_preview": if prompt.len() > 100 {
-                                format!("{}...", &prompt[..100])
-                            } else {
-                                prompt.clone()
-                            },
-                            "enabled": enabled,
-                            "last_run_at": last_run_at,
-                            "next_run_at": next_run_at,
-                            "created_at": created_at.to_rfc3339(),
-                        })
-                    },
-                )
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "name": r.name,
+                        "schedule": r.schedule,
+                        "prompt_preview": r.prompt.as_ref().map(|p| if p.len() > 100 {
+                            format!("{}...", &p[..100])
+                        } else {
+                            p.clone()
+                        }),
+                        "enabled": r.enabled.unwrap_or(false),
+                        "last_run_at": r.last_run_at,
+                        "next_run_at": r.next_run_at,
+                        "created_at": r.created_at.map(|t| t.to_rfc3339()),
+                    })
+                })
                 .collect();
 
             let output = serde_json::to_string_pretty(&serde_json::json!({ "jobs": jobs }))?;
@@ -183,31 +193,34 @@ pub fn list_cron_jobs_tool() -> McpTool {
 pub fn delete_cron_job_tool() -> McpTool {
     McpTool {
         name: "delete_cron_job".to_string(),
-        description: "Delete a cron job by its ID.".to_string(),
+        description: "Delete a cron job by its name. The 'name' parameter is the short unique job name (not the id or display name)."
+            .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "id": {
+                "name": {
                     "type": "string",
-                    "description": "Cron job ID to delete"
+                    "description": "The short unique name of the cron job to delete (e.g., 'hourly-message-count')"
                 }
             },
-            "required": ["id"]
+            "required": ["name"]
         }),
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
-            let id = args["id"]
+            let name = args["name"]
                 .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'id'"))?;
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'name'"))?;
 
             let pool = ctx.pool.clone();
-            let id_clone = id.to_string();
+            let name_owned = name.to_string();
 
             let deleted = tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     sql_forge!(
-                        "DELETE FROM cron_jobs WHERE id = :id",
-                        ( :id = &id_clone )
+                        r#"
+                        DELETE FROM cron_jobs WHERE name = :name
+                        "#,
+                        ( :name = &name_owned )
                     )
                     .execute(&pool)
                     .await
@@ -216,12 +229,12 @@ pub fn delete_cron_job_tool() -> McpTool {
             })?;
 
             if deleted.rows_affected() == 0 {
-                anyhow::bail!("Cron job '{}' not found", id);
+                anyhow::bail!("Cron job '{}' not found", name);
             }
 
             Ok(McpToolResult {
                 call_id: String::new(),
-                content: format!("Cron job '{}' deleted successfully", id),
+                content: format!("Cron job '{}' deleted successfully", name),
                 is_error: false,
             })
         }),

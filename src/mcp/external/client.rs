@@ -30,6 +30,7 @@ pub enum CircuitState {
     /// Too many failures — requests are blocked.
     Open,
     /// Healing period — one test request is allowed.
+    #[expect(dead_code)]
     HalfOpen,
 }
 
@@ -85,6 +86,7 @@ impl CircuitBreaker {
     }
 
     /// Get the current state (for diagnostics).
+    #[allow(dead_code)]
     pub fn state(&self) -> CircuitState {
         self.state.lock().unwrap().state.clone()
     }
@@ -96,6 +98,7 @@ impl CircuitBreaker {
 
 /// Health status of an external MCP server.
 #[derive(Debug, Clone)]
+#[expect(dead_code)]
 pub struct ServerHealth {
     pub connected: bool,
     pub tool_count: usize,
@@ -118,6 +121,7 @@ pub trait McpServerClient: Send + Sync {
     /// Get the server's display name.
     fn name(&self) -> &str;
     /// Check server health.
+    #[expect(dead_code)]
     fn health(&self) -> ServerHealth;
     /// Convert external tools to McpTool instances with a circuit-breaking wrapper.
     fn to_mcp_tools(&mut self) -> Vec<McpTool> {
@@ -237,8 +241,10 @@ pub struct StdioMcpClient {
     process: StdMutex<Option<Child>>,
     next_id: AtomicU64,
     tools: StdMutex<Vec<McpExternalTool>>,
+    #[allow(dead_code)]
     circuit: CircuitBreaker,
     connected: StdMutex<bool>,
+    #[allow(dead_code)]
     last_error: StdMutex<Option<String>>,
 }
 
@@ -456,8 +462,10 @@ pub struct HttpMcpClient {
     client: reqwest::blocking::Client,
     next_id: AtomicU64,
     tools: Vec<McpExternalTool>,
+    #[allow(dead_code)]
     circuit: CircuitBreaker,
     connected: bool,
+    #[allow(dead_code)]
     last_error: Option<String>,
 }
 

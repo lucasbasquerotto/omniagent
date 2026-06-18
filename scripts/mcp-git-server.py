@@ -149,7 +149,24 @@ def run_git(cmd_args, cwd=None, env=None, timeout=60):
         return "", str(e), -1
 
 
-# ── Tool Implementations ────────────────────────────────────────────────
+# ── Cached Token ───────────────────────────────────────────────────────────
+
+_cached_token = None
+_cached_token_expiry = 0
+
+
+def get_token(app_id, inst_id):
+    """Get a cached GitHub installation token, or generate a new one if expired."""
+    global _cached_token, _cached_token_expiry
+    now = time.time()
+    if _cached_token and now < _cached_token_expiry - 60:  # 1 min buffer
+        return _cached_token
+    
+    token = get_installation_token(app_id, inst_id)
+    if token:
+        _cached_token = token
+        _cached_token_expiry = now + 570  # tokens last 1 hour, refresh at 9.5 min
+    return token
 
 
 def tool_create_github_repo(args):
@@ -165,7 +182,7 @@ def tool_create_github_repo(args):
     if not app_id or not inst_id:
         return error_result("GitHub App credentials not configured")
     
-    token = get_installation_token(app_id, inst_id)
+    token = get_token(app_id, inst_id)
     if not token:
         return error_result("Failed to obtain GitHub token")
     
@@ -292,44 +309,48 @@ def tool_commit_and_push(args):
     
     # Push — use GitHub App token for auth
     app_id, inst_id = load_env_vars()
-    push_note = "committed locally"
     
-    if app_id and inst_id:
-        token = get_installation_token(app_id, inst_id)
-        if token:
-            # Get current remote URL
-            stdout, _, _ = run_git(["git", "remote", "get-url", "origin"], cwd=repo_dir)
-            remote_url = stdout.strip()
-            
-            if remote_url:
-                # Build push URL with token
-                if remote_url.startswith("https://"):
-                    push_url = f"https://x-access-token:{token}@{remote_url.split('://', 1)[1]}"
-                elif remote_url.startswith("git@"):
-                    # SSH — just push without token
-                    push_url = remote_url
-                else:
-                    push_url = remote_url
-                
-                # Get current branch
-                stdout, _, _ = run_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir)
-                branch = stdout.strip() or "main"
-                
-                stdout, stderr, rc = run_git(
-                    ["git", "push", push_url, f"HEAD:{branch}"],
-                    cwd=repo_dir, timeout=120
-                )
-                
-                if rc == 0:
-                    push_note = "committed and pushed"
-                else:
-                    # Push failed — still committed locally
-                    push_note = f"committed locally (push failed: {stderr[:200]})"
+    if not app_id or not inst_id:
+        return error_result("GitHub App credentials not configured — cannot push")
+    
+    token = get_token(app_id, inst_id)
+    if not token:
+        return error_result("Failed to obtain GitHub token — cannot push")
+    
+    # Get current remote URL
+    stdout, _, _ = run_git(["git", "remote", "get-url", "origin"], cwd=repo_dir)
+    remote_url = stdout.strip()
+    
+    if not remote_url:
+        return error_result("No remote 'origin' configured — cannot push")
+    
+    # Build push URL with token
+    if remote_url.startswith("https://"):
+        push_url = f"https://x-access-token:{token}@{remote_url.split('://', 1)[1]}"
+    elif remote_url.startswith("git@"):
+        push_url = remote_url
+    else:
+        push_url = remote_url
+    
+    # Get current branch
+    stdout, _, _ = run_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir)
+    branch = stdout.strip() or "main"
+    
+    stdout, stderr, rc = run_git(
+        ["git", "push", push_url, f"HEAD:{branch}"],
+        cwd=repo_dir, timeout=120
+    )
+    
+    if rc != 0:
+        return error_result(f"Push failed: {stderr[:500]}")
+    
+    # Update local tracking refs (push with URL doesn't auto-update them)
+    run_git(["git", "fetch", "origin", "--quiet"], cwd=repo_dir, timeout=30)
     
     return text_result(json.dumps({
         "success": True,
         "repo_dir": os.path.abspath(repo_dir),
-        "note": push_note
+        "note": "committed and pushed"
     }, indent=2))
 
 

@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 fn restrict_path(path: &str, ctx: &AppContext) -> Result<String> {
     let data_dir = Path::new(&ctx.data_dir).canonicalize()?;
+    let workspace_dir = Path::new(&ctx.workspace_dir).canonicalize()?;
     let requested = Path::new(path).canonicalize()?;
-    if !requested.starts_with(&data_dir) {
-        anyhow::bail!("Access denied: path is outside the data directory");
+    if !requested.starts_with(&data_dir) && !requested.starts_with(&workspace_dir) {
+        anyhow::bail!("Access denied: path is outside the data or workspace directory");
     }
     Ok(requested.to_string_lossy().to_string())
 }
@@ -67,20 +68,17 @@ pub fn write_tool() -> McpTool {
             let path = args["path"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
             let content = args["content"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
 
-            // For write, canonicalize the parent dir (file may not exist yet)
-            let path_obj = Path::new(path);
-            let parent = path_obj.parent().ok_or_else(|| anyhow::anyhow!("Invalid path: no parent directory"))?;
-            let parent_canon = parent.canonicalize().map_err(|e| anyhow::anyhow!("Parent directory does not exist: {} ({})", parent.display(), e))?;
+            // For write, validate path is within allowed directories
+            Path::new(path).parent().ok_or_else(|| anyhow::anyhow!("Invalid path: no parent directory"))?;
 
-            // Check parent is within data directory
-            let data_dir = Path::new(&ctx.data_dir).canonicalize()?;
-            if !parent_canon.starts_with(&data_dir) {
-                anyhow::bail!("Access denied: path is outside the data directory");
+            // Check if path is under data_dir or workspace_dir by prefix matching
+            let is_under_data = path.starts_with(ctx.data_dir.as_str());
+            let is_under_workspace = path.starts_with(ctx.workspace_dir.as_str());
+            if !is_under_data && !is_under_workspace {
+                anyhow::bail!("Access denied: path is outside the data or workspace directory");
             }
 
-            let safe_path = parent_canon.join(
-                path_obj.file_name().ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?
-            );
+            let safe_path = Path::new(path).to_path_buf();
             let safe_path_str = safe_path.to_string_lossy().to_string();
             if let Some(parent) = safe_path.parent() {
                 fs::create_dir_all(parent)?;

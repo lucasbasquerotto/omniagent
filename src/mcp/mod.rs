@@ -55,7 +55,7 @@ use crate::prompt_builder::MemoryStore;
 pub struct AppContext {
     pub pool: PgPool,
     pub data_dir: String,
-    #[expect(dead_code)]
+    pub workspace_dir: String,
     pub qdrant_url: Option<String>,
     /// Read-only memory store (MEMORY.md + USER.md) for system prompt injection.
     pub memory_store: Arc<MemoryStore>,
@@ -63,7 +63,7 @@ pub struct AppContext {
 
 impl AppContext {
     /// Create a new application context with a loaded memory store.
-    pub fn new(pool: PgPool, data_dir: &str, qdrant_url: Option<String>) -> Self {
+    pub fn new(pool: PgPool, data_dir: &str, workspace_dir: &str, qdrant_url: Option<String>) -> Self {
         // Load memory store from the default profile's memories directory
         let profile_path = format!("{}/profiles/default", data_dir);
         let mut memory_store = MemoryStore::new(&profile_path);
@@ -72,6 +72,7 @@ impl AppContext {
         Self {
             pool,
             data_dir: data_dir.to_string(),
+            workspace_dir: workspace_dir.to_string(),
             qdrant_url,
             memory_store: Arc::new(memory_store),
         }

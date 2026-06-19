@@ -26,7 +26,13 @@ pub struct Profile {
     pub retrieval_aggressiveness: u8,
     /// Whether grounding is required for answers
     pub grounding_required: bool,
+    /// Context budget for the ContextBuilder (in characters).
+    /// If None, falls back to PROMPT_BUDGET_DEFAULT (15,000).
+    pub prompt_budget: Option<usize>,
 }
+
+/// Default context budget for profiles that don't specify one.
+pub const PROMPT_BUDGET_DEFAULT: usize = 15_000;
 
 impl Profile {
     /// Create a default profile with the given name.
@@ -64,6 +70,7 @@ impl Profile {
             auto_retrieval_enabled: true,
             retrieval_aggressiveness: 2,
             grounding_required: false,
+            prompt_budget: None, // uses PROMPT_BUDGET_DEFAULT (15,000)
         }
     }
 

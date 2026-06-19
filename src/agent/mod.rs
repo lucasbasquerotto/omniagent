@@ -847,7 +847,7 @@ async fn process_thread(
     // 4b. Assemble additional context blocks via ContextBuilder
     let ctx_assembly_meta: Option<ContextAssemblyMeta>;
     let context_messages = {
-        let mut builder = ContextBuilder::new().with_budget(8_000);
+        let mut builder = ContextBuilder::new().with_budget(prof.prompt_budget.unwrap_or(crate::profile::PROMPT_BUDGET_DEFAULT));
 
         // Classify the user message to determine retrieval needs
         let (_query_class, needs_retrieval) =

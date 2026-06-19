@@ -40,7 +40,7 @@ impl Profile {
         Self {
             name: name.to_string(),
             model: Some("deepseek-v4-flash".to_string()),
-            provider: Some("opencode-go".to_string()),
+            provider: Some("deepseek".to_string()),
             base_url: None,
             api_key: None,
             max_tokens: None,

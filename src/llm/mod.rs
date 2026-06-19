@@ -32,6 +32,8 @@ pub enum ProviderKind {
     OpenAI,
     #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
 }
 
 impl fmt::Display for ProviderKind {
@@ -40,6 +42,7 @@ impl fmt::Display for ProviderKind {
             ProviderKind::OpenCodeGo => write!(f, "opencode-go"),
             ProviderKind::OpenAI => write!(f, "openai"),
             ProviderKind::Anthropic => write!(f, "anthropic"),
+            ProviderKind::DeepSeek => write!(f, "deepseek"),
         }
     }
 }
@@ -52,8 +55,9 @@ impl FromStr for ProviderKind {
             "opencode-go" | "opencode_go" | "opencodego" => Ok(ProviderKind::OpenCodeGo),
             "openai" => Ok(ProviderKind::OpenAI),
             "anthropic" => Ok(ProviderKind::Anthropic),
+            "deepseek" => Ok(ProviderKind::DeepSeek),
             other => Err(anyhow::anyhow!(
-                "Unknown LLM provider: {other}. Expected one of: opencode-go, openai, anthropic"
+                "Unknown LLM provider: {other}. Expected one of: opencode-go, openai, anthropic, deepseek"
             )),
         }
     }
@@ -94,6 +98,7 @@ impl ApiMode {
             ProviderKind::OpenCodeGo => opencode_model_api_mode(model_id),
             ProviderKind::OpenAI => ApiMode::ChatCompletions,
             ProviderKind::Anthropic => ApiMode::AnthropicMessages,
+            ProviderKind::DeepSeek => ApiMode::ChatCompletions,
         }
     }
 }
@@ -134,14 +139,24 @@ impl LLMConfig {
             ProviderKind::OpenCodeGo => "https://opencode.ai/zen/go/v1".to_string(),
             ProviderKind::OpenAI => "https://api.openai.com/v1".to_string(),
             ProviderKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
+            ProviderKind::DeepSeek => "https://api.deepseek.com/v1".to_string(),
         });
 
         let api_mode = ApiMode::resolve(provider, &model);
 
+        let api_key = match provider {
+            ProviderKind::DeepSeek => {
+                std::env::var("DEEPSEEK_API_KEY")
+                    .or_else(|_| std::env::var("LLM_API_KEY"))
+                    .unwrap_or_default()
+            }
+            _ => std::env::var("LLM_API_KEY").unwrap_or_default(),
+        };
+
         Self {
             provider,
             api_mode,
-            api_key: std::env::var("LLM_API_KEY").unwrap_or_default(),
+            api_key,
             base_url,
             model,
             max_tokens: std::env::var("LLM_MAX_TOKENS")
@@ -265,6 +280,8 @@ pub struct CompletionResponse {
     /// Tool calls requested by the model, if any.
     pub tool_calls: Vec<ToolCallData>,
     pub usage: Option<Usage>,
+    /// Wall-clock time of the LLM call in milliseconds.
+    pub duration_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -381,10 +398,13 @@ impl LLMClient {
     /// Dispatches to the appropriate provider-specific implementation based on
     /// `self.config.provider` and `self.config.api_mode`.
     pub async fn completion(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        match self.config.api_mode {
+        let start = std::time::Instant::now();
+        let mut resp = match self.config.api_mode {
             ApiMode::ChatCompletions => self.completion_openai(request).await,
             ApiMode::AnthropicMessages => self.completion_anthropic(request).await,
-        }
+        }?;
+        resp.duration_ms = start.elapsed().as_millis() as u64;
+        Ok(resp)
     }
 
     // -----------------------------------------------------------------------
@@ -407,7 +427,7 @@ impl LLMClient {
             "stream": request.stream,
         });
 
-        if matches!(self.config.provider, ProviderKind::OpenCodeGo) {
+        if matches!(self.config.provider, ProviderKind::OpenCodeGo | ProviderKind::DeepSeek) {
             body["include_reasoning"] = serde_json::Value::Bool(true);
         }
 
@@ -484,6 +504,7 @@ impl LLMClient {
             reasoning,
             tool_calls,
             usage: response.usage,
+            duration_ms: 0,
         })
     }
 
@@ -508,6 +529,7 @@ impl LLMClient {
             reasoning,
             tool_calls: vec![],
             usage: response.usage,
+            duration_ms: 0,
         })
     }
 
@@ -623,6 +645,7 @@ impl LLMClient {
             reasoning,
             tool_calls: vec![],
             usage,
+            duration_ms: 0,
         })
     }
 }

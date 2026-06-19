@@ -7,6 +7,9 @@
 //! - `POST|GET /open/{channel_id}` — open channel (allow handler to start)
 //! - `GET /status/{channel_id}` — channel status info
 //! - `GET /prompt/{channel_name}` — show system prompt for a channel
+//! - `POST /prompt-preview/{channel_name}` — preview full prompt (no DB writes), optionally plan
+
+mod settings;
 
 use axum::{
     extract::{Path, State},
@@ -15,6 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +27,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::db::types as queries;
-use crate::prompt_builder::{build_system_prompt, MemoryStore};
+use crate::llm::{ChatMessage, CompletionRequest, LLMClient, LLMConfig};
+use crate::prompt_builder::{build_planning_prompt, build_system_prompt, MemoryStore};
 
 /// Shared application state for the HTTP server.
 #[derive(Clone)]
@@ -31,6 +36,8 @@ struct AppState {
     pool: PgPool,
     cancel_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
     data_dir: String,
+    /// Path to the .env file for settings API
+    env_path: String,
 }
 
 /// Start the HTTP server on the given host and port.
@@ -44,7 +51,8 @@ pub async fn start_server(
     let app_state = Arc::new(AppState {
         pool,
         cancel_tokens,
-        data_dir,
+        data_dir: data_dir.clone(),
+        env_path: format!("{}/.env", data_dir),
     });
 
     let app = Router::new()
@@ -57,6 +65,8 @@ pub async fn start_server(
         .route("/open/:channel_id", get(open_handler))
         .route("/status/:channel_id", get(status_handler))
         .route("/prompt/:channel_name", get(prompt_handler))
+        .route("/prompt-preview/:channel_name", post(prompt_preview_handler))
+        .nest("/settings", settings::settings_router())
         .with_state(app_state);
 
     let addr = format!("{}:{}", host, port);
@@ -260,4 +270,131 @@ async fn prompt_handler(
     );
 
     (StatusCode::OK, result)
+}
+
+// ── Prompt preview endpoint ──
+
+#[derive(Deserialize)]
+struct PromptPreviewRequest {
+    prompt: String,
+    plan: bool,
+}
+
+#[derive(Serialize)]
+struct PromptPreviewResponse {
+    system_prompt: String,
+    messages: Vec<serde_json::Value>,
+    plan: Option<String>,
+}
+
+async fn prompt_preview_handler(
+    Path(channel_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PromptPreviewRequest>,
+) -> impl IntoResponse {
+    let channel = match queries::get_channel_by_name(&state.pool, &channel_name).await {
+        Ok(Some(ch)) => ch,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("Channel '{}' not found", channel_name) })),
+            );
+        }
+        Err(e) => {
+            error!("Failed to look up channel '{}': {:?}", channel_name, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Database error: {}", e) })),
+            );
+        }
+    };
+
+    let profile_name = if channel.current_profile.is_empty() {
+        "default"
+    } else {
+        &channel.current_profile
+    };
+
+    let profile_path = format!("{}/profiles/{}", state.data_dir, profile_name);
+    let mut memory_store = MemoryStore::new(&profile_path);
+    memory_store.load_from_disk();
+
+    let platform = channel.platform.as_deref().unwrap_or("");
+    let system_prompt = build_system_prompt(&memory_store, platform, None, profile_name);
+
+    let mut messages = vec![
+        serde_json::json!({ "role": "system", "content": system_prompt }),
+        serde_json::json!({ "role": "user", "content": body.prompt }),
+    ];
+
+    let plan = if body.plan {
+        // Resolve provider/model: channel > profile > env
+        let profile_registry = crate::profile::ProfileRegistry::new(&state.data_dir);
+        let prof = profile_registry.get(profile_name).cloned()
+            .unwrap_or_else(|| crate::profile::Profile::default(profile_name));
+
+        let provider_name = channel.current_provider.clone()
+            .or_else(|| prof.provider.clone())
+            .unwrap_or_else(|| std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "opencode-go".to_string()));
+
+        let model_name = channel.current_model.clone()
+            .or_else(|| prof.model.clone())
+            .unwrap_or_else(|| std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string()));
+
+        // Build planning prompt
+        let planning_prompt = build_planning_prompt(
+            &memory_store,
+            platform,
+            profile_name,
+            &body.prompt,
+            0,
+            0,
+            None,
+        );
+
+        // Create LLM client with the channel's config
+        let env_cfg = LLMConfig::from_env();
+        let llm_config = LLMConfig {
+            provider: provider_name.parse().unwrap_or(env_cfg.provider),
+            api_key: env_cfg.api_key,
+            base_url: env_cfg.base_url,
+            model: model_name,
+            api_mode: env_cfg.api_mode,
+            max_tokens: 1024,
+            temperature: 0.3,
+        };
+        let llm = LLMClient::new(llm_config);
+
+        let plan_request = CompletionRequest {
+            messages: vec![ChatMessage::system(&planning_prompt)],
+            max_tokens: 1024,
+            temperature: 0.3,
+            stream: false,
+            tools: None,
+        };
+
+        match llm.completion(plan_request).await {
+            Ok(resp) => {
+                let plan_content = resp.content;
+                messages.push(serde_json::json!({ "role": "agent", "msg_type": "plan", "content": plan_content }));
+                Some(plan_content)
+            }
+            Err(e) => {
+                let err_msg = format!("Planning failed: {}", e);
+                messages.push(serde_json::json!({ "role": "agent", "msg_type": "plan", "content": err_msg }));
+                Some(err_msg)
+            }
+        }
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "system_prompt": messages[0]["content"].as_str().unwrap_or(""),
+            "messages": messages,
+            "plan": plan,
+        })),
+    )
 }

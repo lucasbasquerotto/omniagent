@@ -78,7 +78,16 @@ impl AgentConfig {
     /// - `MAX_ITERATIONS` — Max agent turns per thread before skipping (default: 60)
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            llm_api_key: std::env::var("LLM_API_KEY").unwrap_or_default(),
+            llm_api_key: std::env::var("LLM_API_KEY")
+                .or_else(|_| {
+                    let provider = std::env::var("LLM_PROVIDER").unwrap_or_default();
+                    if provider == "deepseek" {
+                        std::env::var("DEEPSEEK_API_KEY")
+                    } else {
+                        Err(std::env::VarError::NotPresent)
+                    }
+                })
+                .unwrap_or_default(),
             llm_model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4".to_string()),
             llm_provider: std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".to_string()),
             llm_base_url: std::env::var("LLM_BASE_URL").unwrap_or_default(),
@@ -1095,7 +1104,7 @@ async fn process_thread(
 
             match llm.completion(plan_request).await {
                 Ok(resp) => {
-                    merge_usage(&mut cumulative_usage, resp.usage);
+                    merge_usage(&mut cumulative_usage, resp.usage.clone());
                     let content = resp.content;
 
                     // Check if the LLM accepted the plan (refinement mode)
@@ -1116,6 +1125,17 @@ async fn process_thread(
                         max_iter + 1,
                     );
 
+                    // Convert Usage to JSON value for token_usage field
+                    let plan_token_usage = resp.usage.map(|u| {
+                        serde_json::json!({
+                            "prompt_tokens": u.prompt_tokens,
+                            "completion_tokens": u.completion_tokens,
+                            "cached_tokens": u.cached_tokens,
+                            "reasoning_tokens": u.reasoning_tokens,
+                        })
+                    });
+                    let plan_duration_ms = Some(resp.duration_ms as i32);
+
                     // Save the plan as a plan-type message
                     let plan_msg = MessageNew {
                         thread_id: thread.id,
@@ -1132,8 +1152,8 @@ async fn process_thread(
                         is_summary: false,
                         msg_type: "plan".to_string(),
                         msg_subtype: Some("markdown".to_string()),
-                        processing_time_ms: None,
-                        token_usage: None,
+                        processing_time_ms: plan_duration_ms,
+                        token_usage: plan_token_usage,
                     };
                     match queries::create_message(pool, &plan_msg).await {
                         Ok(_) => {},
@@ -1248,7 +1268,7 @@ async fn process_thread(
         };
 
         // Track cumulative token usage
-        merge_usage(&mut cumulative_usage, response.usage);
+        merge_usage(&mut cumulative_usage, response.usage.clone());
 
         // Store reasoning if present
         if response.reasoning.is_some() {
@@ -1275,10 +1295,65 @@ async fn process_thread(
         assistant_msg.tool_calls = Some(response.tool_calls.clone());
         messages.push(assistant_msg);
 
+        // Per-message token/time from the LLM response that generated these tool calls
+        let tool_token_usage = response.usage.map(|u| {
+            serde_json::json!({
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "cached_tokens": u.cached_tokens,
+                "reasoning_tokens": u.reasoning_tokens,
+            })
+        });
+        let tool_duration_ms = Some(response.duration_ms as i32);
+        let is_multi_tool = response.tool_calls.len() > 1;
+
+        // If multiple tool calls, persist a multi-tool message first (holds time/tokens)
+        if is_multi_tool {
+            let multi_content = response.tool_calls
+                .iter()
+                .map(|tc| tc.function.arguments.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let multi_msg = MessageNew {
+                thread_id: thread.id,
+                role: "agent".to_string(),
+                content: multi_content,
+                thread_sequence: cause_msg.thread_sequence + 1,
+                external_id: None,
+                metadata: serde_json::json!({}),
+                embedding: None,
+                summary_text: None,
+                is_summary: false,
+                msg_type: "multi-tool".to_string(),
+                msg_subtype: None,
+                processing_time_ms: tool_duration_ms,
+                token_usage: tool_token_usage.clone(),
+            };
+            match persist_or_abort(pool, &multi_msg, thread.id).await {
+                CreateMessageResult::FkViolation => {
+                    anyhow::bail!("FK violation — thread {} no longer exists", thread.id)
+                }
+                CreateMessageResult::OtherError(e) => {
+                    error!("Failed to persist multi-tool message: {:?}", e)
+                }
+                CreateMessageResult::Success(saved) => {
+                    enqueue_delivery(ctx, &saved, &channel, thread, cause_msg.external_id.clone()).await;
+                }
+            }
+        }
+
         // Execute each tool call
         for tc in &response.tool_calls {
             let tool_name = tc.function.name.clone();
             let tool_args = tc.function.arguments.clone();
+
+            // Single tool: attach time/tokens to the tool message.
+            // Multi-tool: time/tokens are on the multi-tool message, tools get null.
+            let (tool_ptime, tool_tu) = if is_multi_tool {
+                (None, None)
+            } else {
+                (tool_duration_ms, tool_token_usage.clone())
+            };
 
             // Persist the tool call as an agent message with msg_type="tool"
             let tool_call_msg = MessageNew {
@@ -1293,20 +1368,18 @@ async fn process_thread(
                 is_summary: false,
                 msg_type: "tool".to_string(),
                 msg_subtype: Some(tool_name.clone()),
-                processing_time_ms: None,
-                token_usage: None,
+                processing_time_ms: tool_ptime,
+                token_usage: tool_tu,
             };
             match persist_or_abort(pool, &tool_call_msg, thread.id).await {
-                CreateMessageResult::FkViolation => anyhow::bail!("FK violation — thread {} no longer exists", thread.id),
-                CreateMessageResult::OtherError(e) => error!("Failed to persist tool call '{}': {:?}", tool_name, e),
+                CreateMessageResult::FkViolation => {
+                    anyhow::bail!("FK violation — thread {} no longer exists", thread.id)
+                }
+                CreateMessageResult::OtherError(e) => {
+                    error!("Failed to persist tool call '{}': {:?}", tool_name, e)
+                }
                 CreateMessageResult::Success(saved) => {
-                    enqueue_delivery(
-                        ctx,
-                        &saved,
-                        &channel,
-                        thread,
-                        cause_msg.external_id.clone(),
-                    ).await;
+                    enqueue_delivery(ctx, &saved, &channel, thread, cause_msg.external_id.clone()).await;
                 }
             }
 
@@ -1475,8 +1548,8 @@ async fn process_thread(
         }),
         embedding: None,
         summary_text: None,
-        is_summary: false,
-        msg_type: "message".to_string(),
+        is_summary: !limit_reached,
+        msg_type: if limit_reached { "message".to_string() } else { "summary".to_string() },
         msg_subtype: None,
         processing_time_ms: Some(agent_elapsed_ms),
         token_usage: token_usage_json.clone(),
@@ -1492,105 +1565,104 @@ async fn process_thread(
         cause_msg.external_id.clone(),
     ).await;
 
-    // ── Summary generation (outside iteration budget) ──
-    // Strip tool results from summary context — the summary only needs
-    // the conversation flow (user requests + agent responses), not raw tool
-    // outputs. This keeps summary tokens low and avoids silent failures
-    // from oversized context windows.
-    let mut summary_msgs: Vec<ChatMessage> = messages
-        .iter()
-        .filter(|m| m.role != "tool")
-        .map(|m| {
-            let mut cloned = m.clone();
-            // Remove tool_calls from assistant messages since we removed
-            // the corresponding tool results — DeepSeek requires tool_call
-            // chains to be complete.
-            if cloned.role == "assistant" && cloned.tool_calls.is_some() {
-                cloned.tool_calls = None;
+    // ── Summary generation (only when interrupted / iteration limit reached) ──
+    // When the thread completed normally, the agent's final message IS the summary
+    // (the prompt instructs it to end with a summary). No separate LLM call needed.
+    if limit_reached {
+        // Strip tool results from summary context — the summary only needs
+        // the conversation flow (user requests + agent responses), not raw tool
+        // outputs. This keeps summary tokens low and avoids silent failures
+        // from oversized context windows.
+        let mut summary_msgs: Vec<ChatMessage> = messages
+            .iter()
+            .filter(|m| m.role != "tool")
+            .map(|m| {
+                let mut cloned = m.clone();
+                // Remove tool_calls from assistant messages since we removed
+                // the corresponding tool results — DeepSeek requires tool_call
+                // chains to be complete.
+                if cloned.role == "assistant" && cloned.tool_calls.is_some() {
+                    cloned.tool_calls = None;
+                }
+                cloned
+            })
+            .collect();
+        summary_msgs.push(ChatMessage::system(
+            "The iteration limit was reached so the task may be incomplete. \
+             Summarize what was accomplished and inform the user they can request to continue.",
+        ));
+
+        let summary_request = CompletionRequest {
+            messages: summary_msgs,
+            max_tokens: 512,
+            temperature: 0.3,
+            stream: false,
+            tools: None,
+        };
+
+        let summary_start = std::time::Instant::now();
+        let (summary_text, summary_token_usage) = match llm.completion(summary_request).await {
+            Ok(resp) => {
+                let usage = resp.usage.clone();
+                merge_usage(&mut cumulative_usage, resp.usage);
+                let tokens = usage.as_ref().map(|u| {
+                    serde_json::json!({
+                        "prompt_tokens": u.prompt_tokens,
+                        "completion_tokens": u.completion_tokens,
+                        "cached_tokens": u.cached_tokens,
+                        "reasoning_tokens": u.reasoning_tokens,
+                    })
+                });
+                info!(
+                    "[summary] Generated summary for thread {} ({} chars, limit_reached={})",
+                    thread.id,
+                    resp.content.len(),
+                    limit_reached,
+                );
+                (resp.content, tokens)
             }
-            cloned
-        })
-        .collect();
-    summary_msgs.push(ChatMessage::system(if limit_reached {
-        "The iteration limit was reached so the task may be incomplete. \
-         Summarize what was accomplished and inform the user they can request to continue."
-    } else {
-        "Now summarize what was accomplished."
-    }));
+            Err(e) => {
+                warn!("[summary] Failed to generate summary for thread {}: {:?}", thread.id, e);
+                (format!("Summary generation failed: {}", e), None)
+            }
+        };
+        let summary_elapsed_ms = summary_start.elapsed().as_millis() as i32;
 
-    let summary_request = CompletionRequest {
-        messages: summary_msgs,
-        max_tokens: 512,
-        temperature: 0.3,
-        stream: false,
-        tools: None,
-    };
+        let summary_msg = MessageNew {
+            thread_id: thread.id,
+            role: "agent".to_string(),
+            content: summary_text,
+            thread_sequence: cause_msg.thread_sequence + 2,
+            external_id: None,
+            metadata: serde_json::json!({}),
+            embedding: None,
+            summary_text: None,
+            is_summary: true,
+            msg_type: "summary".to_string(),
+            msg_subtype: None,
+            processing_time_ms: Some(summary_elapsed_ms),
+            token_usage: summary_token_usage,
+        };
 
-    let summary_start = std::time::Instant::now();
-    let (summary_text, summary_token_usage) = match llm.completion(summary_request).await {
-        Ok(resp) => {
-            let usage = resp.usage.clone();
-            merge_usage(&mut cumulative_usage, resp.usage);
-            let tokens = usage.as_ref().map(|u| {
-                serde_json::json!({
-                    "prompt_tokens": u.prompt_tokens,
-                    "completion_tokens": u.completion_tokens,
-                    "cached_tokens": u.cached_tokens,
-                    "reasoning_tokens": u.reasoning_tokens,
-                })
-            });
-            info!(
-                "[summary] Generated summary for thread {} ({} chars, limit_reached={})",
-                thread.id,
-                resp.content.len(),
-                limit_reached,
-            );
-            (resp.content, tokens)
+        match queries::create_message(pool, &summary_msg).await {
+            Ok(summary_saved) => {
+                info!("[summary] Saved summary message for thread {}", thread.id,);
+                enqueue_delivery(
+                    ctx,
+                    &summary_saved,
+                    &channel,
+                    thread,
+                    cause_msg.external_id.clone(),
+                ).await;
+            }
+            Err(e) => warn!(
+                "[summary] Failed to save summary for thread {}: {:?}",
+                thread.id, e
+            ),
         }
-        Err(e) => {
-            warn!("[summary] Failed to generate summary for thread {}: {:?}", thread.id, e);
-            (format!("Summary generation failed: {}", e), None)
-        }
-    };
-    let summary_elapsed_ms = summary_start.elapsed().as_millis() as i32;
-
-    let summary_msg = MessageNew {
-        thread_id: thread.id,
-        role: "agent".to_string(),
-        content: summary_text,
-        thread_sequence: cause_msg.thread_sequence + 2, // after reasoning (1) and message (1)
-        external_id: None,
-        metadata: serde_json::json!({}),
-        embedding: None,
-        summary_text: None,
-        is_summary: true,
-        msg_type: "summary".to_string(),
-        msg_subtype: None,
-        processing_time_ms: Some(summary_elapsed_ms),
-        token_usage: summary_token_usage,
-    };
+    }
     // Define final status before potential early return
     let final_status = if limit_reached { "interrupted" } else { "completed" };
-
-    match queries::create_message(pool, &summary_msg).await {
-        Ok(summary_saved) => {
-            info!(
-                "[summary] Saved summary message for thread {}",
-                thread.id,
-            );
-            enqueue_delivery(
-                        ctx,
-                &summary_saved,
-                &channel,
-                thread,
-                cause_msg.external_id.clone(),
-            ).await;
-        }
-        Err(e) => warn!(
-            "[summary] Failed to save summary for thread {}: {:?}",
-            thread.id, e
-        ),
-    }
 
     queries::complete_thread(pool, thread.id, final_status, 0, 0, 0, 0).await?;
 

@@ -298,10 +298,13 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
     println!("│  /subscribe <name> to receive summaries from a channel    │");
     println!("│  /unsubscribe <name> to stop receiving summaries          │");
     println!("│  /subscriptions to list your current subscriptions        │");
+    println!("│  /usage to show token usage stats per channel              │");
     println!("└─────────────────────────────────────────────────────────┘\n");
 
     // Get or create the current thread
     let mut thread_id = get_or_create_thread(&pool, current_channel_id, &profile_name, &resolved_provider, &resolved_model).await?;
+    // Mark the /start thread as a system thread (terminal, never processed by executor)
+    db::types::set_thread_system(&pool, thread_id).await?;
     let _ = get_next_sequence(&pool, current_channel_id, thread_id).await?;
 
     // Initialize cursor-based polling tracker — skip existing messages
@@ -521,6 +524,10 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
                         println!("Channel '{}' not found.", name);
                     }
                 }
+                continue;
+            }
+            "/usage" => {
+                handle_usage_command(&pool).await?;
                 continue;
             }
             "/subscriptions" => {
@@ -1190,4 +1197,58 @@ async fn handle_channel_command<R: std::io::BufRead + Unpin>(
             }
         }
     }
+}
+
+/// Handle the `/usage` command — display token usage stats per channel.
+async fn handle_usage_command(pool: &PgPool) -> anyhow::Result<()> {
+    let stats = db::types::get_channel_usage_stats(pool).await?;
+
+    if stats.is_empty() {
+        println!("No usage data found. Send a message first to generate token usage.");
+        return Ok(());
+    }
+
+    println!();
+    println!("┌─ Channel Usage ────────────────────────────────────────");
+    println!("│ {:<20} {:<22} {:>10} {:>10} {:>10}", "Channel", "Model", "Input", "Cached", "Output");
+    println!("│ {:-<20} {:-<22} {:->10} {:->10} {:->10}", "", "", "", "", "");
+
+    for s in &stats {
+        let model = s.model.as_deref().unwrap_or("(not set)");
+        println!(
+            "│ {:<20} {:<22} {:>10} {:>10} {:>10}",
+            s.channel_name,
+            model,
+            format_num(s.total_input_tokens.unwrap_or(0)),
+            format_num(s.total_cached_tokens.unwrap_or(0)),
+            format_num(s.total_output_tokens.unwrap_or(0)),
+        );
+    }
+
+    // Summary row
+    let total_in: i64 = stats.iter().map(|s| s.total_input_tokens.unwrap_or(0)).sum();
+    let total_cached: i64 = stats.iter().map(|s| s.total_cached_tokens.unwrap_or(0)).sum();
+    let total_out: i64 = stats.iter().map(|s| s.total_output_tokens.unwrap_or(0)).sum();
+    println!("│ {:-<20} {:-<22} {:->10} {:->10} {:->10}", "", "", "", "", "");
+    println!(
+        "│ {:<20} {:<22} {:>10} {:>10} {:>10}",
+        "TOTAL", "", format_num(total_in), format_num(total_cached), format_num(total_out),
+    );
+    println!("└─────────────────────────────────────────────────────────");
+    println!();
+
+    Ok(())
+}
+
+/// Format a number with thousands separators.
+fn format_num(n: i64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }

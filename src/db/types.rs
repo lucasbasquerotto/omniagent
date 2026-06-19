@@ -276,6 +276,18 @@ pub async fn create_thread(
     row.try_into()
 }
 
+/// Set a thread's status to 'system' (terminal — init messages like /start).
+/// These threads should never be picked up by the executor.
+pub async fn set_thread_system(pool: &PgPool, thread_id: i64) -> anyhow::Result<()> {
+    sql_forge!(
+        "UPDATE threads SET status = 'system', terminal = true WHERE id = :id",
+        ( :id = thread_id )
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 /// Set a thread's status to 'pending' so the executor picks it up.
 pub async fn set_thread_pending(pool: &PgPool, thread_id: i64) -> anyhow::Result<()> {
@@ -1527,5 +1539,48 @@ pub async fn get_summaries_since(
     )
     .fetch_all(pool)
     .await?;
+    Ok(rows)
+}
+// ---------------------------------------------------------------------------
+// Usage stats query — channel-level token usage
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChannelUsageStats {
+    pub channel_id: i64,
+    pub channel_name: String,
+    pub model: Option<String>,
+    pub total_input_tokens: Option<i64>,
+    pub total_cached_tokens: Option<i64>,
+    pub total_output_tokens: Option<i64>,
+    pub total_threads: Option<i64>,
+    pub total_duration_ms: Option<i64>,
+}
+
+/// Get token usage stats aggregated per channel.
+/// Shows model, input_tokens, cached_tokens, output_tokens for each channel.
+pub async fn get_channel_usage_stats(pool: &PgPool) -> anyhow::Result<Vec<ChannelUsageStats>> {
+    let rows: Vec<ChannelUsageStats> = sql_forge!(
+        ChannelUsageStats,
+        r#"
+        SELECT
+            c.id AS channel_id,
+            c.name AS channel_name,
+            COALESCE(NULLIF(t.model, ''), '(not set)') AS model,
+            COALESCE(SUM(t.input_tokens), 0)::bigint AS total_input_tokens,
+            COALESCE(SUM(t.cached_tokens), 0)::bigint AS total_cached_tokens,
+            COALESCE(SUM(t.output_tokens), 0)::bigint AS total_output_tokens,
+            COUNT(t.id)::bigint AS total_threads,
+            COALESCE(SUM(t.duration_ms), 0)::bigint AS total_duration_ms
+        FROM channels c
+        LEFT JOIN threads t ON t.channel_id = c.id
+        WHERE t.status IN ('completed', 'failed', 'interrupted', 'skipped')
+        GROUP BY c.id, c.name, t.model
+        ORDER BY c.name ASC, t.model ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
     Ok(rows)
 }

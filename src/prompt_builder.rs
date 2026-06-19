@@ -20,9 +20,9 @@ const ENTRY_DELIMITER: &str = "\n§\n";
 // ── Character limits ────────────────────────────────────────────
 
 /// Max characters for the MEMORY block in the system prompt.
-const MEMORY_CHAR_LIMIT: usize = 2_500;
+const MEMORY_CHAR_LIMIT: usize = 10_000;
 /// Max characters for the USER profile block in the system prompt.
-const USER_CHAR_LIMIT: usize = 1_000;
+const USER_CHAR_LIMIT: usize = 2_000;
 
 // ── Stable identity / guidance texts ────────────────────────────
 
@@ -37,35 +37,17 @@ Fetch all 12 in a SINGLE tool-calling round.\n\
 Do not re-fetch with different query params, do not try alternative APIs for the same data. \
 The data you have is sufficient.\n\
 4. TRUST YOUR RESULTS — once you have data, move forward. Don't second-guess.\n\
-5. COMPLETE in 2-4 tool-calling rounds max for research. More than 6 means you failed at batching.\n\
-6. READ the input file, DO the work, WRITE output, VERIFY, DONE. No detours.\n\
-7. BEFORE fetching external data, ALWAYS use search_messages (to check \
+5. READ the input file, DO the work, WRITE output, VERIFY, DONE. No detours.\n\
+6. BEFORE fetching external data, ALWAYS use search_messages (to check \
 past conversation history) and search_wiki (to check the project knowledge base). \
 Existing knowledge may already cover the topic.\n\
-8. Skip Critical-Instructions.md and Anti-Patterns.md — they are not needed for \
-normal research tasks.\n\
-9. OUTPUT QUALITY: When writing research-output.md, include clear headers, \
-comparison tables where appropriate, and cite sources. Verify the file was written \
-by reading it back with filesystem_read.\n\
 \n\
-FILESYSTEM ACCESS:\n\
-- Read/write/search/list operations are allowed under TWO directories:\n\
-  * data_dir=<data_dir> — agent config, profiles, wiki, memories\n\
-  * /opt/workspace/ — project development (create, edit, manage project files)\n\
-- Research output file path: <data_dir>/research-output.md (MUST write to this path).\n\
-- To read the research input, use filesystem_read(path=\"<data_dir>/research-input.md\").\n\
-- For project files, write to paths under /opt/workspace/.\n\
-- Do NOT try to access paths under /app/ — they are outside the allowed directories.";
+7. FINAL MESSAGE = SUMMARY: After all tool calls complete, your final text \
+response must be a concise summary of what was accomplished. Cover key results, \
+decisions, and any follow-up actions needed. This replaces the need for a \
+separate summarization step.";
 
-const RESEARCH_WORKFLOW: &str = "\
-RESEARCH WORKFLOW (follow this exact sequence for research tasks):\n\
-1. Read research-input.md to understand the requirements and output path.\n\
-2. search_messages for relevant past research and existing knowledge.\n\
-3. search_wiki for knowledge base articles on the topic.\n\
-4. Fetch ALL external data in ONE batch — combine all HTTP fetches into a single\n\
-   tool-calling round. Do NOT fetch one URL at a time.\n\
-5. Write research-output.md with structured headers, comparison tables, and cited sources.\n\
-6. Verify the output was written correctly by reading it back.";
+const RESEARCH_WORKFLOW: &str = "";
 
 const SKILLS_GUIDANCE: &str = "";
 
@@ -80,41 +62,34 @@ whenever possible (message IDs, wiki file paths, tool call IDs).\n\
 4. If you lack sufficient evidence to answer, either ask a clarifying \
 question or trigger a search/retrieval tool before responding.";
 
-const WIKI_GUIDANCE: &str = "Your wiki at <data_dir>/profiles/<profile>/wiki/ stores long-term knowledge. \
-Use search_wiki to find relevant wiki pages. \
-Use search_messages to find past conversations and research results. \
-Both are available as MCP tools — check them before fetching external data.";
+const WIKI_GUIDANCE: &str = "";
 
-const DB_SCHEMA: &str = "DATABASE SCHEMA (PostgreSQL):\\n\\\
-channels: id, name, platform, external_id, cause, metadata (JSONB), closed, created_at, updated_at\\n\\\
+const DB_SCHEMA: &str = "DATABASE SCHEMA (PostgreSQL):\n\
+channels: id, name, platform, external_id, cause, metadata (JSONB), \
+current_profile, current_provider, current_model, closed, created_at, updated_at\n\
 threads: id, channel_id, status, cause, profile, provider, model, \
-input_tokens, cached_tokens, output_tokens, duration_ms, created_at, started_at, ended_at\\n\\\
+terminal, input_tokens, cached_tokens, output_tokens, duration_ms, \
+created_at, started_at, ended_at\n\
 messages: id, thread_id, role, content, thread_sequence, msg_type, msg_subtype, \
 external_id, metadata (JSONB), embedding, summary_text, is_summary, \
-processing_time_ms (tool latency), token_usage (JSONB), created_at\\n\\\
-summaries: id, channel_id, next_thread_id, content (cross-thread summary text), created_at\\n\\\
-\\n\\\
-Key relationships: threads.channel_id → channels.id ; messages.thread_id → threads.id ; \
-summaries.channel_id → channels.id\\n\\\
-\\n\\\
-The query_database MCP tool gives you read-only SQL access (SELECT only). Query these tables directly via \
-sql-forge or SQL. Use search_messages for full-text search across messages. \
+processing_time_ms (tool latency), token_usage (JSONB), created_at\n\
+summaries: id, channel_id, next_thread_id, content, created_at\n\
+cron_jobs: id, channel_id, name, schedule, prompt, script, enabled, \
+deliver, profile, model_override, created_at\n\
+kanban_tasks: id, lane, title, description, epic, assignee, priority, \
+size, status, order, tags, dependencies, created_at, updated_at\n\
+\n\
+Key relationships:\n\
+  threads.channel_id -> channels.id\n\
+  messages.thread_id -> threads.id\n\
+  summaries.channel_id -> channels.id\n\
+  cron_jobs.channel_id -> channels.id\n\
+\
+The query_database MCP tool gives you read-only SQL access (SELECT only). \
+Query these tables directly via sql-forge or SQL. \
+Use search_messages for full-text search across messages. \
 Use summaries to understand what happened in prior threads.";
-
-const DOCKER_EXECUTION_GUIDANCE: &str = "DOCKER CODE EXECUTION: \
-You can execute arbitrary code, run builds, install packages, and perform \
-computations using Docker. The `compose` tool supports: ps, up, down, logs, \
-build, exec, stop, restart, pull. \
-\
-TOOLBOX PATTERN: If the task needs tools not available in the agent container, \
-create a docker-compose.yml with a 'toolbox' service in the workspace directory, \
-build it, then use `compose exec toolbox <cmd>` to run anything. \
-This keeps side-effects isolated, reproducible, and portable. \
-\
-EXISTING PROJECTS: If the workspace project already has a docker-compose.yml, \
-use `compose exec <service> <cmd>` to run commands inside its containers. \
-Prefer this over installing tools in the agent container — it keeps the agent \
-image lean and projects self-contained.";
+const DOCKER_EXECUTION_GUIDANCE: &str = "";
 
 const PROFILE_HINT: &str = "Active OmniAgent profile: default. \
 Your profile configuration determines which model, provider, and tools are available. \
@@ -276,17 +251,9 @@ pub fn build_system_prompt_parts(
     let mut stable_parts: Vec<String> = vec![
         DEFAULT_AGENT_IDENTITY.to_string(),
         TOOL_GUIDANCE.to_string(),
-        RESEARCH_WORKFLOW.to_string(),
-        SKILLS_GUIDANCE.to_string(),
         GROUNDING_POLICY.to_string(),
-        DOCKER_EXECUTION_GUIDANCE.to_string(),
         DB_SCHEMA.to_string(),
     ];
-
-    // Wiki guidance with the actual data directory
-    let wiki_hint = WIKI_GUIDANCE.replace("<profile>", profile_name);
-    let data_dir = env::var("OMNI_DATA_DIR").unwrap_or_else(|_| "/opt/data".to_string());
-    stable_parts.push(wiki_hint.replace("<data_dir>", &data_dir));
 
     // Profile hint
     if profile_name == "default" {

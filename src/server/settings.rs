@@ -1,0 +1,537 @@
+//! Settings API — read/write environment variables organized by category.
+//!
+//! - `GET /settings` — returns all settings with metadata
+//! - `PUT /settings` — updates one or more values and writes to .env file
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, put},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::AppState;
+
+/// A single option for a select-type setting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingOption {
+    pub id: String,
+    pub name: String,
+}
+
+/// Metadata describing how a setting should be rendered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingMeta {
+    /// Rendering type: "text", "number", "boolean", "secret", "select", "textarea"
+    #[serde(rename = "type")]
+    pub field_type: String,
+    /// Human-readable description
+    pub description: String,
+    /// Options for select type
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<SettingOption>>,
+    /// Whether the setting is read-only
+    #[serde(default)]
+    pub readonly: bool,
+    /// Default value if not set in .env
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// A single setting entry with its current value and metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingEntry {
+    pub name: String,
+    pub value: String,
+    pub metadata: SettingMeta,
+}
+
+/// A category grouping related settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingCategory {
+    pub name: String,
+    pub label: String,
+    pub settings: Vec<SettingEntry>,
+}
+
+/// Response from GET /settings
+#[derive(Debug, Serialize)]
+pub struct SettingsResponse {
+    pub categories: Vec<SettingCategory>,
+}
+
+/// Request body for PUT /settings
+#[derive(Debug, Deserialize)]
+pub struct UpdateSettingsRequest {
+    pub updates: Vec<SettingUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SettingUpdate {
+    pub name: String,
+    pub value: String,
+}
+
+/// Build the router for /settings endpoints using the shared AppState.
+pub fn settings_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/", get(get_settings_handler))
+        .route("/", put(update_settings_handler))
+}
+
+/// Load current .env file as a HashMap.
+fn load_env_file(env_path: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let content = match std::fs::read_to_string(env_path) {
+        Ok(c) => c,
+        Err(_) => return map,
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().to_string();
+            let value = value.trim().to_string();
+            map.insert(key, value);
+        }
+    }
+    map
+}
+
+/// Write HashMap back to .env file.
+fn write_env_file(env_path: &str, vars: &HashMap<String, String>) -> Result<(), String> {
+    let mut content = String::new();
+    let mut keys: Vec<&String> = vars.keys().collect();
+    keys.sort();
+
+    for key in keys {
+        if let Some(value) = vars.get(key) {
+            content.push_str(&format!("{}={}\n", key, value));
+        }
+    }
+
+    std::fs::write(env_path, content).map_err(|e| format!("Failed to write .env: {}", e))
+}
+
+/// The canonical list of all settings with their metadata.
+fn get_all_setting_definitions() -> Vec<(String, String, SettingMeta)> {
+    vec![
+        // ── General ──
+        (
+            "MAX_TOKENS".into(),
+            get_env_or_default("MAX_TOKENS", "4096"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Maximum tokens per LLM response".into(),
+                options: None,
+                readonly: false,
+                default: Some("4096".into()),
+            },
+        ),
+        (
+            "TEMPERATURE".into(),
+            get_env_or_default("TEMPERATURE", "0.7"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "LLM sampling temperature (0.0 – 2.0)".into(),
+                options: None,
+                readonly: false,
+                default: Some("0.7".into()),
+            },
+        ),
+        (
+            "MAX_ITERATIONS".into(),
+            get_env_or_default("MAX_ITERATIONS", "60"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Maximum agent turns per thread before stopping".into(),
+                options: None,
+                readonly: false,
+                default: Some("60".into()),
+            },
+        ),
+        (
+            "LLM_MAX_TOKENS".into(),
+            get_env_or_default("LLM_MAX_TOKENS", "8192"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Maximum tokens for the LLM client".into(),
+                options: None,
+                readonly: false,
+                default: Some("8192".into()),
+            },
+        ),
+        // ── Planning (Prompt Graph) ──
+        (
+            "PROMPT_GRAPH_ENABLED".into(),
+            get_env_or_default("PROMPT_GRAPH_ENABLED", "false"),
+            SettingMeta {
+                field_type: "boolean".into(),
+                description: "Enable planning phase before execution".into(),
+                options: Some(vec![
+                    SettingOption { id: "true".into(), name: "Enabled".into() },
+                    SettingOption { id: "false".into(), name: "Disabled".into() },
+                ]),
+                readonly: false,
+                default: Some("false".into()),
+            },
+        ),
+        (
+            "PROMPT_GRAPH_MAX_TOKENS".into(),
+            get_env_or_default("PROMPT_GRAPH_MAX_TOKENS", "2048"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Maximum tokens for the planning LLM call".into(),
+                options: None,
+                readonly: false,
+                default: Some("2048".into()),
+            },
+        ),
+        (
+            "PROMPT_GRAPH_ITERATIONS".into(),
+            get_env_or_default("PROMPT_GRAPH_ITERATIONS", "0"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Planning refinement iterations (0 = one-shot)".into(),
+                options: None,
+                readonly: false,
+                default: Some("0".into()),
+            },
+        ),
+        // ── Memory & Retention ──
+        (
+            "SUMMARIZE_AFTER_DAYS".into(),
+            get_env_or_default("SUMMARIZE_AFTER_DAYS", "7"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Days of inactivity before auto-summarizing threads".into(),
+                options: None,
+                readonly: false,
+                default: Some("7".into()),
+            },
+        ),
+        (
+            "DELETE_AFTER_DAYS".into(),
+            get_env_or_default("DELETE_AFTER_DAYS", "30"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Days before old messages and summaries are deleted".into(),
+                options: None,
+                readonly: false,
+                default: Some("30".into()),
+            },
+        ),
+        (
+            "SUMMARY_WINDOW".into(),
+            get_env_or_default("SUMMARY_WINDOW", "10"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Threads per summary generation window".into(),
+                options: None,
+                readonly: false,
+                default: Some("10".into()),
+            },
+        ),
+        (
+            "SUMMARY_TOKENS".into(),
+            get_env_or_default("SUMMARY_TOKENS", "4096"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Maximum tokens for summary generation".into(),
+                options: None,
+                readonly: false,
+                default: Some("4096".into()),
+            },
+        ),
+        // ── LLM Provider ──
+        (
+            "LLM_PROVIDER".into(),
+            get_env_or_default("LLM_PROVIDER", "opencode-go"),
+            SettingMeta {
+                field_type: "select".into(),
+                description: "LLM provider backend".into(),
+                options: Some(vec![
+                    SettingOption { id: "opencode-go".into(), name: "OpenCode Go".into() },
+                    SettingOption { id: "openai".into(), name: "OpenAI".into() },
+                    SettingOption { id: "anthropic".into(), name: "Anthropic".into() },
+                    SettingOption { id: "deepseek".into(), name: "DeepSeek".into() },
+                ]),
+                readonly: false,
+                default: Some("opencode-go".into()),
+            },
+        ),
+        (
+            "LLM_MODEL".into(),
+            get_env_or_default("LLM_MODEL", "deepseek-v4-flash"),
+            SettingMeta {
+                field_type: "text".into(),
+                description: "Model name (e.g. deepseek-v4-flash, gpt-4)".into(),
+                options: None,
+                readonly: false,
+                default: Some("deepseek-v4-flash".into()),
+            },
+        ),
+        (
+            "LLM_BASE_URL".into(),
+            get_env_or_default("LLM_BASE_URL", ""),
+            SettingMeta {
+                field_type: "text".into(),
+                description: "Base URL for the LLM API".into(),
+                options: None,
+                readonly: false,
+                default: None,
+            },
+        ),
+        (
+            "LLM_API_KEY".into(),
+            get_env_or_default("LLM_API_KEY", ""),
+            SettingMeta {
+                field_type: "secret".into(),
+                description: "API key for the LLM provider".into(),
+                options: None,
+                readonly: false,
+                default: None,
+            },
+        ),
+        (
+            "DEEPSEEK_API_KEY".into(),
+            get_env_or_default("DEEPSEEK_API_KEY", ""),
+            SettingMeta {
+                field_type: "secret".into(),
+                description: "DeepSeek API key (fallback for LLM_API_KEY)".into(),
+                options: None,
+                readonly: false,
+                default: None,
+            },
+        ),
+        // ── System (read-only) ──
+        (
+            "HOST".into(),
+            get_env_or_default("HOST", "0.0.0.0"),
+            SettingMeta {
+                field_type: "text".into(),
+                description: "HTTP server bind address".into(),
+                options: None,
+                readonly: true,
+                default: Some("0.0.0.0".into()),
+            },
+        ),
+        (
+            "PORT".into(),
+            get_env_or_default("PORT", "8080"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "HTTP server port".into(),
+                options: None,
+                readonly: true,
+                default: Some("8080".into()),
+            },
+        ),
+        (
+            "QDRANT_URL".into(),
+            get_env_or_default("QDRANT_URL", "http://qdrant:6333"),
+            SettingMeta {
+                field_type: "text".into(),
+                description: "Qdrant vector database URL".into(),
+                options: None,
+                readonly: true,
+                default: Some("http://qdrant:6333".into()),
+            },
+        ),
+        (
+            "OMNI_DATA_DIR".into(),
+            get_env_or_default("OMNI_DATA_DIR", "/opt/data"),
+            SettingMeta {
+                field_type: "text".into(),
+                description: "Data directory for profiles and wiki".into(),
+                options: None,
+                readonly: true,
+                default: Some("/opt/data".into()),
+            },
+        ),
+        (
+            "WORKSPACE_DIR".into(),
+            get_env_or_default("WORKSPACE_DIR", "/opt/workspace"),
+            SettingMeta {
+                field_type: "text".into(),
+                description: "Workspace directory for projects".into(),
+                options: None,
+                readonly: true,
+                default: Some("/opt/workspace".into()),
+            },
+        ),
+    ]
+}
+
+/// Get env var value or default, checking both in-process env and .env file.
+fn get_env_or_default(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Organize setting definitions into categories.
+fn categorize_settings(defs: Vec<(String, String, SettingMeta)>) -> Vec<SettingCategory> {
+    let mut categories: Vec<SettingCategory> = vec![
+        SettingCategory {
+            name: "general".into(),
+            label: "General".into(),
+            settings: vec![],
+        },
+        SettingCategory {
+            name: "planning".into(),
+            label: "Planning".into(),
+            settings: vec![],
+        },
+        SettingCategory {
+            name: "memory".into(),
+            label: "Memory & Retention".into(),
+            settings: vec![],
+        },
+        SettingCategory {
+            name: "llm".into(),
+            label: "LLM Provider".into(),
+            settings: vec![],
+        },
+        SettingCategory {
+            name: "system".into(),
+            label: "System".into(),
+            settings: vec![],
+        },
+    ];
+
+    for (name, value, meta) in defs {
+        let cat_name = match name.as_str() {
+            "MAX_TOKENS" | "TEMPERATURE" | "MAX_ITERATIONS" | "LLM_MAX_TOKENS" => "general",
+            "PROMPT_GRAPH_ENABLED"
+            | "PROMPT_GRAPH_MAX_TOKENS"
+            | "PROMPT_GRAPH_ITERATIONS" => "planning",
+            "SUMMARIZE_AFTER_DAYS"
+            | "DELETE_AFTER_DAYS"
+            | "SUMMARY_WINDOW"
+            | "SUMMARY_TOKENS" => "memory",
+            "LLM_PROVIDER"
+            | "LLM_MODEL"
+            | "LLM_BASE_URL"
+            | "LLM_API_KEY"
+            | "DEEPSEEK_API_KEY" => "llm",
+            _ => "system",
+        };
+
+        if let Some(cat) = categories.iter_mut().find(|c| c.name == cat_name) {
+            cat.settings.push(SettingEntry {
+                name,
+                value,
+                metadata: meta,
+            });
+        }
+    }
+
+    categories.retain(|c| !c.settings.is_empty());
+    categories
+}
+
+// ── Handlers ──
+
+/// GET /settings — return all settings organized by category.
+async fn get_settings_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<SettingsResponse> {
+    // Reload .env file to get current values, then merge with defaults
+    let env_vars = load_env_file(&state.env_path);
+
+    let defs: Vec<(String, String, SettingMeta)> = get_all_setting_definitions()
+        .into_iter()
+        .map(|(name, _default_value, meta)| {
+            // Check .env first, then process env, then default
+            let value = env_vars
+                .get(&name)
+                .cloned()
+                .or_else(|| std::env::var(&name).ok())
+                .unwrap_or_else(|| meta.default.clone().unwrap_or_default());
+            (name, value, meta)
+        })
+        .collect();
+
+    Json(SettingsResponse {
+        categories: categorize_settings(defs),
+    })
+}
+
+/// PUT /settings — update one or more settings and write to .env.
+async fn update_settings_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<UpdateSettingsRequest>,
+) -> impl IntoResponse {
+    if body.updates.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "No updates provided" })),
+        );
+    }
+
+    let mut env_vars = load_env_file(&state.env_path);
+
+    // Known writable setting names for validation
+    let writable_keys: std::collections::HashSet<&str> = [
+        "MAX_TOKENS",
+        "TEMPERATURE",
+        "MAX_ITERATIONS",
+        "LLM_MAX_TOKENS",
+        "PROMPT_GRAPH_ENABLED",
+        "PROMPT_GRAPH_MAX_TOKENS",
+        "PROMPT_GRAPH_ITERATIONS",
+        "SUMMARIZE_AFTER_DAYS",
+        "DELETE_AFTER_DAYS",
+        "SUMMARY_WINDOW",
+        "SUMMARY_TOKENS",
+        "LLM_PROVIDER",
+        "LLM_MODEL",
+        "LLM_BASE_URL",
+        "LLM_API_KEY",
+        "DEEPSEEK_API_KEY",
+    ]
+    .into_iter()
+    .collect();
+
+    let mut applied: Vec<String> = Vec::new();
+
+    for update in &body.updates {
+        if !writable_keys.contains(update.name.as_str()) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": format!("Setting '{}' is read-only", update.name),
+                    "field": update.name,
+                })),
+            );
+        }
+        env_vars.insert(update.name.clone(), update.value.clone());
+        applied.push(update.name.clone());
+    }
+
+    match write_env_file(&state.env_path, &env_vars) {
+        Ok(()) => {
+            tracing::info!("Settings updated: {:?}", applied);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "updated": applied,
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::error!("Failed to write .env: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+        }
+    }
+}

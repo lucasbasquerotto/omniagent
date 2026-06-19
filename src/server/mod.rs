@@ -335,11 +335,13 @@ async fn prompt_preview_handler(
 
         let provider_name = channel.current_provider.clone()
             .filter(|s| !s.is_empty())
+            .or_else(|| prof.provider.clone().filter(|s| !s.is_empty()))
             .or_else(|| std::env::var("LLM_PROVIDER").ok().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "opencode-go".to_string());
 
         let model_name = channel.current_model.clone()
             .filter(|s| !s.is_empty())
+            .or_else(|| prof.model.clone().filter(|s| !s.is_empty()))
             .or_else(|| std::env::var("LLM_MODEL").ok().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "deepseek-v4-flash".to_string());
 

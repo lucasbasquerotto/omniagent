@@ -333,22 +333,49 @@ async fn prompt_preview_handler(
         let prof = profile_registry.get(profile_name).cloned()
             .unwrap_or_else(|| crate::profile::Profile::default(profile_name));
 
-        let provider_name = channel.current_provider.clone()
+        let provider_name = match channel.current_provider.clone()
             .filter(|s| !s.is_empty())
             .or_else(|| prof.provider.clone().filter(|s| !s.is_empty()))
             .or_else(|| std::env::var("LLM_PROVIDER").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "opencode-go".to_string());
+        {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "No LLM provider configured — set LLM_PROVIDER env var or configure channel/provider profile"
+                    })),
+                );
+            }
+        };
 
-        let model_name = channel.current_model.clone()
+        let model_name = match channel.current_model.clone()
             .filter(|s| !s.is_empty())
             .or_else(|| prof.model.clone().filter(|s| !s.is_empty()))
             .or_else(|| std::env::var("LLM_MODEL").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "deepseek-v4-flash".to_string());
+        {
+            Some(m) => m,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "No LLM model configured — set LLM_MODEL env var or configure channel/model profile"
+                    })),
+                );
+            }
+        };
 
         // Resolve provider enum for the resolved provider name
         let resolved_provider: crate::llm::ProviderKind = match provider_name.parse() {
             Ok(p) => p,
-            Err(_) => crate::llm::ProviderKind::OpenCodeGo,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Unknown LLM provider: '{}'", provider_name)
+                    })),
+                );
+            }
         };
 
         // Build planning prompt

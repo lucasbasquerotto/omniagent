@@ -1,8 +1,4 @@
-//! Telegram platform — outbound message delivery to Telegram.
-//!
-//! **Inbound** (receiving messages from Telegram) is disabled by design.
-//! The user will add a webhook endpoint, websocket relay, or another
-//! mechanism later.
+//! Telegram platform — outbound + optional inbound message delivery.
 //!
 //! **Outbound** (sending agent responses to Telegram) runs in the `start()`
 //! loop.  It polls the `messages` table for new rows belonging to the
@@ -22,6 +18,14 @@
 //!   - On first tool call: send "⌛ 1/N"
 //!   - On subsequent tool calls in same thread: edit to "⌛ N/M"
 //!   - When summary arrives: delete progress message (summary is already a reply)
+//!
+//! **Inbound** is OFF by default.  Two transport options are implemented but
+//! disabled behind env-var gates for future use:
+//!
+//! 1. **Long polling** (`TELEGRAM_POLLING_ENABLED=true`): polls `getUpdates`
+//!    and inserts new messages as pending threads.
+//! 2. **WebSocket** (`TELEGRAM_WS_URL` set): connects to a WebSocket bridge
+//!    that relays Telegram updates (e.g. via tdlib or a bot-api gateway).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -48,6 +52,8 @@ impl TelegramBotClient {
             api_base: format!("https://api.telegram.org/bot{}", bot_token),
         }
     }
+
+    // ── Outbound ─────────────────────────────────────────────────────────
 
     /// Send a new text message to a chat.
     async fn send_message(
@@ -104,7 +110,6 @@ impl TelegramBotClient {
             .send()
             .await?;
 
-        // editMessageText returns the edited message on success
         Self::extract_message_id(resp).await
     }
 
@@ -126,10 +131,43 @@ impl TelegramBotClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            // Deleting a message that doesn't exist is fine — ignore
             tracing::warn!("deleteMessage returned {}: {}", status, text);
         }
         Ok(())
+    }
+
+    // ── Inbound (polling) ────────────────────────────────────────────────
+
+    /// Poll `getUpdates` for new messages since the given offset.
+    /// Returns a list of Telegram Update objects.
+    /// The `offset` is the last processed `update_id` + 1 (paging mechanism).
+    #[allow(dead_code)]
+    async fn get_updates(&self, offset: Option<i64>, timeout_secs: u32) -> Result<Vec<serde_json::Value>> {
+        let mut body = serde_json::json!({
+            "timeout": timeout_secs,
+            "allowed_updates": ["message"],
+        });
+        if let Some(off) = offset {
+            body["offset"] = serde_json::json!(off);
+        }
+
+        let resp = self
+            .http_client
+            .post(format!("{}/getUpdates", self.api_base))
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+
+        if !status.is_success() || !body["ok"].as_bool().unwrap_or(false) {
+            let desc = body["description"].as_str().unwrap_or("unknown error");
+            anyhow::bail!("Telegram getUpdates error ({}): {}", status, desc);
+        }
+
+        let result = body["result"].as_array().cloned().unwrap_or_default();
+        Ok(result)
     }
 
     /// Extract the `message_id` from a Telegram Bot API response.
@@ -217,91 +255,44 @@ async fn process_outbound(
 
         match msg.msg_type.as_str() {
             "tool_result" => {
-                // Tool results are never user-facing — skip entirely.
                 state.last_processed_id = msg_id;
                 continue;
             }
 
             "tool" => {
-                // Tool call — edit the thread's tool message.
                 let tool_name = msg.msg_subtype.as_deref().unwrap_or("unknown");
                 let line = format!("🔧 tool:{}", tool_name);
 
-                // First tool call in this thread — send a new message.
-                // Subsequent tool calls — append to the existing message.
                 if let Some(edit_msg_id) = state.tool_edit_ids.get(&thread_id) {
-                    // Edit the existing message to append this tool call.
-                    // We store the accumulated tool list in the edit message.
-                    // Fetch the current text, append the new tool.
-                    // Actually, we track tools in a per-thread list.
-                    match bot.edit_message_text(
-                        &state.chat_id,
-                        *edit_msg_id,
-                        &line,
-                        None,
-                    )
-                    .await
-                    {
+                    match bot.edit_message_text(&state.chat_id, *edit_msg_id, &line, None).await {
                         Ok(_) => {
                             state.tool_edit_ids.insert(thread_id, *edit_msg_id);
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "Failed to edit tool message for thread {}: {:?}",
-                                thread_id,
-                                e
-                            );
-                            // Message may have been deleted — send fresh.
-                            match bot
-                                .send_message(&state.chat_id, &line, None, None, true)
-                                .await
-                            {
+                            tracing::warn!("Failed to edit tool message for thread {}: {:?}", thread_id, e);
+                            match bot.send_message(&state.chat_id, &line, None, None, true).await {
                                 Ok(new_id) => {
                                     state.tool_edit_ids.insert(thread_id, new_id);
-
-                                    // Progress flag: first tool call in a fresh thread
-                                    if state.progress_enabled
-                                        && !state.progress_msg_ids.contains_key(&thread_id)
-                                    {
-                                        send_progress(
-                                            bot,
-                                            state,
-                                            thread_id,
-                                            1,
-                                        )
-                                        .await;
+                                    if state.progress_enabled && !state.progress_msg_ids.contains_key(&thread_id) {
+                                        send_progress(bot, state, thread_id, 1).await;
                                     }
                                 }
                                 Err(e2) => {
-                                    tracing::error!(
-                                        "Failed to send tool message for thread {}: {:?}",
-                                        thread_id,
-                                        e2
-                                    );
+                                    tracing::error!("Failed to send tool message for thread {}: {:?}", thread_id, e2);
                                 }
                             }
                         }
                     }
                 } else {
-                    // First tool call in this thread — send new message.
-                    match bot
-                        .send_message(&state.chat_id, &line, None, None, true)
-                        .await
-                    {
+                    match bot.send_message(&state.chat_id, &line, None, None, true).await {
                         Ok(new_id) => {
                             state.tool_edit_ids.insert(thread_id, new_id);
-
-                            // Progress flag: first iteration
                             if state.progress_enabled {
                                 send_progress(bot, state, thread_id, 1).await;
                             }
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "Failed to send initial tool message for thread {}: {:?}",
-                                thread_id,
-                                e
-                            );
+                            tracing::error!("Failed to send initial tool message for thread {}: {:?}", thread_id, e);
                         }
                     }
                 }
@@ -309,96 +300,50 @@ async fn process_outbound(
             }
 
             "reasoning" => {
-                // Send as new isolated message (quiet).
                 if !msg.content.trim().is_empty() {
-                    if let Err(e) = bot
-                        .send_message(&state.chat_id, &msg.content, None, None, true)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to send reasoning for thread {}: {:?}",
-                            thread_id,
-                            e
-                        );
+                    if let Err(e) = bot.send_message(&state.chat_id, &msg.content, None, None, true).await {
+                        tracing::warn!("Failed to send reasoning for thread {}: {:?}", thread_id, e);
                     }
                 }
                 state.last_processed_id = msg_id;
             }
 
             "message" | "plan" => {
-                // Send as new isolated message (notifiable).
                 if !msg.content.trim().is_empty() {
-                    if let Err(e) = bot
-                        .send_message(&state.chat_id, &msg.content, None, None, false)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to send {} for thread {}: {:?}",
-                            msg.msg_type,
-                            thread_id,
-                            e
-                        );
+                    if let Err(e) = bot.send_message(&state.chat_id, &msg.content, None, None, false).await {
+                        tracing::warn!("Failed to send {} for thread {}: {:?}", msg.msg_type, thread_id, e);
                     }
                 }
                 state.last_processed_id = msg_id;
             }
 
             "summary" => {
-                // Send as reply to the original user message.
                 if let Some(ref reply_external_id) = msg.cause_external_id {
                     let reply_id: i64 = match reply_external_id.parse() {
                         Ok(id) => id,
                         Err(_) => {
-                            tracing::warn!(
-                                "Invalid cause external_id '{}' for thread {}",
-                                reply_external_id,
-                                thread_id
-                            );
+                            tracing::warn!("Invalid cause external_id '{}' for thread {}", reply_external_id, thread_id);
                             state.last_processed_id = msg_id;
                             continue;
                         }
                     };
 
-                    // Clean up progress message if enabled
                     if state.progress_enabled {
                         if let Some(progress_id) = state.progress_msg_ids.remove(&thread_id) {
                             let _ = bot.delete_message(&state.chat_id, progress_id).await;
                         }
                     }
-
-                    // Clean up tool edit message (no longer needed)
                     state.tool_edit_ids.remove(&thread_id);
 
                     if !msg.content.trim().is_empty() {
-                        if let Err(e) = bot
-                            .send_message(
-                                &state.chat_id,
-                                &msg.content,
-                                None,
-                                Some(reply_id),
-                                false,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to send summary reply for thread {}: {:?}",
-                                thread_id,
-                                e
-                            );
+                        if let Err(e) = bot.send_message(&state.chat_id, &msg.content, None, Some(reply_id), false).await {
+                            tracing::warn!("Failed to send summary reply for thread {}: {:?}", thread_id, e);
                         }
                     }
                 } else {
-                    // No reply target — send as isolated message.
                     if !msg.content.trim().is_empty() {
-                        if let Err(e) = bot
-                            .send_message(&state.chat_id, &msg.content, None, None, false)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to send summary (no reply target) for thread {}: {:?}",
-                                thread_id,
-                                e
-                            );
+                        if let Err(e) = bot.send_message(&state.chat_id, &msg.content, None, None, false).await {
+                            tracing::warn!("Failed to send summary (no reply target) for thread {}: {:?}", thread_id, e);
                         }
                     }
                 }
@@ -406,29 +351,16 @@ async fn process_outbound(
             }
 
             "error" => {
-                // Send as new isolated message (notifiable).
                 if !msg.content.trim().is_empty() {
-                    if let Err(e) = bot
-                        .send_message(&state.chat_id, &msg.content, None, None, false)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to send error for thread {}: {:?}",
-                            thread_id,
-                            e
-                        );
+                    if let Err(e) = bot.send_message(&state.chat_id, &msg.content, None, None, false).await {
+                        tracing::warn!("Failed to send error for thread {}: {:?}", thread_id, e);
                     }
                 }
                 state.last_processed_id = msg_id;
             }
 
             _ => {
-                // Unknown type — skip but advance cursor.
-                tracing::debug!(
-                    "Skipping unsupported msg_type '{}' for message {}",
-                    msg.msg_type,
-                    msg_id
-                );
+                tracing::debug!("Skipping unsupported msg_type '{}' for message {}", msg.msg_type, msg_id);
                 state.last_processed_id = msg_id;
             }
         }
@@ -443,46 +375,19 @@ async fn send_progress(bot: &TelegramBotClient, state: &mut ChannelState, thread
     let text = format!("⌛ {}/{}", current, total);
 
     if let Some(progress_id) = state.progress_msg_ids.get(&thread_id) {
-        // Edit existing progress message
-        match bot
-            .edit_message_text(&state.chat_id, *progress_id, &text, None)
-            .await
-        {
+        match bot.edit_message_text(&state.chat_id, *progress_id, &text, None).await {
             Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to edit progress for thread {}: {:?}",
-                    thread_id,
-                    e
-                );
-            }
+            Err(e) => tracing::warn!("Failed to edit progress for thread {}: {:?}", thread_id, e),
         }
     } else {
-        // Send new progress message
-        match bot
-            .send_message(&state.chat_id, &text, None, None, true)
-            .await
-        {
-            Ok(new_id) => {
-                state.progress_msg_ids.insert(thread_id, new_id);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to send progress for thread {}: {:?}",
-                    thread_id,
-                    e
-                );
-            }
+        match bot.send_message(&state.chat_id, &text, None, None, true).await {
+            Ok(new_id) => { state.progress_msg_ids.insert(thread_id, new_id); }
+            Err(e) => tracing::warn!("Failed to send progress for thread {}: {:?}", thread_id, e),
         }
     }
 }
 
 /// Fetch messages that haven't been sent to Telegram yet.
-///
-/// Returns messages with `id > last_processed_id` that belong to the
-/// telegram channel, ordered by `id ASC`.  Each row also carries the
-/// cause message's `external_id` so we know which Telegram message to
-/// reply to for summaries.
 async fn fetch_unsent_messages(
     pool: &PgPool,
     channel_id: i64,
@@ -532,12 +437,187 @@ async fn fetch_unsent_messages(
     }).collect())
 }
 
-/// Find or create the telegram channel in the DB.
+// ---------------------------------------------------------------------------
+// Inbound: Long polling (getUpdates)
+// ---------------------------------------------------------------------------
+
+/// Process inbound messages via Telegram Bot API long polling.
+///
+/// Runs in a loop, calling `getUpdates` with a long timeout.  Each new
+/// message in the configured chat is inserted as a seq-0 pending thread
+/// into the database for the agent to pick up.
+///
+/// **Disabled by default** — enable via `TELEGRAM_POLLING_ENABLED=true`.
+#[allow(dead_code)]
+async fn inbound_polling_loop(
+    bot: TelegramBotClient,
+    pool: PgPool,
+    chat_id: String,
+    db_channel_id: i64,
+) {
+    tracing::info!("Telegram inbound polling started for chat_id={}", chat_id);
+
+    let mut offset: Option<i64> = None;
+
+    loop {
+        match bot.get_updates(offset, 30).await {
+            Ok(updates) => {
+                for update in &updates {
+                    let update_id = update["update_id"].as_i64().unwrap_or(0);
+
+                    // Extract the message from the update
+                    let msg = match update.get("message") {
+                        Some(m) => m,
+                        None => {
+                            offset = Some(update_id + 1);
+                            continue;
+                        }
+                    };
+
+                    // Only process messages from our configured chat
+                    let msg_chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
+                    let msg_chat_id_str = msg_chat_id.to_string();
+                    if msg_chat_id_str != chat_id {
+                        offset = Some(update_id + 1);
+                        continue;
+                    }
+
+                    // Extract text content
+                    let text = msg["text"].as_str().unwrap_or("").to_string();
+                    if text.is_empty() {
+                        offset = Some(update_id + 1);
+                        continue;
+                    }
+
+                    let telegram_msg_id = msg["message_id"].as_i64().unwrap_or(0);
+
+                    tracing::info!(
+                        "Inbound Telegram message from chat {}: {}",
+                        msg_chat_id,
+                        text.chars().take(100).collect::<String>()
+                    );
+
+                    // Insert as a new thread into the DB
+                    if let Err(e) = insert_inbound_message(&pool, db_channel_id, &text, telegram_msg_id).await {
+                        tracing::error!("Failed to insert inbound message: {:?}", e);
+                    }
+
+                    offset = Some(update_id + 1);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Telegram inbound polling error: {:?}", e);
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Insert a message received from Telegram as a new pending thread.
+async fn insert_inbound_message(
+    pool: &PgPool,
+    channel_id: i64,
+    text: &str,
+    telegram_msg_id: i64,
+) -> Result<()> {
+    // Get the channel's current_profile for stamping
+    let channel = crate::db::types::get_channel_by_id(pool, channel_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Channel {} not found", channel_id))?;
+
+    let profile_name = channel.current_profile;
+    let provider = channel.current_provider.unwrap_or_else(|| {
+        std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "opencode-go".to_string())
+    });
+    let model = channel.current_model.unwrap_or_else(|| {
+        std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())
+    });
+
+    // Create a new thread
+    let thread = crate::db::types::create_thread(
+        pool,
+        "user",
+        channel_id,
+        &profile_name,
+        Some(&provider),
+        Some(&model),
+    )
+    .await?;
+
+    // Insert the seq-0 user/cause message
+    let msg = crate::models::MessageNew {
+        thread_id: thread.id,
+        role: "cause".to_string(),
+        content: text.to_string(),
+        thread_sequence: 0,
+        external_id: Some(telegram_msg_id.to_string()),
+        metadata: serde_json::json!({
+            "telegram_chat_id": channel.external_id,
+            "telegram_msg_id": telegram_msg_id,
+        }),
+        embedding: None,
+        summary_text: None,
+        is_summary: false,
+        msg_type: "message".to_string(),
+        msg_subtype: None,
+        processing_time_ms: None,
+        token_usage: None,
+    };
+
+    crate::db::types::create_cause_and_set_pending(pool, &msg).await?;
+
+    tracing::info!(
+        "Created thread {} for inbound Telegram msg_id={}",
+        thread.id,
+        telegram_msg_id
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Inbound: WebSocket bridge
+// ---------------------------------------------------------------------------
+
+/// WebSocket inbound loop.
+///
+/// Connects to a WebSocket bridge that relays Telegram message events.
+/// The bridge is expected to send JSON-encoded messages matching the
+/// Telegram Bot API Update schema on each frame.
+///
+/// **Disabled by default** — configure via `TELEGRAM_WS_URL` env var.
+///
+/// This is a stub/placeholder.  A real implementation would:
+/// 1. Connect to the WS endpoint using tokio-tungstenite.
+/// 2. Read JSON frames and convert them into inbound message inserts.
+/// 3. Reconnect on disconnection with exponential backoff.
+#[allow(dead_code)]
+async fn inbound_websocket_loop(
+    _pool: PgPool,
+    _db_channel_id: i64,
+    ws_url: String,
+) {
+    tracing::info!(
+        "Telegram WebSocket inbound configured (url={}) — not yet implemented, staying alive",
+        ws_url
+    );
+
+    // Keep the task alive as a placeholder.
+    // When implementing: use tokio_tungstenite::connect_async() and
+    // read messages from the stream, calling insert_inbound_message() for each.
+    futures::future::pending::<()>().await;
+}
+
+// ---------------------------------------------------------------------------
+// Find or create the Telegram channel in the DB
+// ---------------------------------------------------------------------------
+
 async fn find_or_create_channel(
     pool: &PgPool,
     chat_id: &str,
 ) -> Result<i64> {
-    // Try to find existing channel
     #[derive(Debug, sqlx::FromRow)]
     struct ChannelRow {
         id: i64,
@@ -559,7 +639,6 @@ async fn find_or_create_channel(
         return Ok(row.id);
     }
 
-    // Create new channel
     let channel = crate::db::types::create_channel(
         pool,
         &format!("telegram-{}", chat_id),
@@ -569,12 +648,7 @@ async fn find_or_create_channel(
     )
     .await?;
 
-    tracing::info!(
-        "Created telegram channel '{}' (id={}) in DB",
-        channel.name,
-        channel.id
-    );
-
+    tracing::info!("Created telegram channel '{}' (id={}) in DB", channel.name, channel.id);
     Ok(channel.id)
 }
 
@@ -582,16 +656,10 @@ async fn find_or_create_channel(
 // TelegramPlatform
 // ---------------------------------------------------------------------------
 
-/// Telegram outbound delivery platform.
-///
-/// The platform stays alive in `start()` and polls the DB for new completed
-/// messages in the Telegram channel.  It does NOT poll the Telegram API for
-/// inbound messages — that will be added later via webhook/websocket.
+/// Telegram platform for outbound delivery (always active when configured)
+/// and optional inbound via polling or WebSocket (both disabled by default).
 pub struct TelegramPlatform {
-    /// Bot API token.  Empty = disabled (stub mode).
     bot_token: String,
-    /// Chat ID to serve (e.g. "-1001234567890").
-    /// If empty, the platform stays in stub mode.
     chat_id: String,
 }
 
@@ -622,36 +690,57 @@ impl Platform for TelegramPlatform {
             return Ok(());
         }
 
-        tracing::info!(
-            "Telegram platform starting — serving chat_id '{}'",
-            self.chat_id
-        );
+        tracing::info!("Telegram platform starting — serving chat_id '{}'", self.chat_id);
 
         let bot = TelegramBotClient::new(&self.bot_token);
 
-        // Find or create the channel in DB
         let db_channel_id = match find_or_create_channel(&pool, &self.chat_id).await {
             Ok(id) => id,
             Err(e) => {
-                tracing::error!(
-                    "Failed to find/create telegram channel: {:?}",
-                    e
-                );
+                tracing::error!("Failed to find/create telegram channel: {:?}", e);
                 return Err(e);
             }
         };
 
-        // Load channel metadata
         let channel = crate::db::types::get_channel_by_id(&pool, db_channel_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Channel {} disappeared", db_channel_id))?;
 
-        // Load max_iterations from agent config
         let max_iterations = std::env::var("MAX_ITERATIONS")
             .unwrap_or_else(|_| "60".to_string())
             .parse::<u32>()
             .unwrap_or(60);
 
+        // ── Optional: Spawn inbound polling ──────────────────────────────
+        let polling_enabled = std::env::var("TELEGRAM_POLLING_ENABLED")
+            .unwrap_or_default()
+            .to_lowercase() == "true";
+
+        if polling_enabled {
+            let bot_clone = TelegramBotClient::new(&self.bot_token);
+            let pool_clone = pool.clone();
+            let chat_id = self.chat_id.clone();
+            tokio::spawn(async move {
+                inbound_polling_loop(bot_clone, pool_clone, chat_id, db_channel_id).await;
+            });
+            tracing::info!("Telegram inbound polling enabled");
+        } else {
+            tracing::info!("Telegram inbound polling disabled (set TELEGRAM_POLLING_ENABLED=true to enable)");
+        }
+
+        // ── Optional: Spawn inbound websocket ────────────────────────────
+        let ws_url = std::env::var("TELEGRAM_WS_URL").unwrap_or_default();
+        if !ws_url.is_empty() {
+            let pool_clone = pool.clone();
+            tokio::spawn(async move {
+                inbound_websocket_loop(pool_clone, db_channel_id, ws_url).await;
+            });
+            tracing::info!("Telegram WebSocket inbound configured via TELEGRAM_WS_URL");
+        } else {
+            tracing::debug!("Telegram WebSocket inbound not configured");
+        }
+
+        // ── Outbound state ───────────────────────────────────────────────
         let mut state = ChannelState::new(
             self.chat_id.clone(),
             db_channel_id,
@@ -665,7 +754,7 @@ impl Platform for TelegramPlatform {
             state.progress_enabled,
         );
 
-        // Outbound loop — poll DB for new messages and deliver to Telegram.
+        // ── Outbound loop — poll DB for new messages and deliver ─────────
         loop {
             if let Err(e) = process_outbound(&bot, &pool, &mut state).await {
                 tracing::error!("Telegram outbound processing error: {:?}", e);
@@ -675,8 +764,6 @@ impl Platform for TelegramPlatform {
     }
 
     async fn send_response(&self, _pool: &PgPool, _message_id: i64) -> Result<()> {
-        // Outbound delivery is handled by the polling loop in start().
-        // This method is a no-op.
         Ok(())
     }
 }

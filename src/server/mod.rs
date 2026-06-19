@@ -341,6 +341,12 @@ async fn prompt_preview_handler(
             .or_else(|| prof.model.clone())
             .unwrap_or_else(|| std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string()));
 
+        // Resolve provider enum for the resolved provider name
+        let resolved_provider: crate::llm::ProviderKind = match provider_name.parse() {
+            Ok(p) => p,
+            Err(_) => crate::llm::ProviderKind::OpenCodeGo,
+        };
+
         // Build planning prompt
         let planning_prompt = build_planning_prompt(
             &memory_store,
@@ -352,14 +358,32 @@ async fn prompt_preview_handler(
             None,
         );
 
-        // Create LLM client with the channel's config
-        let env_cfg = LLMConfig::from_env();
-        let llm_config = LLMConfig {
-            provider: provider_name.parse().unwrap_or(env_cfg.provider),
-            api_key: env_cfg.api_key,
-            base_url: env_cfg.base_url,
+        // Create LLM client — resolve base_url, api_key, and api_mode
+        // for the ACTUAL provider (channel > profile > env), not the
+        // env's default, so that e.g. a deepseek channel doesn't hit
+        // the opencode-go API with the wrong auth/format.
+        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match resolved_provider {
+            crate::llm::ProviderKind::OpenCodeGo => "https://opencode.ai/zen/go/v1".to_string(),
+            crate::llm::ProviderKind::OpenAI => "https://api.openai.com/v1".to_string(),
+            crate::llm::ProviderKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
+            crate::llm::ProviderKind::DeepSeek => "https://api.deepseek.com/v1".to_string(),
+        });
+        let api_key = match resolved_provider {
+            crate::llm::ProviderKind::DeepSeek => {
+                std::env::var("DEEPSEEK_API_KEY")
+                    .or_else(|_| std::env::var("LLM_API_KEY"))
+                    .unwrap_or_default()
+            }
+            _ => std::env::var("LLM_API_KEY").unwrap_or_default(),
+        };
+        let api_mode = crate::llm::ApiMode::resolve(resolved_provider, &model_name);
+
+        let llm_config = crate::llm::LLMConfig {
+            provider: resolved_provider,
+            api_key,
+            base_url,
             model: model_name,
-            api_mode: env_cfg.api_mode,
+            api_mode,
             max_tokens: 1024,
             temperature: 0.3,
         };

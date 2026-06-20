@@ -364,6 +364,19 @@ pub async fn create_cause_and_set_pending(pool: &PgPool, msg: &MessageNew) -> an
     .execute(&mut *tx)
     .await?;
 
+    // If the thread was skipped because the channel is closed, move the
+    // associated kanban task back to 'todo' so it can be retried later.
+    if thread_status == "skipped" {
+        let _ = sql_forge!(
+            "UPDATE kanban_tasks SET status = 'todo', updated_at = NOW() WHERE id = (
+                SELECT task_id FROM threads WHERE id = :tid AND task_id IS NOT NULL
+            )",
+            ( :tid = msg.thread_id )
+        )
+        .execute(&mut *tx)
+        .await;
+    }
+
     tx.commit().await?;
     saved.try_into()
 }
@@ -461,12 +474,36 @@ pub async fn complete_thread(
 
 /// Set all pending/processing threads for a channel to 'skipped'.
 pub async fn skip_channel_threads(pool: &PgPool, channel_id: i64) -> anyhow::Result<u64> {
+    // Mark all pending/processing threads as skipped
     let result = sql_forge!(
         "UPDATE threads SET status = 'skipped', ended_at = NOW(), terminal = true WHERE channel_id = :channel_id AND status IN ('pending', 'processing') AND NOT terminal",
         ( :channel_id = channel_id )
     )
     .execute(pool)
     .await?;
+
+    // Update associated kanban tasks:
+    // - pending (never started) → todo (can be retried)
+    // - processing (was started) → blocked (needs investigation)
+    let _ = sql_forge!(
+        "UPDATE kanban_tasks SET status = 'todo', updated_at = NOW() WHERE id IN (
+            SELECT task_id FROM threads
+            WHERE channel_id = :ch AND task_id IS NOT NULL AND status = 'pending'
+        ) AND status = 'ready'",
+        ( :ch = channel_id )
+    )
+    .execute(pool)
+    .await;
+
+    let _ = sql_forge!(
+        "UPDATE kanban_tasks SET status = 'blocked', updated_at = NOW() WHERE id IN (
+            SELECT task_id FROM threads
+            WHERE channel_id = :ch AND task_id IS NOT NULL AND status = 'processing'
+        ) AND status = 'running'",
+        ( :ch = channel_id )
+    )
+    .execute(pool)
+    .await;
 
     Ok(result.rows_affected())
 }

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 
 /// A profile defines the model, provider, data paths, and allowed tools
 /// for a given context (channel or direct prompt).
@@ -34,6 +36,36 @@ pub struct Profile {
 /// Default context budget for profiles that don't specify one.
 pub const PROMPT_BUDGET_DEFAULT: usize = 15_000;
 
+/// The list of all known tools — used for multi-select in the dashboard.
+pub const ALL_KNOWN_TOOLS: &[&str] = &[
+    "filesystem_read",
+    "filesystem_write",
+    "filesystem_list",
+    "filesystem_search",
+    "filesystem_info",
+    "fetch",
+    "search_messages",
+    "search_wiki",
+    "promote_to_memory",
+    "list_memories",
+    "review_memories",
+    "get_metrics",
+    "query_database",
+    "create_github_repo",
+    "clone_repo",
+    "commit_and_push",
+    "status",
+    "compose",
+];
+
+/// Schema for profiles/<name>/config.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+}
+
 impl Profile {
     /// Create a default profile with the given name.
     pub fn default(name: &str) -> Self {
@@ -45,33 +77,34 @@ impl Profile {
             api_key: None,
             max_tokens: None,
             temperature: None,
-            allowed_tools: vec![
-                "filesystem_read".to_string(),
-                "filesystem_write".to_string(),
-                "filesystem_list".to_string(),
-                "filesystem_search".to_string(),
-                "filesystem_info".to_string(),
-                "fetch".to_string(),
-                "search_messages".to_string(),
-                "search_wiki".to_string(),
-                "promote_to_memory".to_string(),
-                "list_memories".to_string(),
-                "review_memories".to_string(),
-                "get_metrics".to_string(),
-                "query_database".to_string(),
-                // Git tools (native)
-                "create_github_repo".to_string(),
-                "clone_repo".to_string(),
-                "commit_and_push".to_string(),
-                "status".to_string(),
-                // Docker compose (native)
-                "compose".to_string(),
-            ],
+            allowed_tools: ALL_KNOWN_TOOLS.iter().map(|s| s.to_string()).collect(),
             auto_retrieval_enabled: true,
             retrieval_aggressiveness: 2,
             grounding_required: false,
             prompt_budget: None, // uses PROMPT_BUDGET_DEFAULT (15,000)
         }
+    }
+
+    /// Load a profile config from `<data_dir>/profiles/<name>/config.json`.
+    /// Returns None if the file doesn't exist or can't be read.
+    pub fn load_config(data_dir: &str, name: &str) -> Option<ProfileConfig> {
+        let path: PathBuf = [data_dir, "profiles", name, "config.json"].iter().collect();
+        let content = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Apply a ProfileConfig on top of the default — fields from config override defaults.
+    pub fn with_config(mut self, config: ProfileConfig) -> Self {
+        if let Some(p) = config.provider {
+            self.provider = Some(p);
+        }
+        if let Some(m) = config.model {
+            self.model = Some(m);
+        }
+        if let Some(tools) = config.allowed_tools {
+            self.allowed_tools = tools;
+        }
+        self
     }
 
     /// Resolve the effective model, checking channel override first, then profile.
@@ -110,8 +143,37 @@ impl ProfileRegistry {
             default_profile: "default".to_string(),
             data_dir: data_dir.to_string(),
         };
+        registry.scan_filesystem();
         registry.ensure_default();
         registry
+    }
+
+    /// Scan the filesystem for profile directories and load config.json.
+    fn scan_filesystem(&mut self) {
+        let profiles_dir: PathBuf = [&self.data_dir, "profiles"].iter().collect();
+        if !profiles_dir.exists() {
+            return;
+        }
+        let entries = match fs::read_dir(&profiles_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let profile = if let Some(config) = Profile::load_config(&self.data_dir, &name) {
+                Profile::default(&name).with_config(config)
+            } else {
+                Profile::default(&name)
+            };
+            self.profiles.insert(name, profile);
+        }
     }
 
     /// Ensure the default profile exists.
@@ -137,5 +199,44 @@ impl ProfileRegistry {
         self.profiles
             .get("default")
             .expect("Default profile must exist")
+    }
+
+    /// List all profile names (filesystem directories).
+    pub fn list_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.profiles.keys().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_profile_has_all_tools() {
+        let p = Profile::default("test");
+        assert!(p.allowed_tools.contains(&"filesystem_read".to_string()));
+        assert!(p.allowed_tools.contains(&"compose".to_string()));
+        assert_eq!(p.allowed_tools.len(), ALL_KNOWN_TOOLS.len());
+    }
+
+    #[test]
+    fn test_profile_config_override() {
+        let profile = Profile::default("test").with_config(ProfileConfig {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-3".to_string()),
+            allowed_tools: Some(vec!["filesystem_read".to_string()]),
+        });
+        assert_eq!(profile.provider, Some("anthropic".to_string()));
+        assert_eq!(profile.model, Some("claude-3".to_string()));
+        assert_eq!(profile.allowed_tools, vec!["filesystem_read".to_string()]);
+    }
+
+    #[test]
+    fn test_registry_empty_data_dir() {
+        let registry = ProfileRegistry::new("/tmp/nonexistent");
+        assert!(registry.get("default").is_some());
+        assert!(registry.list_names().contains(&"default".to_string()));
     }
 }

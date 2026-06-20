@@ -330,7 +330,7 @@ async fn prompt_preview_handler(
     match queries::get_recent_channel_seq0_messages(&state.pool, channel.id, 5).await {
         Ok(msgs) if !msgs.is_empty() => {
             let recent_text: String = msgs.iter().rev().map(|msg| {
-                format!("[msg {}] {}: {}", msg.id, msg.role, msg.content.chars().take(200).collect::<String>())
+                format!("[msg {}] {}", msg.id, msg.content.chars().take(200).collect::<String>())
             }).collect::<Vec<_>>().join("\n");
             messages.push(serde_json::json!({ "role": "system", "content": format!("Recent conversations in this channel:\n{}", recent_text) }));
         }

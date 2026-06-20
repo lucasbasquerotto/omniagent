@@ -138,42 +138,21 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Drop base_path from profiles (path is derived as <data_dir>/profiles/<name>/)
-    sql_forge!(
-        r#"
-        ALTER TABLE profiles DROP COLUMN IF EXISTS base_path;
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Create profiles table
-    sql_forge!(
-        r#"
-        CREATE TABLE IF NOT EXISTS profiles (
-            id              BIGSERIAL PRIMARY KEY,
-            name            TEXT NOT NULL UNIQUE,
-            model           TEXT,
-            provider        TEXT,
-            base_url        TEXT,
-            api_key         TEXT,
-            max_tokens      INT,
-            temperature     DOUBLE PRECISION,
-            allowed_tools   JSONB DEFAULT '[]',
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
     // Migration: make thread_id nullable so seq-0 messages can be inserted
     // without a pre-determined thread_id, then set thread_id = id after insert.
     sql_forge!(
         r#"
         ALTER TABLE messages
         ALTER COLUMN thread_id DROP NOT NULL;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Drop profiles table — data now lives in profiles/<name>/config.json ──
+    sql_forge!(
+        r#"
+        DROP TABLE IF EXISTS profiles CASCADE;
         "#,
     )
     .execute(pool)

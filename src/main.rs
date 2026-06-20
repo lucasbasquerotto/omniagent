@@ -1052,13 +1052,10 @@ async fn handle_channel_command<R: std::io::BufRead + Unpin>(
                     }
                 };
 
-                // 1b. Show available profiles from DB + always include "default"
-                let db_profiles = db::types::find_all_profiles(pool).await?;
-                let mut profile_names: Vec<String> =
-                    db_profiles.iter().map(|p| p.name.clone()).collect();
-                if !profile_names.contains(&"default".to_string()) {
-                    profile_names.insert(0, "default".to_string());
-                }
+                // 1b. Show available profiles from filesystem
+                let data_dir = std::env::var("OMNI_DATA_DIR").unwrap_or_else(|_| "/opt/data".to_string());
+                let profile_registry = crate::profile::ProfileRegistry::new(&data_dir);
+                let profile_names = profile_registry.list_names();
 
                 println!("\nAvailable profiles:");
                 for (i, pn) in profile_names.iter().enumerate() {

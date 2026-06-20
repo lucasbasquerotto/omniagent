@@ -436,6 +436,32 @@ pub fn update_kanban_task_tool() -> McpTool {
                                     format!("Execute kanban task: {}", t.title)
                                 };
 
+                                // Check dependencies: task stays as "todo" until all deps are done/archived
+                                let blocked_deps: i64 = sql_forge!(
+                                    scalar i64,
+                                    r#"
+                                    SELECT COUNT(*)
+                                    FROM kanban_task_dependencies d
+                                    JOIN kanban_tasks t_dep ON t_dep.id = d.depends_on_id
+                                    WHERE d.task_id = :task_id
+                                      AND t_dep.status != 'done'
+                                      AND NOT t_dep.archived
+                                    "#,
+                                    ( :task_id = &t.id )
+                                )
+                                .fetch_one(&pool)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Failed to check dependencies for task '{}': {e}", t.id))?;
+
+                                if blocked_deps > 0 {
+                                    tracing::info!(
+                                        "Kanban task '{}' has {} unsatisfied dependencies — staying as todo",
+                                        t.id, blocked_deps
+                                    );
+                                    // Do not create thread or advance to ready
+                                    return Ok(());
+                                }
+
                                 // Create a thread with cause='kanban' and task_id linking to kanban task
                                 let thread = queries::create_thread(
                                     &pool,
@@ -560,6 +586,139 @@ pub fn delete_kanban_task_tool() -> McpTool {
             Ok(McpToolResult {
                 call_id: String::new(),
                 content: format!("Kanban task '{}' deleted successfully", id),
+                is_error: false,
+            })
+        }),
+    }
+}
+
+pub fn add_kanban_dependency_tool() -> McpTool {
+    McpTool {
+        name: "add_kanban_dependency".to_string(),
+        description: "Add a dependency from one kanban task to another. The dependent task will only proceed from todo to ready when the dependency is done or archived.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The task that depends on another"
+                },
+                "depends_on_id": {
+                    "type": "string",
+                    "description": "The task that must be completed first"
+                }
+            },
+            "required": ["task_id", "depends_on_id"]
+        }),
+        handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
+            let task_id = args["task_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'task_id'"))?;
+            let depends_on_id = args["depends_on_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'depends_on_id'"))?;
+
+            if task_id == depends_on_id {
+                anyhow::bail!("A task cannot depend on itself");
+            }
+
+            let pool = ctx.pool.clone();
+            let task_id_clone = task_id.to_string();
+            let depends_on_id_clone = depends_on_id.to_string();
+
+            tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    let exists: i64 = sql_forge!(
+                        scalar i64,
+                        "SELECT COUNT(*) FROM kanban_tasks WHERE id IN (:tid, :did)",
+                        ( :tid = &task_id_clone, :did = &depends_on_id_clone )
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to verify tasks: {e}"))?;
+
+                    if exists != 2 {
+                        anyhow::bail!("One or both kanban tasks not found");
+                    }
+
+                    sql_forge!(
+                        r#"
+                        INSERT INTO kanban_task_dependencies (task_id, depends_on_id)
+                        VALUES (:task_id, :depends_on_id)
+                        ON CONFLICT (task_id, depends_on_id) DO NOTHING
+                        "#,
+                        ( :task_id = &task_id_clone, :depends_on_id = &depends_on_id_clone )
+                    )
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to add dependency: {e}"))?;
+
+                    Ok::<_, anyhow::Error>(())
+                })
+            })?;
+
+            Ok(McpToolResult {
+                call_id: String::new(),
+                content: format!("Dependency added: '{}' now depends on '{}'", task_id, depends_on_id),
+                is_error: false,
+            })
+        }),
+    }
+}
+
+pub fn remove_kanban_dependency_tool() -> McpTool {
+    McpTool {
+        name: "remove_kanban_dependency".to_string(),
+        description: "Remove a dependency between two kanban tasks.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The dependent task"
+                },
+                "depends_on_id": {
+                    "type": "string",
+                    "description": "The task it no longer depends on"
+                }
+            },
+            "required": ["task_id", "depends_on_id"]
+        }),
+        handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
+            let task_id = args["task_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'task_id'"))?;
+            let depends_on_id = args["depends_on_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'depends_on_id'"))?;
+
+            let pool = ctx.pool.clone();
+            let task_id_clone = task_id.to_string();
+            let depends_on_id_clone = depends_on_id.to_string();
+
+            tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    let result = sql_forge!(
+                        "DELETE FROM kanban_task_dependencies WHERE task_id = :task_id AND depends_on_id = :depends_on_id",
+                        ( :task_id = &task_id_clone, :depends_on_id = &depends_on_id_clone )
+                    )
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to remove dependency: {e}"))?;
+
+                    if result.rows_affected() == 0 {
+                        anyhow::bail!("Dependency not found between '{}' and '{}'", task_id, depends_on_id);
+                    }
+
+                    Ok::<_, anyhow::Error>(())
+                })
+            })?;
+
+            Ok(McpToolResult {
+                call_id: String::new(),
+                content: format!("Dependency removed between '{}' and '{}'", task_id, depends_on_id),
                 is_error: false,
             })
         }),

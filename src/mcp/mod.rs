@@ -208,6 +208,8 @@ pub fn default_registry(ctx: &AppContext) -> McpRegistry {
     registry.register(tools::kanban::list_kanban_tasks_tool());
     registry.register(tools::kanban::update_kanban_task_tool());
     registry.register(tools::kanban::delete_kanban_task_tool());
+    registry.register(tools::kanban::add_kanban_dependency_tool());
+    registry.register(tools::kanban::remove_kanban_dependency_tool());
 
     // Cron tools
     registry.register(tools::cron::create_cron_job_tool());

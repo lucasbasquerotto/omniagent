@@ -29,10 +29,15 @@ Next-generation agent system built with Rust, PostgreSQL + pgvector, and MCP too
 - **Dynamic tool registry** — external tools auto-merge with built-in tools at startup
 - Configured via `MCP_SERVERS_CONFIG` env var or `<data_dir>/config/mcp-servers.json`
 
+### 🔐 Vault Integration
+- Secrets (e.g., `DEEPSEEK_API_KEY`) can be stored in **HashiCorp Vault** at `hermes-vault:8200`
+- A helper script at `/opt/data/scripts/inject-deepseek-key.py` reads from Vault path `kv/data/hermes-user` and injects into the environment
+- Enables secure key management without storing secrets in `.env` files
+
 ### Requirements
 
 - Docker & Docker Compose
-- An LLM API key (OpenCode Go, OpenAI, or Anthropic)
+- An LLM API key (OpenCode Go, OpenAI, Anthropic, or DeepSeek)
 
 ### Setup
 
@@ -47,7 +52,7 @@ Next-generation agent system built with Rust, PostgreSQL + pgvector, and MCP too
    cp .env.example .env
    ```
    Edit `.env` and set at minimum:
-   - `LLM_API_KEY` — your LLM provider API key
+   - `LLM_API_KEY` — your LLM provider API key (or use the Vault helper for DeepSeek)
    - `DATABASE_URL` — PostgreSQL connection string (default: `postgres://omniagent:***@postgres:5432/omniagent`)
 
 3. Start the stack:
@@ -71,11 +76,25 @@ curl http://localhost:8080/health
 
 Channels represent communication endpoints. Each channel has its own state, profile, and model configuration. The agent processes messages **sequentially within a channel** but **in parallel across channels**.
 
+### Channel Fields
+
+| Field | Description |
+|-------|-------------|
+| `name` | Human-readable channel name |
+| `platform` | Platform identifier (e.g., `telegram`, `api`, `cron`) |
+| `external_id` | Platform-specific address (chat ID, channel name, etc.) |
+| `resource_identifier` | Canonical resource address — used in (platform, resource_identifier) unique constraint |
+| `current_profile` | Profile to use for message processing |
+| `current_provider` | Provider override (overrides profile) |
+| `current_model` | Model override (overrides profile) |
+| `closed` | Boolean (default `false`). A closed channel retains history but **won't process new messages** |
+| `readonly` | Boolean (default `false`). Protects the channel from deletion |
+
 ### Creating a Channel
 
 ```sql
-INSERT INTO channels (name, platform, external_id, cause, current_profile)
-VALUES ('my-channel', 'api', 'my-channel-1', 'user', 'default');
+INSERT INTO channels (name, platform, external_id, resource_identifier, cause, current_profile)
+VALUES ('my-channel', 'api', 'my-channel-1', 'my-channel-1', 'user', 'default');
 ```
 
 Each channel can set a custom profile, provider, and model:
@@ -94,13 +113,41 @@ Channels can be marked as `readonly` (e.g., the default cron channel) to protect
 ALTER TABLE channels ADD COLUMN readonly BOOLEAN NOT NULL DEFAULT false;
 ```
 
+### Closed Channels
+
+Channels can be marked as `closed` (boolean, default `false`). A closed channel:
+- Retains all message history
+- Does **not** process new messages (they remain pending)
+- Can be reopened by setting `closed = false`
+
+```sql
+ALTER TABLE channels ADD COLUMN closed BOOLEAN NOT NULL DEFAULT false;
+```
+
+### Channel Subscriptions
+
+The `channel_subscriptions` table enables cross-platform listening:
+
+| Field | Description |
+|-------|-------------|
+| `channel_id` | The channel that receives updates |
+| `subscriber_platform` | Platform of the subscriber |
+| `subscriber_resource` | Resource identifier of the subscriber |
+
+A Telegram channel can subscribe to another channel's summaries — when a summary is generated, it's forwarded to the subscriber. The unique constraint is `(channel_id, subscriber_platform, subscriber_resource)`.
+
+```sql
+INSERT INTO channel_subscriptions (channel_id, subscriber_platform, subscriber_resource)
+VALUES (1, 'telegram', 'my-telegram-chat');
+```
+
 ## Profiles
 
 Profiles bundle model configuration, provider, and allowed tools. A `default` profile is created on first startup.
 
 Profile fields:
-- **provider** — LLM provider (e.g., `opencode-go`, `openai`, `anthropic`)
-- **model** — LLM model name (e.g., `deepseek-v4-flash`)
+- **provider** — LLM provider (e.g., `opencode-go`, `openai`, `anthropic`, `deepseek`)
+- **model** — LLM model name (e.g., `deepseek-v4-flash`, `claude-sonnet-4`)
 - **allowed_tools** — which MCP tools the agent can use
 
 ### Creating a Profile
@@ -158,19 +205,71 @@ Agent picks it up, marks as processing
   │
   ├─ LLM responds with text → saved as msg_type='message'
   ├─ LLM includes reasoning → saved as msg_type='reasoning' (separate row)
+  ├─ LLM plans next step → saved as msg_type='plan'
+  ├─ LLM calls tools in parallel → saved as msg_type='multi-tool'
   └─ LLM calls tools → tool executed, result fed back, loop continues
   │
   ▼
-Prompt marked as completed, processing_time_ms set
+Prompt marked as completed, processing_time_ms and token_usage set
 ```
+
+### Message Types
+
+| `msg_type` | Description |
+|------------|-------------|
+| `message` | Standard user or assistant message |
+| `cron` | Cron-triggered message |
+| `kanban` | Kanban-triggered message |
+| `tool` | Tool invocation |
+| `tool_result` | Tool execution result |
+| `reasoning` | LLM reasoning/thinking content |
+| `summary` | Thread summary |
+| `plan` | LLM planning or reasoning step |
+| `multi-tool` | Parallel tool calls from the LLM |
+| `error` | Processing error (see `msg_subtype` for error codes) |
+
+### Error Subtypes
+
+| `msg_subtype` | Description |
+|---------------|-------------|
+| `no-profile` | Profile field is empty |
+| `no-provider` | Provider field is empty |
+| `no-model` | Model field is empty |
+| `invalid-profile` | Profile does not exist in the registry |
+
+### Per-Message Timing and Token Usage
+
+Each message stores its own timing and token data:
+
+- **`processing_time_ms`**: Wall-clock time spent processing this message (stored per-message, not thread-level)
+- **`token_usage`**: JSONB object with:
+  - `prompt_tokens` — tokens in the prompt
+  - `completion_tokens` — tokens in the completion
+  - `cached_tokens` — tokens served from cache (if supported by provider)
+  - `reasoning_tokens` — tokens used for reasoning/thinking (if supported)
+
+```json
+{
+  "prompt_tokens": 1523,
+  "completion_tokens": 412,
+  "cached_tokens": 0,
+  "reasoning_tokens": 89
+}
+```
+
+### Startup Cleanup
+
+On startup, the agent runs `skip_on_startup()` which marks all messages with status `pending` or `processing` as `skipped`. This prevents messages from being stuck indefinitely after a container restart.
 
 ### Profile Resolution at Message Time
 
 When a message is created (seq-0), the `provider` and `model` fields are **stamped** on the message using this resolution chain:
-1. **Channel** `current_provider` / `current_model` (highest priority)
-2. **Profile** `provider` / `model` (if set in the profile file)
-3. **Environment variables** `LLM_PROVIDER` / `LLM_MODEL`
-4. **Built-in defaults** `opencode-go` / `deepseek-v4-flash`
+
+1. **Message** `profile` field (highest priority) — set per-message for cron/kanban tasks
+2. **Channel** `current_provider` / `current_model` / `current_profile`
+3. **Profile** `provider` / `model` (if set in the profile)
+4. **Environment variables** `LLM_PROVIDER` / `LLM_MODEL`
+5. **Built-in defaults** `opencode-go` / `deepseek-v4-flash`
 
 This happens at creation time for:
 - **User messages**: provider/model are stamped when the message is inserted
@@ -215,7 +314,16 @@ VALUES ('cron_abc123', 'hourly-report', 'Hourly Report', '0 0 * * * * *', 'Gener
 | `profile` | Profile to use (NULL = channel's current_profile) |
 | `schedule` | 7-field quartz cron expression |
 | `prompt` | The message content to execute |
+| `mode` | Execution mode: `agentic` (default) or `direct` |
+| `direct_task_type` | Task type for `direct` mode (e.g., `kanban_dispatcher`) |
 | `enabled` | Whether the job is active |
+| `active` | Whether the job is currently claimed by a scheduler |
+
+### Execution Modes
+
+- **`agentic`** (default): Normal cron agent execution — the prompt is sent to the LLM for processing, with full tool access and reasoning.
+- **`direct`**: Bypasses the LLM and runs a specific task directly. Currently supports:
+  - `kanban_dispatcher`: Moves kanban tasks from `todo` to `ready` status (ordered by priority then position), triggering execution of their body as the prompt.
 
 ### Scheduler
 
@@ -264,6 +372,18 @@ VALUES ('task_abc123', 'Research topic', 'Find latest papers on...', 'todo', 1, 
 | `done` | Completed |
 | `blocked` | Blocked by something |
 
+### Kanban Dispatcher
+
+When a cron job is configured with `mode='direct'` and `direct_task_type='kanban_dispatcher'`, it acts as a **kanban dispatcher**. On each tick:
+
+1. Queries all kanban tasks with `status = 'todo'`
+2. Orders them by `priority` (ascending, lower = higher priority), then by `position`
+3. Moves the first eligible task to `ready` status
+4. The task's `body` becomes the prompt for execution
+5. The task's `profile` field (or channel's current_profile) is used for resolution
+
+This enables periodic task processing without human intervention — a cron job can drip-feed todo items into the agent's queue.
+
 ### Channel and Profile Assignment
 
 Each kanban task can specify:
@@ -275,6 +395,27 @@ When a task is updated to `ready` status, the system:
 2. Resolves the profile (task's profile or channel's current_profile)
 3. Creates a pending seq-0 message with `msg_type='kanban'` and `msg_subtype=<task_id>`
 4. The agent processes the message like any other pending message
+
+## Memory Management
+
+Memory files are loaded from the profile's memory directory and included in context assembly during the **NeverTrim** priority tier.
+
+### Location
+
+```
+$OMNI_DATA_DIR/profiles/<name>/memories/
+  MEMORY.md      # Core memory file
+  SOUL.md        # Identity/persona file
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMORY_MAX_CHARS` | `5000` | Maximum characters in MEMORY.md |
+| `USER_MAX_CHARS` | `1000` | Maximum characters for user-specific memory |
+
+Memory files in the `memories/` directory are loaded and included in every context assembly at the highest priority (NeverTrim tier), ensuring they are always present in the system prompt regardless of token budget constraints.
 
 ## Stopping and Resuming
 
@@ -323,9 +464,11 @@ This will:
 | `DATABASE_URL` | `postgres://omniagent:***@postgres:5432/omniagent` | PostgreSQL connection string |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant endpoint |
 | `LLM_API_KEY` | — | API key for LLM provider |
-| `LLM_PROVIDER` | `opencode-go` | Provider: opencode-go, openai, anthropic |
+| `LLM_PROVIDER` | `opencode-go` | Provider: `opencode-go`, `openai`, `anthropic`, `deepseek` |
 | `LLM_MODEL` | `deepseek-v4-flash` | Default LLM model |
 | `LLM_BASE_URL` | *per provider* | API endpoint URL |
+| `DEEPSEEK_API_KEY` | — | DeepSeek-specific API key (sourced from Vault at `kv/data/hermes-user`) |
+| `DEEPSEEK_BASE_URL` | *default* | DeepSeek API endpoint base URL |
 | `MAX_TOKENS` | `4096` | Max response tokens |
 | `TEMPERATURE` | `0.7` | Sampling temperature |
 | `MAX_ITERATIONS` | `60` | Max agent turns per thread |
@@ -335,6 +478,19 @@ This will:
 | `MCP_SERVERS_CONFIG` | — | External MCP servers config file path |
 | `VECTORIZE_MESSAGES` | `false` | Enable message embedding generation |
 | `VECTORIZE_WIKI` | `false` | Enable wiki embedding generation |
+| `MEMORY_MAX_CHARS` | `5000` | Max characters in MEMORY.md |
+| `USER_MAX_CHARS` | `1000` | Max characters for user memory |
+
+### Settings Organization
+
+Environment variables are organized into categories:
+
+| Category | Variables |
+|----------|-----------|
+| **General** | `HOST`, `PORT`, `OMNI_DATA_DIR`, `QDRANT_URL`, `DELETE_AFTER_DAYS`, `MAX_ITERATIONS`, `MCP_SERVERS_CONFIG` |
+| **LLM** | `LLM_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, `LLM_BASE_URL`, `MAX_TOKENS`, `TEMPERATURE`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` |
+| **Memory** | `MEMORY_MAX_CHARS`, `USER_MAX_CHARS` |
+| **Retrieval** | `VECTORIZE_MESSAGES`, `VECTORIZE_WIKI` |
 
 ## API Endpoints
 
@@ -352,7 +508,71 @@ Resume processing for a stopped channel.
 
 ### `GET /prompt/{channel_name}`
 
-Show the system prompt that would be used for a given channel (for debugging).
+Show the raw system prompt that would be used for a given channel (for debugging).
+
+### `POST /prompt-preview/{channel_name}`
+
+Preview the assembled system prompt with a custom prompt and plan. Useful for testing context assembly without inserting a message.
+
+```bash
+curl -X POST http://localhost:8080/prompt-preview/my-channel \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What is the weather?", "plan": false}'
+```
+
+Returns:
+```json
+{
+  "system_prompt": "...",
+  "messages": [{ "role": "user", "content": "What is the weather?" }],
+  "plan": false
+}
+```
+
+### `GET /settings`
+
+Returns all configuration settings with metadata, organized by category.
+
+```bash
+curl http://localhost:8080/settings
+```
+
+Response:
+```json
+{
+  "General": [
+    {
+      "name": "HOST",
+      "value": "0.0.0.0",
+      "type": "string",
+      "description": "HTTP bind address",
+      "options": null,
+      "readonly": true,
+      "default": "0.0.0.0"
+    },
+    ...
+  ],
+  "LLM": [ ... ],
+  "Memory": [ ... ],
+  "Retrieval": [ ... ]
+}
+```
+
+Read-only settings (`HOST`, `PORT`, `QDRANT_URL`) are marked with `readonly: true` and cannot be modified via the API.
+
+### `PUT /settings`
+
+Update one or more settings. Writes changes back to the `.env` file.
+
+```bash
+curl -X PUT http://localhost:8080/settings \
+  -H "Content-Type: application/json" \
+  -d '{"updates": [{"name": "MAX_TOKENS", "value": "8192"}]}'
+```
+
+- Returns `200` with the updated settings list on success
+- Returns `403` if attempting to modify a read-only setting
+- Returns `404` if a setting name is not recognized
 
 ## Sending Messages
 
@@ -368,8 +588,26 @@ VALUES (1, 1, 0, 'user', 'Your prompt here', 'pending', 'message', 0, 'default')
 | Field | Description |
 |-------|-------------|
 | `profile` | Profile to use for processing (overrides channel's current_profile) |
-| `msg_type` | Type: `message`, `cron`, `kanban`, `tool`, `tool_result`, `reasoning`, `summary`, `plan` |
-| `msg_subtype` | For kanban/cron: stores the task/job ID |
+| `msg_type` | Type: `message`, `cron`, `kanban`, `tool`, `tool_result`, `reasoning`, `summary`, `plan`, `multi-tool`, `error` |
+| `msg_subtype` | For kanban/cron: stores the task/job ID. For errors: error code (`no-profile`, `no-provider`, `no-model`) |
+| `processing_time_ms` | Wall-clock time spent processing the message |
+| `token_usage` | JSONB: `{prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens}` |
+
+## CLI Commands
+
+### `/usage`
+
+Reads from the `threads` table to display token usage per channel and totals:
+
+```bash
+# Display token usage summary
+cargo run -- /usage
+```
+
+Output shows:
+- Token usage per channel (prompt + completion + cached + reasoning tokens)
+- Total token usage across all channels
+- Helps with cost tracking and monitoring
 
 ## Backup Container
 
@@ -428,6 +666,8 @@ $OMNI_DATA_DIR/
   config/
     mcp-servers.json    # External MCP server config (optional)
   tools/                # MCP tool definitions
+  scripts/
+    inject-deepseek-key.py  # Vault helper for DeepSeek API key injection
 ```
 
 ## Architecture Diagram
@@ -488,6 +728,7 @@ The binary reads `.env` automatically via `dotenvy`.
 | Processing stuck at `processing` | Container restarted mid-call | On restart, pending/processing messages are marked as skipped |
 | No model configured | Profile + channel both lack model | Set `current_model` on channel or `model` on profile |
 | Tools returning errors | Path outside data directory | Ensure file paths are under `OMNI_DATA_DIR` |
+| Settings write fails with 403 | Attempted to modify read-only setting | `HOST`, `PORT`, `QDRANT_URL` are read-only |
 
 ## Internal Docs
 
@@ -531,4 +772,4 @@ WHERE t.channel_id = <ch_id> ORDER BY t.id;"
 # Stop/Resume API
 curl http://localhost:8080/stop/<channel_id>
 curl http://localhost:8080/resume/<channel_id>"
-
+```

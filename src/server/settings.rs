@@ -538,6 +538,10 @@ async fn update_settings_handler(
             );
         }
         env_vars.insert(update.name.clone(), update.value.clone());
+        // Also set in the process environment so currently-running
+        // MemoryStore / future loads pick up the change immediately
+        // without requiring a container restart.
+        std::env::set_var(&update.name, &update.value);
         applied.push(update.name.clone());
     }
 

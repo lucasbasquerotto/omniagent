@@ -577,6 +577,7 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
             &profile_name,
             Some(&resolved_provider),
             Some(&resolved_model),
+            None,
         ).await?;
 
         let msg = models::MessageNew {
@@ -755,6 +756,7 @@ async fn get_or_create_thread(pool: &PgPool, channel_id: i64, profile_name: &str
         profile_name,
         Some(resolved_provider),
         Some(resolved_model),
+        None,
     ).await?;
 
     let root_msg = models::MessageNew {

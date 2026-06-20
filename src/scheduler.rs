@@ -131,6 +131,7 @@ async fn tick(pool: &PgPool, data_dir: &str) -> Result<()> {
             &profile_name,
             provider.as_deref(),
             model.as_deref(),
+            None,
         )
         .await
         {

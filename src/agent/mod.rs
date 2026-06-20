@@ -392,10 +392,19 @@ async fn channel_handler(
                         continue;
                     }
 
+                    // If this thread is linked to a kanban task, mark it as running
+                    if let Some(ref task_id) = thread.task_id {
+                        let _ = queries::update_kanban_status(&pool, task_id, "running").await;
+                    }
+
                     if let Err(e) = process_thread(&pool, &llm, &config, &mcp, &ctx, thread, &cause_msg).await {
                         error!("Failed to process thread {}: {:?}", thread.id, e);
                         // Mark thread as failed
                         let _ = queries::complete_thread(&pool, thread.id, "failed", 0, 0, 0, 0).await;
+                        // If this thread is linked to a kanban task, mark it as blocked
+                        if let Some(ref task_id) = thread.task_id {
+                            let _ = queries::update_kanban_status(&pool, task_id, "blocked").await;
+                        }
                     }
                 }
 
@@ -1665,6 +1674,16 @@ async fn process_thread(
     let final_status = if limit_reached { "interrupted" } else { "completed" };
 
     queries::complete_thread(pool, thread.id, final_status, 0, 0, 0, 0).await?;
+
+    // If this thread is linked to a kanban task, update its status
+    if let Some(ref task_id) = thread.task_id {
+        let kanban_status = if final_status == "completed" {
+            "review"
+        } else {
+            "blocked"
+        };
+        let _ = queries::update_kanban_status(pool, task_id, kanban_status).await;
+    }
 
     // 11. Trigger cross-thread summary check
     check_and_generate_summary(pool, llm, config, thread.channel_id).await;

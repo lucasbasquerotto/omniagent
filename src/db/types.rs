@@ -30,6 +30,7 @@ pub struct ThreadDb {
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub terminal: bool,
+    pub task_id: Option<String>,
 }
 
 impl TryFrom<ThreadDb> for Thread {
@@ -73,6 +74,7 @@ impl TryFrom<ThreadDb> for Thread {
                 None
             },
             terminal: db.terminal,
+            task_id: db.task_id,
         })
     }
 }
@@ -254,21 +256,22 @@ pub async fn create_thread(
     profile: &str,
     provider: Option<&str>,
     model: Option<&str>,
+    task_id: Option<&str>,
 ) -> anyhow::Result<Thread> {
     let row: ThreadDb = sql_forge!(
         ThreadDb,
         r#"
-        INSERT INTO threads (status, cause, channel_id, profile, provider, model)
-        VALUES ('created', :cause, :channel_id, :profile, NULLIF(:provider, '')::text, NULLIF(:model, '')::text)
+        INSERT INTO threads (status, cause, channel_id, profile, provider, model, task_id)
+        VALUES ('created', :cause, :channel_id, :profile, NULLIF(:provider, '')::text, NULLIF(:model, '')::text, NULLIF(:task_id, '')::text)
         RETURNING
-            id, status, cause, channel_id, profile, provider, model,
+            id, status, cause, channel_id, profile, provider, model, task_id,
             input_tokens, cached_tokens, output_tokens, duration_ms,
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
             ''::text AS "started_at",
             ''::text AS "ended_at",
             terminal
         "#,
-        ( :cause = cause, :channel_id = channel_id, :profile = profile, :provider = provider.unwrap_or(""), :model = model.unwrap_or("") )
+        ( :cause = cause, :channel_id = channel_id, :profile = profile, :provider = provider.unwrap_or(""), :model = model.unwrap_or(""), :task_id = task_id.unwrap_or("") )
     )
     .fetch_one(pool)
     .await?;
@@ -348,7 +351,7 @@ pub async fn find_pending_threads_by_channel(
         ThreadDb,
         r#"
         SELECT
-            id, status, cause, channel_id, profile, provider, model,
+            id, status, cause, channel_id, profile, provider, model, task_id,
             input_tokens, cached_tokens, output_tokens, duration_ms,
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
             COALESCE(TO_CHAR(started_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "started_at",
@@ -453,6 +456,17 @@ pub async fn count_thread_messages(pool: &PgPool, thread_id: i64) -> anyhow::Res
     .await?;
 
     Ok(count.unwrap_or(0) as i32)
+}
+
+/// Update a kanban task's status by task_id.
+pub async fn update_kanban_status(pool: &PgPool, task_id: &str, status: &str) -> anyhow::Result<()> {
+    sql_forge!(
+        "UPDATE kanban_tasks SET status = :status, updated_at = NOW() WHERE id = :id",
+        ( :status = status, :id = task_id )
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Skip all pending/processing threads on startup.
@@ -1353,7 +1367,7 @@ pub async fn get_completed_seq0_threads_since(
         ThreadDb,
         r#"
         SELECT
-            id, status, cause, channel_id, profile, provider, model,
+            id, status, cause, channel_id, profile, provider, model, task_id,
             input_tokens, cached_tokens, output_tokens, duration_ms,
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
             COALESCE(TO_CHAR(started_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "started_at",

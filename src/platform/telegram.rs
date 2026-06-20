@@ -574,6 +574,7 @@ async fn insert_inbound_message(
         &profile_name,
         Some(&provider),
         Some(&model),
+        None,
     )
     .await?;
 

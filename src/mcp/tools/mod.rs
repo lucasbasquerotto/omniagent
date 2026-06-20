@@ -10,3 +10,4 @@ pub mod plugin_manager;
 pub mod query;
 pub mod search;
 pub mod skills;
+pub mod subtasks;

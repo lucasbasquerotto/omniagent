@@ -37,6 +37,7 @@ use crate::vectorizer::Vectorizer;
 use crate::mcp::{
     truncate_content, AppContext, McpRegistry, McpToolCall, DEFAULT_MAX_TOOL_OUTPUT_CHARS,
 };
+use crate::prompt_builder::format_subtask_section;
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -860,6 +861,46 @@ async fn process_thread(
         &profile_name,
     );
 
+    // 4a. Inject subtask context if the thread has subtasks
+    let subtask_section: Option<String> = match crate::subtask::list_subtasks(pool, thread.id).await
+    {
+        Ok(subtask_rows) => {
+            if subtask_rows.is_empty() {
+                None
+            } else {
+                let thread_subtasks: Vec<crate::prompt_builder::ThreadSubtask> = subtask_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        let status = match row.status.as_str() {
+                            "completed" => crate::prompt_builder::SubtaskStatus::Completed,
+                            "cancelled" => crate::prompt_builder::SubtaskStatus::Cancelled,
+                            _ => crate::prompt_builder::SubtaskStatus::Pending,
+                        };
+                        crate::prompt_builder::ThreadSubtask {
+                            name: row.description.clone(),
+                            status,
+                            step_index: i,
+                            total_steps: subtask_rows.len(),
+                        }
+                    })
+                    .collect();
+                let section = format_subtask_section(&thread_subtasks, thread.id);
+                if section.is_some() {
+                    info!(
+                        "Injected subtask section into system prompt for thread {}",
+                        thread.id
+                    );
+                }
+                section
+            }
+        }
+        Err(e) => {
+            warn!("Failed to query subtasks for thread {}: {:?}", thread.id, e);
+            None
+        }
+    };
+
     // 4b. Assemble additional context blocks via ContextBuilder
     let ctx_assembly_meta: Option<ContextAssemblyMeta>;
     let context_messages = {
@@ -1229,6 +1270,11 @@ async fn process_thread(
     let mut messages = vec![
         ChatMessage::system(&system_prompt),
     ];
+
+    // Inject subtask context section if the thread has active subtasks
+    if let Some(ref subtask_section) = subtask_section {
+        messages.push(ChatMessage::system(subtask_section));
+    }
 
     // Add context blocks as system messages (before the user message)
     if !context_messages.is_empty() {

@@ -646,5 +646,31 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // ── Thread subtasks table ──
+    sql_forge!(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_subtasks (
+            id          BIGSERIAL PRIMARY KEY,
+            thread_id   BIGINT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            description TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            priority    INTEGER DEFAULT 0,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sql_forge!(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_thread_subtasks_thread_id
+        ON thread_subtasks(thread_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

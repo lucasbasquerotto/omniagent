@@ -241,6 +241,9 @@ pub fn default_registry(ctx: &AppContext) -> McpRegistry {
     // Plugin management tool
     registry.register(tools::plugin_manager::plugin_manager_tool());
 
+    // Thread subtask management tool
+    registry.register(tools::subtasks::manage_subtasks_tool());
+
     // External MCP servers (load from config, best-effort)
     let external_tools = external::client::initialize_external_tools(&ctx.data_dir);
     for tool in external_tools {

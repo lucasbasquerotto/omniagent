@@ -20,6 +20,7 @@ mod prompt_builder;
 mod relevance;
 mod scheduler;
 mod server;
+mod subtask;
 mod vectorizer;
 
 use crate::platform::OutboundSender;

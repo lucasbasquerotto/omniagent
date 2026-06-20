@@ -496,6 +496,108 @@ The user's request is provided below as a reference."#.to_string()
     )
 }
 
+// ── Subtask Formatting ─────────────────────────────────────────
+
+/// Status of a subtask within a thread's execution plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SubtaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+/// A single subtask in a thread's execution plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSubtask {
+    /// Display name of this subtask.
+    pub name: String,
+    /// Current status.
+    pub status: SubtaskStatus,
+    /// Zero-based index in the ordered list of subtasks.
+    pub step_index: usize,
+    /// Total number of steps in the plan.
+    pub total_steps: usize,
+}
+
+/// Format a list of subtasks as a markdown section for the system prompt.
+///
+/// Returns `None` when the list is empty — no section is added.
+/// When subtasks exist, formats them as:
+///
+/// ```text
+/// ## Current Task Progress
+/// Thread: 12345
+/// 🔴 Subtask Name  (step 2 of 5)
+///
+///   1. ✅ Name
+///   2. 🔄 Name  ← current
+///   3. ⏳ Name
+///   4. ⏳ Name
+///   5. ⏳ Name
+/// ```
+///
+/// Status emoji mapping:
+/// - `completed` → ✅
+/// - `in_progress` → 🔄
+/// - `pending` → ⏳
+/// - `cancelled` → ❌
+pub fn format_subtask_section(subtasks: &[ThreadSubtask], thread_id: i64) -> Option<String> {
+    if subtasks.is_empty() {
+        return None;
+    }
+
+    // Find the current (in_progress) subtask
+    let current_idx = subtasks.iter().position(|s| s.status == SubtaskStatus::InProgress);
+    let current_name = current_idx.and_then(|idx| {
+        let s = &subtasks[idx];
+        // Use total_steps from the current subtask for display
+        Some(format!("{}  (step {} of {})", s.name, idx + 1, s.total_steps))
+    });
+
+    // Build the step list
+    let mut steps = String::new();
+    for (i, subtask) in subtasks.iter().enumerate() {
+        let emoji = match subtask.status {
+            SubtaskStatus::Completed => "✅",
+            SubtaskStatus::InProgress => "🔄",
+            SubtaskStatus::Pending => "⏳",
+            SubtaskStatus::Cancelled => "❌",
+        };
+        let current_marker = if subtask.status == SubtaskStatus::InProgress {
+            "  ← current"
+        } else {
+            ""
+        };
+        steps.push_str(&format!("  {}. {} {}{}\n", i + 1, emoji, subtask.name, current_marker));
+    }
+
+    // Assemble the section
+    let section = if let Some(ref cur) = current_name {
+        format!(
+            "## Current Task Progress\n\
+             Thread: {}\n\
+             🔴 {} \n\
+             \n\
+             {}",
+            thread_id,
+            cur,
+            steps.trim_end(),
+        )
+    } else {
+        format!(
+            "## Current Task Progress\n\
+             Thread: {}\n\
+             \n\
+             {}",
+            thread_id,
+            steps.trim_end(),
+        )
+    };
+
+    Some(section)
+}
+
 /// Result of `build_system_prompt_parts`.
 pub struct PromptParts {
     pub stable: String,

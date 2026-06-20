@@ -547,42 +547,6 @@ pub async fn create_message(pool: &PgPool, msg: &MessageNew) -> anyhow::Result<M
 // ---------------------------------------------------------------------------
 
 /// A profile as stored in the DB — uses string timestamps for sql-forge compatibility.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ProfileDb {
-    pub id: i64,
-    pub name: String,
-    pub model: Option<String>,
-    pub provider: Option<String>,
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
-    pub max_tokens: Option<i32>,
-    pub temperature: Option<f64>,
-    pub allowed_tools: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-}
-
-/// Fetch all profiles from the database, ordered by name.
-pub async fn find_all_profiles(pool: &PgPool) -> anyhow::Result<Vec<ProfileDb>> {
-    let rows: Vec<ProfileDb> = sql_forge!(
-        ProfileDb,
-        r#"
-        SELECT
-            id, name, model, provider, base_url, api_key,
-            max_tokens, temperature,
-            COALESCE(allowed_tools::text, '[]') AS "allowed_tools",
-            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
-            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
-        FROM profiles
-        ORDER BY name ASC
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows)
-}
-
 /// Claim a channel for a session by updating its resource_identifier.
 /// Returns the old resource_identifier (if any) so the caller can notify the
 /// previous session.

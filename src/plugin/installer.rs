@@ -252,66 +252,12 @@ pub fn discover_plugins(
 ) -> Vec<(PluginManifest, String, String)> {
     let mut results = Vec::new();
 
-    // 1. Scan installed plugins: <data_dir>/plugins/installed/<name>/plugin.json
-    let installed_base = format!("{}/plugins/installed", data_dir);
-    if let Ok(entries) = std::fs::read_dir(&installed_base) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let manifest_path = path.join("plugin.json");
-            if manifest_path.exists() {
-                let path_str = manifest_path.to_string_lossy().to_string();
-                match load_manifest(&path_str) {
-                    Ok(manifest) => {
-                        results.push((manifest, "installed".to_string(), path_str));
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to load installed plugin manifest at {}: {:?}", path_str, e);
-                    }
-                }
-            }
-        }
-    }
+    // [ORDER IMPORTANT] Legacy backward-compatibility scans MUST come FIRST
+    // so that real plugin.json files from installed/bundled scans OVERRIDE them.
+    // The upsert in sync_plugins_from_disk uses ON CONFLICT DO UPDATE, so
+    // later entries with the same name win over earlier ones.
 
-    // 2. Scan bundled plugins: <workspace_dir>/plugins/<type>/<name>/plugin.json
-    let bundled_base = format!("{}/plugins", workspace_dir);
-    if let Ok(bundled_entries) = std::fs::read_dir(&bundled_base) {
-        for entry in bundled_entries.flatten() {
-            let type_path = entry.path();
-            if !type_path.is_dir() {
-                continue;
-            }
-            // type_path is like plugins/mcp or plugins/platform
-            if let Ok(plugin_entries) = std::fs::read_dir(&type_path) {
-                for plugin_entry in plugin_entries.flatten() {
-                    let plugin_path = plugin_entry.path();
-                    if !plugin_path.is_dir() {
-                        continue;
-                    }
-                    let manifest_path = plugin_path.join("plugin.json");
-                    if manifest_path.exists() {
-                        let path_str = manifest_path.to_string_lossy().to_string();
-                        match load_manifest(&path_str) {
-                            Ok(manifest) => {
-                                results.push((manifest, "bundled".to_string(), path_str));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to load bundled plugin manifest at {}: {:?}",
-                                    path_str,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Legacy backward compatibility: platforms.json → synthetic platform plugin
+    // A. Legacy backward compatibility: platforms.json → synthetic platform plugin
     let platforms_config = format!("{}/config/platforms.json", data_dir);
     if Path::new(&platforms_config).exists() {
         match std::fs::read_to_string(&platforms_config) {
@@ -352,7 +298,7 @@ pub fn discover_plugins(
         }
     }
 
-    // 4. Legacy backward compatibility: mcp-servers.json → synthetic MCP plugin
+    // B. Legacy backward compatibility: mcp-servers.json → synthetic MCP plugin
     let mcp_config = format!("{}/config/mcp-servers.json", data_dir);
     if Path::new(&mcp_config).exists() {
         match std::fs::read_to_string(&mcp_config) {
@@ -391,6 +337,97 @@ pub fn discover_plugins(
                     e
                 );
             }
+        }
+    }
+
+    // C. Scan installed plugins: <data_dir>/plugins/installed/<name>/plugin.json
+    //    Runs AFTER legacy scans so real plugin.json data (including config_schema) overrides synthetic manifests.
+    let installed_base = format!("{}/plugins/installed", data_dir);
+    if let Ok(entries) = std::fs::read_dir(&installed_base) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let manifest_path = path.join("plugin.json");
+            if manifest_path.exists() {
+                let path_str = manifest_path.to_string_lossy().to_string();
+                match load_manifest(&path_str) {
+                    Ok(manifest) => {
+                        results.push((manifest, "installed".to_string(), path_str));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load installed plugin manifest at {}: {:?}", path_str, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // D. Scan bundled plugins: <workspace_dir>/plugins/<type>/<name>/plugin.json
+    //    Runs AFTER legacy scans so real plugin.json data overrides synthetic manifests.
+    let bundled_base = format!("{}/plugins", workspace_dir);
+    if let Ok(bundled_entries) = std::fs::read_dir(&bundled_base) {
+        for entry in bundled_entries.flatten() {
+            let type_path = entry.path();
+            if !type_path.is_dir() {
+                continue;
+            }
+            // type_path is like plugins/mcp or plugins/platform
+            if let Ok(plugin_entries) = std::fs::read_dir(&type_path) {
+                for plugin_entry in plugin_entries.flatten() {
+                    let plugin_path = plugin_entry.path();
+                    if !plugin_path.is_dir() {
+                        continue;
+                    }
+                    let manifest_path = plugin_path.join("plugin.json");
+                    if manifest_path.exists() {
+                        let path_str = manifest_path.to_string_lossy().to_string();
+                        match load_manifest(&path_str) {
+                            Ok(manifest) => {
+                                results.push((manifest, "bundled".to_string(), path_str));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to load bundled plugin manifest at {}: {:?}",
+                                    path_str,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // After all discovery, also scan mcp-config.json files for MCP server entries
+    // that aren't covered by bundled/installed plugin.json files.
+    // These get synthetic manifests but won't have config_schema unless
+    // a plugin.json is also present under the installed/bundled paths.
+    let mcp_plugin_servers = crate::mcp::external::config::discover_plugin_servers(data_dir);
+    for srv in &mcp_plugin_servers {
+        // Only add if not already in results (dedup by name)
+        if !results.iter().any(|(m, _, _)| m.name == srv.name) {
+            let transport_str = match srv.transport {
+                crate::mcp::external::config::McpTransport::Stdio => "stdio",
+                crate::mcp::external::config::McpTransport::Http => "http",
+            };
+            let manifest = PluginManifest {
+                name: srv.name.clone(),
+                version: "0.1.0".to_string(),
+                plugin_type: PluginType::Mcp,
+                description: Some(format!("MCP server '{}' (from mcp-config.json)", srv.name)),
+                entrypoint: crate::plugin::PluginEntrypoint {
+                    command: srv.command.clone().unwrap_or_default(),
+                    args: srv.args.clone(),
+                    transport: transport_str.to_string(),
+                    url: srv.url.clone(),
+                },
+                capabilities: None,
+                config_schema: vec![],
+            };
+            results.push((manifest, "mcp_config".to_string(), String::new()));
         }
     }
 

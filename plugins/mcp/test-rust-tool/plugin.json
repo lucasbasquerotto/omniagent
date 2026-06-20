@@ -7,7 +7,7 @@
     {
       "key": "GREETING_NAME",
       "label": "Greeting Name",
-      "type": "text",
+      "type": "string",
       "default": "World",
       "description": "Default name to use in echo greeting when no input is provided"
     }

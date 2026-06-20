@@ -16,7 +16,7 @@
     {
       "key": "PLATFORM_GREETING",
       "label": "Platform Greeting",
-      "type": "text",
+      "type": "string",
       "default": "Hello from Python",
       "description": "Greeting message shown in platform status"
     }

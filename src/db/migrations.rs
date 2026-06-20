@@ -563,5 +563,15 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // ── Add task_id to threads for kanban task association ──
+    sql_forge!(
+        r#"
+        ALTER TABLE threads
+        ADD COLUMN IF NOT EXISTS task_id TEXT REFERENCES kanban_tasks(id)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

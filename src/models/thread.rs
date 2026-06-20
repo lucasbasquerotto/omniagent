@@ -18,6 +18,7 @@ pub struct Thread {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub terminal: bool,
+    pub task_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -28,4 +29,5 @@ pub struct ThreadNew {
     pub profile: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub task_id: Option<String>,
 }

@@ -255,7 +255,7 @@ pub fn update_kanban_task_tool() -> McpTool {
 
             let pool = ctx.pool.clone();
             let id_clone = id.to_string();
-            let was_status_ready = args["status"].as_str().map(|s| s == "ready").unwrap_or(false);
+            let was_status_todo = args["status"].as_str().map(|s| s == "todo").unwrap_or(false);
 
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
@@ -352,8 +352,8 @@ pub fn update_kanban_task_tool() -> McpTool {
                         .map_err(|e| anyhow::anyhow!("Failed to update profile: {e}"))?;
                     }
 
-                    // If status is being updated to 'ready', create a pending seq-0 message
-                    if was_status_ready {
+                    // If status is being updated to 'todo', create a pending seq-0 message
+                    if was_status_todo {
                         // Fetch the task to get its details
                         #[derive(Debug, FromRow)]
                         struct TaskRow {
@@ -378,7 +378,7 @@ pub fn update_kanban_task_tool() -> McpTool {
                         .map_err(|e| anyhow::anyhow!("Failed to fetch task: {e}"))?;
 
                         if let Some(t) = task {
-                            if t.status == "ready" {
+                            if was_status_todo {
                                 // Resolve channel_id: task's channel_id, or default cron channel
                                 let task_channel_id = if let Some(cid) = t.channel_id {
                                     cid
@@ -436,7 +436,7 @@ pub fn update_kanban_task_tool() -> McpTool {
                                     format!("Execute kanban task: {}", t.title)
                                 };
 
-                                // Create a thread with cause='kanban'
+                                // Create a thread with cause='kanban' and task_id linking to kanban task
                                 let thread = queries::create_thread(
                                     &pool,
                                     "kanban",
@@ -444,9 +444,10 @@ pub fn update_kanban_task_tool() -> McpTool {
                                     &profile_name,
                                     provider.as_deref(),
                                     model.as_deref(),
+                                    Some(&t.id),
                                 )
                                 .await
-                                .map_err(|e| anyhow::anyhow!("Failed to create thread for ready task '{}': {e}", t.id))?;
+                                .map_err(|e| anyhow::anyhow!("Failed to create thread for todo task '{}': {e}", t.id))?;
 
                                 // Add a cause message with the task content
                                 let cause_msg = MessageNew {
@@ -485,6 +486,20 @@ pub fn update_kanban_task_tool() -> McpTool {
                                 tracing::info!(
                                     "Thread {} set to pending for kanban task '{}'",
                                     thread.id, t.id
+                                );
+
+                                // Advance kanban task to 'ready' now that a thread has been queued
+                                sql_forge!(
+                                    "UPDATE kanban_tasks SET status = 'ready', updated_at = NOW() WHERE id = :id",
+                                    ( :id = &t.id )
+                                )
+                                .execute(&pool)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Failed to advance task '{}' to ready: {e}", t.id))?;
+
+                                tracing::info!(
+                                    "Kanban task '{}' advanced to ready with thread {}",
+                                    t.id, thread.id
                                 );
                             }
                         }

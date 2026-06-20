@@ -207,6 +207,28 @@ fn get_all_setting_definitions() -> Vec<(String, String, SettingMeta)> {
         ),
         // ── Memory & Retention ──
         (
+            "MEMORY_MAX_CHARS".into(),
+            get_env_or_default("MEMORY_MAX_CHARS", "5000"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Max characters for MEMORY.md in the system prompt".into(),
+                options: None,
+                readonly: false,
+                default: Some("5000".into()),
+            },
+        ),
+        (
+            "USER_MAX_CHARS".into(),
+            get_env_or_default("USER_MAX_CHARS", "1000"),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Max characters for USER.md in the system prompt".into(),
+                options: None,
+                readonly: false,
+                default: Some("1000".into()),
+            },
+        ),
+        (
             "SUMMARIZE_AFTER_DAYS".into(),
             get_env_or_default("SUMMARIZE_AFTER_DAYS", "7"),
             SettingMeta {
@@ -414,7 +436,9 @@ fn categorize_settings(defs: Vec<(String, String, SettingMeta)>) -> Vec<SettingC
             "SUMMARIZE_AFTER_DAYS"
             | "DELETE_AFTER_DAYS"
             | "SUMMARY_WINDOW"
-            | "SUMMARY_TOKENS" => "memory",
+            | "SUMMARY_TOKENS"
+            | "MEMORY_MAX_CHARS"
+            | "USER_MAX_CHARS" => "memory",
             "LLM_PROVIDER"
             | "LLM_MODEL"
             | "LLM_BASE_URL"
@@ -490,6 +514,8 @@ async fn update_settings_handler(
         "DELETE_AFTER_DAYS",
         "SUMMARY_WINDOW",
         "SUMMARY_TOKENS",
+        "MEMORY_MAX_CHARS",
+        "USER_MAX_CHARS",
         "LLM_PROVIDER",
         "LLM_MODEL",
         "LLM_BASE_URL",

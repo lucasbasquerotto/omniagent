@@ -218,6 +218,7 @@ pub fn default_registry(ctx: &AppContext) -> McpRegistry {
     registry.register(tools::memory::promote_to_memory_tool());
     registry.register(tools::memory::list_memories_tool());
     registry.register(tools::memory::review_memories_tool());
+    registry.register(tools::memory::manage_memory_tool());
 
     // Metrics tool
     registry.register(tools::metrics::get_metrics_tool());

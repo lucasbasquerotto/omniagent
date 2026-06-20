@@ -497,3 +497,151 @@ pub fn review_memories_tool() -> McpTool {
         }),
     }
 }
+
+const ENTRY_DELIMITER: &str = "\n§\n";
+
+// ---------------------------------------------------------------------------
+// manage_memory
+// ---------------------------------------------------------------------------
+
+pub fn manage_memory_tool() -> McpTool {
+    McpTool {
+        name: "manage_memory".to_string(),
+        description:
+            "Manage profile memory files (MEMORY.md and USER.md). Supports add, remove, and clean \
+             operations on the agent's persistent memory entries. Use on explicit user request only. \
+             'add' prepends a new entry, 'remove' deletes entries matching a substring, \
+             'clean' clears all entries." .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": ["memory", "user"],
+                    "description": "Which file: 'memory' for MEMORY.md, 'user' for USER.md"
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "remove", "clean"],
+                    "description": "Operation: 'add' prepends a new entry, 'remove' deletes entries matching substring, 'clean' clears all entries"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content for 'add' action. For 'remove', a substring to match against entries."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Profile name (default: 'default')"
+                }
+            },
+            "required": ["target", "action"]
+        }),
+        handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
+            let target = args["target"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'target'"))?;
+            let action = args["action"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'action'"))?;
+            let content = args["content"].as_str().unwrap_or("");
+            let profile = args["profile"].as_str().unwrap_or("default");
+
+            let memories_dir = format!("{}/profiles/{}/memories", ctx.data_dir, profile);
+            let dir_path = std::path::Path::new(&memories_dir);
+            std::fs::create_dir_all(dir_path)
+                .map_err(|e| anyhow::anyhow!("Failed to create memories directory: {}", e))?;
+
+            let filename = match target {
+                "memory" => "MEMORY.md",
+                "user" => "USER.md",
+                _ => anyhow::bail!("Invalid target '{}'. Must be 'memory' or 'user'", target),
+            };
+            let filepath = dir_path.join(filename);
+
+            match action {
+                "add" => {
+                    if content.is_empty() {
+                        anyhow::bail!("Content is required for 'add' action");
+                    }
+                    // Read existing content
+                    let existing = if filepath.exists() {
+                        std::fs::read_to_string(&filepath)
+                            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", filepath.display(), e))?
+                    } else {
+                        String::new()
+                    };
+                    let existing = existing.trim();
+                    let new_content = if existing.is_empty() {
+                        content.to_string()
+                    } else {
+                        format!("{}\n§\n{}", content, existing)
+                    };
+                    std::fs::write(&filepath, &new_content)
+                        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", filepath.display(), e))?;
+                    Ok(McpToolResult {
+                        call_id: String::new(),
+                        content: format!(
+                            "Entry added to {} (profile: {}). {} total chars.",
+                            filename,
+                            profile,
+                            new_content.len()
+                        ),
+                        is_error: false,
+                    })
+                }
+                "remove" => {
+                    if content.is_empty() {
+                        anyhow::bail!("Substring is required for 'remove' action to match entries");
+                    }
+                    if !filepath.exists() {
+                        return Ok(McpToolResult {
+                            call_id: String::new(),
+                            content: format!("No {} file found — nothing to remove.", filename),
+                            is_error: false,
+                        });
+                    }
+                    let existing = std::fs::read_to_string(&filepath)
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", filepath.display(), e))?;
+                    let entries: Vec<String> = existing
+                        .split(ENTRY_DELIMITER)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let before = entries.len();
+                    let removed: Vec<&String> = entries.iter().filter(|e| e.contains(content)).collect();
+                    let removed_count = removed.len();
+                    let kept: Vec<&str> = entries.iter().filter(|e| !e.contains(content)).map(|s| s.as_str()).collect();
+                    if kept.is_empty() {
+                        // All entries removed — delete the file
+                        std::fs::remove_file(&filepath)
+                            .map_err(|e| anyhow::anyhow!("Failed to remove {}: {}", filepath.display(), e))?;
+                    } else {
+                        let new_content = kept.join(ENTRY_DELIMITER);
+                        std::fs::write(&filepath, &new_content)
+                            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", filepath.display(), e))?;
+                    }
+                    Ok(McpToolResult {
+                        call_id: String::new(),
+                        content: format!(
+                            "Removed {}/{} entries from {} matching '{}'. {} remaining.",
+                            removed_count, before, filename, content, kept.len()
+                        ),
+                        is_error: false,
+                    })
+                }
+                "clean" => {
+                    if filepath.exists() {
+                        std::fs::remove_file(&filepath)
+                            .map_err(|e| anyhow::anyhow!("Failed to remove {}: {}", filepath.display(), e))?;
+                    }
+                    Ok(McpToolResult {
+                        call_id: String::new(),
+                        content: format!("{} cleared — all entries removed (profile: {}).", filename, profile),
+                        is_error: false,
+                    })
+                }
+                _ => anyhow::bail!("Invalid action '{}'. Must be 'add', 'remove', or 'clean'", action),
+            }
+        }),
+    }
+}

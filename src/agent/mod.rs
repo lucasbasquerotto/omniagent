@@ -1743,24 +1743,58 @@ pub async fn skip_on_startup(pool: &PgPool) -> Result<u64> {
     .fetch_all(pool)
     .await?;
 
-    if affected.is_empty() {
+    let count = if affected.is_empty() {
         info!("[startup] No pending/processing threads to skip");
-        return Ok(0);
-    }
+        0
+    } else {
+        for row in &affected {
+            info!(
+                "[startup] Will skip thread {} (status={})",
+                row.id, row.status
+            );
+        }
 
-    for row in &affected {
+        let c = queries::skip_all_pending_threads(pool).await?;
+        if c > 0 {
+            info!(
+                "[startup] Skipped {} pending/processing threads on startup",
+                c
+            );
+        }
+        c
+    };
+
+    // ── Reset kanban tasks on startup ──
+    // Move "ready" tasks back to "todo" so they get re-processed
+    let ready_result = sql_forge!(
+        r#"UPDATE kanban_tasks SET status = 'todo', updated_at = NOW() WHERE status = 'ready'"#,
+    )
+    .execute(pool)
+    .await?;
+    let ready_count = ready_result.rows_affected();
+    if ready_count > 0 {
         info!(
-            "[startup] Will skip thread {} (status={})",
-            row.id, row.status
+            "[startup] Reset {} kanban tasks from ready → todo",
+            ready_count
         );
     }
 
-    let count = queries::skip_all_pending_threads(pool).await?;
-    if count > 0 {
+    // Move "running" tasks to "blocked" since the agent restarted mid-execution
+    let running_result = sql_forge!(
+        r#"UPDATE kanban_tasks SET status = 'blocked', updated_at = NOW() WHERE status = 'running'"#,
+    )
+    .execute(pool)
+    .await?;
+    let running_count = running_result.rows_affected();
+    if running_count > 0 {
         info!(
-            "[startup] Skipped {} pending/processing threads on startup",
-            count
+            "[startup] Reset {} kanban tasks from running → blocked",
+            running_count
         );
+    }
+
+    if ready_count + running_count == 0 {
+        info!("[startup] No kanban tasks to reset");
     }
 
     Ok(count)

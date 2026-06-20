@@ -319,7 +319,7 @@ pub fn discover_plugins(
                 if let Ok(config) = serde_json::from_str::<crate::platform::external::PlatformPluginsConfig>(&content) {
                     for plugin_cfg in &config.platforms {
                         let manifest = PluginManifest {
-                            name: format!("platform:{}", plugin_cfg.name),
+                            name: plugin_cfg.name.clone(),
                             version: "0.1.0".to_string(),
                             plugin_type: PluginType::Platform,
                             description: Some(format!(
@@ -364,7 +364,7 @@ pub fn discover_plugins(
                             crate::mcp::external::config::McpTransport::Http => "http",
                         };
                         let manifest = PluginManifest {
-                            name: format!("mcp:{}", server_cfg.name),
+                            name: server_cfg.name.clone(),
                             version: "0.1.0".to_string(),
                             plugin_type: PluginType::Mcp,
                             description: Some(format!(

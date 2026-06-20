@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "name": "test-rust-tool",
+      "transport": "stdio",
+      "command": "./plugins/mcp/test-rust-tool/target/release/test-rust-tool",
+      "args": [],
+      "env": {}
+    }
+  ]
+}

@@ -573,5 +573,19 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // ── Kanban task dependencies table ──
+    sql_forge!(
+        r#"
+        CREATE TABLE IF NOT EXISTS kanban_task_dependencies (
+            task_id TEXT NOT NULL REFERENCES kanban_tasks(id) ON DELETE CASCADE,
+            depends_on_id TEXT NOT NULL REFERENCES kanban_tasks(id) ON DELETE CASCADE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (task_id, depends_on_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

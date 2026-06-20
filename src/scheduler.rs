@@ -30,6 +30,8 @@ struct CronJobDueRow {
     prompt: Option<String>,
     channel_id: Option<i64>,
     profile: Option<String>,
+    mode: Option<String>,
+    direct_task_type: Option<String>,
 }
 
 /// Spawn the cron scheduler loop as a background task.
@@ -87,6 +89,31 @@ async fn tick(pool: &PgPool, data_dir: &str) -> Result<()> {
             "[cron-scheduler] Firing job '{}' (id={})",
             display_name, job.id
         );
+
+        // ── Direct mode: run predefined task without agent ──
+        let job_mode = job.mode.as_deref().unwrap_or("agentic");
+        if job_mode == "direct" {
+            if let Some(task_type) = job.direct_task_type.as_deref() {
+                match task_type {
+                    "kanban_dispatcher" => {
+                        info!(
+                            "[cron-scheduler] Running kanban_dispatcher for job '{}'",
+                            display_name
+                        );
+                        run_kanban_dispatcher(pool).await?;
+                    }
+                    other => {
+                        warn!(
+                            "[cron-scheduler] Unknown direct_task_type '{}' for job '{}', skipping",
+                            other, display_name
+                        );
+                    }
+                }
+            }
+            let new_next = calculate_next_run(&job.schedule, &now);
+            release_job(pool, &job.id, &now, &new_next).await?;
+            continue;
+        }
 
         // ── Determine which channel to fire into ──
         let channel = if let Some(cid) = job.channel_id {
@@ -206,9 +233,10 @@ async fn fetch_due_jobs(pool: &PgPool) -> Result<Vec<CronJobDueRow>> {
     let rows: Vec<CronJobDueRow> = sql_forge!(
         CronJobDueRow,
         r#"
-        SELECT id, name, display_name, schedule, prompt, channel_id, profile
+        SELECT id, name, display_name, schedule, prompt, channel_id, profile, mode, direct_task_type
         FROM cron_jobs
         WHERE enabled = true
+          AND active = true
           AND (next_run_at IS NULL OR next_run_at <= NOW())
           AND 1 = :_one
         ORDER BY created_at ASC
@@ -247,7 +275,178 @@ async fn release_job(
 
 /// Ensure a cron channel exists (upsert on conflict).
 async fn ensure_cron_channel(pool: &PgPool) -> Result<crate::models::Channel> {
-    queries::create_channel(pool, "cron-default", "cron", "cron-default", "cron", "cron-default").await
+    queries::create_channel(pool, "cron", "cron", "cron", "cron", "cron").await
+}
+
+/// Run the kanban_dispatcher: move all 'todo' tasks to 'ready' by creating
+/// threads and messages for each, respecting dependencies and ordering by
+/// priority DESC, position ASC.
+async fn run_kanban_dispatcher(pool: &PgPool) -> Result<()> {
+    #[derive(Debug, FromRow)]
+    struct TodoTaskRow {
+        id: String,
+        title: String,
+        body: Option<String>,
+        channel_id: Option<i64>,
+        profile: Option<String>,
+    }
+
+    let tasks: Vec<TodoTaskRow> = sql_forge!(
+        TodoTaskRow,
+        r#"
+        SELECT id, title, body, channel_id, profile
+        FROM kanban_tasks
+        WHERE status = 'todo'
+          AND NOT archived
+        ORDER BY priority DESC NULLS LAST, position ASC NULLS LAST
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if tasks.is_empty() {
+        info!("[kanban-dispatcher] No todo tasks to dispatch");
+        return Ok(());
+    }
+
+    let mut dispatched = 0u64;
+    let mut skipped_deps = 0u64;
+
+    for t in &tasks {
+        // Check dependencies
+        let blocked_deps: i64 = sql_forge!(
+            scalar i64,
+            r#"
+            SELECT COUNT(*)
+            FROM kanban_task_dependencies d
+            JOIN kanban_tasks t_dep ON t_dep.id = d.depends_on_id
+            WHERE d.task_id = :task_id
+              AND t_dep.status != 'done'
+              AND NOT t_dep.archived
+            "#,
+            ( :task_id = &t.id )
+        )
+        .fetch_one(pool)
+        .await?;
+
+        if blocked_deps > 0 {
+            info!(
+                "[kanban-dispatcher] Task '{}' has {} unsatisfied dependencies — skipping",
+                t.id, blocked_deps
+            );
+            skipped_deps += 1;
+            continue;
+        }
+
+        // Resolve channel_id
+        let task_channel_id = if let Some(cid) = t.channel_id {
+            cid
+        } else {
+            match queries::get_channel_by_platform_name(pool, "kanban", "kanban").await {
+                Ok(Some(ch)) => ch.id,
+                _ => {
+                    warn!("[kanban-dispatcher] No default cron channel found, skipping task '{}'", t.id);
+                    continue;
+                }
+            }
+        };
+
+        // Resolve profile
+        let profile_name = if let Some(ref p) = t.profile {
+            p.clone()
+        } else {
+            match queries::find_channel_by_id(pool, task_channel_id).await {
+                Ok(Some(ch)) => ch.current_profile.clone(),
+                _ => "default".to_string(),
+            }
+        };
+
+        // Create thread
+        let thread = match queries::create_thread(
+            pool,
+            "kanban",
+            task_channel_id,
+            &profile_name,
+            None,
+            None,
+            Some(&t.id),
+        )
+        .await
+        {
+            Ok(th) => th,
+            Err(e) => {
+                warn!(
+                    "[kanban-dispatcher] Failed to create thread for task '{}': {:?}",
+                    t.id, e
+                );
+                continue;
+            }
+        };
+
+        // Create cause message
+        let content = t.body.as_deref().unwrap_or(&t.title);
+        let content = if content.is_empty() {
+            format!("Execute kanban task: {}", t.title)
+        } else {
+            content.to_string()
+        };
+
+        let cause_msg = crate::models::MessageNew {
+            thread_id: thread.id,
+            role: "cause".to_string(),
+            content,
+            thread_sequence: 0,
+            external_id: Some(format!("kanban:{}", t.id)),
+            metadata: serde_json::json!({
+                "kanban_task_id": t.id,
+                "kanban_task_title": t.title,
+            }),
+            embedding: None,
+            summary_text: None,
+            is_summary: false,
+            msg_type: "kanban".to_string(),
+            msg_subtype: Some(t.id.clone()),
+            processing_time_ms: None,
+            token_usage: None,
+        };
+
+        match queries::create_cause_and_set_pending(pool, &cause_msg).await {
+            Ok(created) => {
+                info!(
+                    "[kanban-dispatcher] Created cause message {} / thread {} for task '{}'",
+                    created.id, thread.id, t.id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "[kanban-dispatcher] Failed to create cause for task '{}': {:?}",
+                    t.id, e
+                );
+                continue;
+            }
+        }
+
+        // Advance to ready
+        sql_forge!(
+            "UPDATE kanban_tasks SET status = 'ready', updated_at = NOW() WHERE id = :id",
+            ( :id = &t.id )
+        )
+        .execute(pool)
+        .await?;
+
+        info!(
+            "[kanban-dispatcher] Task '{}' advanced to ready (thread {})",
+            t.id, thread.id
+        );
+        dispatched += 1;
+    }
+
+    info!(
+        "[kanban-dispatcher] Dispatched {} tasks ({} skipped due to deps, {} total todo)",
+        dispatched, skipped_deps, tasks.len()
+    );
+
+    Ok(())
 }
 
 /// Parse a cron expression and compute the next run after `now`.

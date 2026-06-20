@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""test-python-tool MCP server — implements standard MCP JSON-RPC over stdio.
+
+Tools:
+  - wait: Sleep for N seconds (default 900)
+  - echo: Echo back input text
+
+Cancellation is detected when stdin closes (EOF).
+"""
+
+import json
+import os
+import sys
+import time
+import logging
+import threading
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [test-python-tool] %(levelname)s %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("mcp")
+
+MCP_PROTOCOL_VERSION = "2025-03-26"
+initialized = False
+stdin_closed = threading.Event()
+
+
+def send_json(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def make_success(req_id, result):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def make_error(req_id, code, message):
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def handle_initialize(req_id):
+    result = {
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": {"tools": {"listChanged": False}},
+        "serverInfo": {"name": "test-python-tool", "version": "0.1.0"},
+    }
+    send_json(make_success(req_id, result))
+    log.info("Initialized: test-python-tool v0.1.0")
+
+
+def handle_tools_list(req_id):
+    tools = [
+        {
+            "name": "wait",
+            "description": "Sleep for a specified duration in seconds (default 900 = 15 minutes)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "duration_secs": {
+                        "type": "integer",
+                        "description": "Seconds to wait",
+                        "default": 900,
+                    }
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "echo",
+            "description": "Echo back the input text",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to echo back"}
+                },
+                "required": ["text"],
+            },
+        },
+    ]
+    send_json(make_success(req_id, {"tools": tools}))
+    log.info("tools/list returned 2 tools")
+
+
+def handle_wait(req_id, arguments):
+    duration_secs = arguments.get("duration_secs", 900) if arguments else 900
+    log.info("wait tool called: sleeping for %s second(s)", duration_secs)
+
+    slept = 0
+    cancelled = False
+    for _ in range(duration_secs):
+        if stdin_closed.is_set():
+            cancelled = True
+            break
+        time.sleep(1)
+        slept += 1
+
+    if cancelled:
+        send_json(
+            make_success(
+                req_id,
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Waited for {slept} second(s) before cancellation",
+                        }
+                    ],
+                    "isError": False,
+                },
+            )
+        )
+        log.info("wait tool cancelled after %s second(s)", slept)
+        sys.exit(0)
+    else:
+        send_json(
+            make_success(
+                req_id,
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Waited for {duration_secs} seconds",
+                        }
+                    ],
+                    "isError": False,
+                },
+            )
+        )
+        log.info("wait tool completed: slept for %s second(s)", duration_secs)
+
+
+def handle_echo(req_id, arguments):
+    text = (arguments or {}).get("text", "")
+    log.info("echo tool called: text='%s'", text)
+    send_json(
+        make_success(
+            req_id,
+            {
+                "content": [{"type": "text", "text": text}],
+                "isError": False,
+            },
+        )
+    )
+    log.info("echo tool completed")
+
+
+def main():
+    global initialized
+
+    log.info("test-python-tool MCP server starting (PID=%d)", os.getpid())
+
+    # Background thread to detect stdin EOF
+    def monitor_stdin():
+        stdin_closed.wait()
+        log.info("stdin closed detected - will cancel on next iteration")
+
+    monitor = threading.Thread(target=monitor_stdin, daemon=True)
+    monitor.start()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        # If we detect stdin is about to close, signal it
+        if line == "__EOF__":
+            stdin_closed.set()
+            continue
+
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as e:
+            log.error("Failed to parse JSON-RPC: %s", e)
+            continue
+
+        method = request.get("method", "")
+        req_id = request.get("id")
+
+        if method == "initialize":
+            if req_id is not None:
+                handle_initialize(req_id)
+                initialized = True
+
+        elif method == "notifications/initialized":
+            log.info("Client initialized notification received")
+
+        elif method == "tools/list":
+            if not initialized:
+                if req_id is not None:
+                    send_json(make_error(req_id, -32000, "Server not initialized"))
+                continue
+            if req_id is not None:
+                handle_tools_list(req_id)
+
+        elif method == "tools/call":
+            if not initialized:
+                if req_id is not None:
+                    send_json(make_error(req_id, -32000, "Server not initialized"))
+                continue
+            if req_id is not None:
+                params = request.get("params", {})
+                tool_name = params.get("name", "")
+                arguments = params.get("arguments", {})
+
+                if tool_name == "wait":
+                    handle_wait(req_id, arguments)
+                elif tool_name == "echo":
+                    handle_echo(req_id, arguments)
+                else:
+                    if req_id is not None:
+                        send_json(
+                            make_error(
+                                req_id, -32602, f"Unknown tool: {tool_name}"
+                            )
+                        )
+
+        else:
+            log.warning("Unknown method: %s", method)
+            if req_id is not None:
+                send_json(make_error(req_id, -32601, f"Method not found: {method}"))
+
+    log.info("test-python-tool MCP server shutting down (stdin closed)")
+
+
+if __name__ == "__main__":
+    main()

@@ -632,5 +632,19 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Migrate id column from SERIAL (INT4) to BIGSERIAL (INT8) to match Rust i64
+    sql_forge!(
+        r#"
+        DO $$ BEGIN
+            ALTER TABLE plugin_registry ALTER COLUMN id TYPE BIGINT;
+        EXCEPTION
+            WHEN OTHERS THEN
+                -- Column already BIGINT or migration not needed
+        END $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

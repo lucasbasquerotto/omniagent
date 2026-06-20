@@ -1,6 +1,5 @@
 use crate::mcp::{truncate_content, AppContext, McpTool, McpToolResult, DEFAULT_MAX_TOOL_OUTPUT_CHARS};
 use crate::db::types as queries;
-use crate::models::MessageNew;
 use anyhow::Result;
 use serde_json::Value;
 use sql_forge::sql_forge;
@@ -99,9 +98,9 @@ pub fn create_kanban_task_tool() -> McpTool {
                     let resolved_channel_id = if let Some(cid) = channel_id_arg {
                         cid
                     } else {
-                        match queries::get_channel_by_platform_name(&pool, "cron", "cron-default").await {
+                        match queries::get_channel_by_platform_name(&pool, "cron", "cron").await {
                             Ok(Some(ch)) => ch.id,
-                            _ => anyhow::bail!("No default cron channel found. Create a channel with platform='cron' and name='cron-default' first."),
+                            _ => anyhow::bail!("No default cron channel found. Create a channel with platform='cron' and name='cron' first."),
                         }
                     };
 
@@ -255,7 +254,6 @@ pub fn update_kanban_task_tool() -> McpTool {
 
             let pool = ctx.pool.clone();
             let id_clone = id.to_string();
-            let was_status_todo = args["status"].as_str().map(|s| s == "todo").unwrap_or(false);
 
             tokio::task::block_in_place(|| {
                 let handle = tokio::runtime::Handle::current();
@@ -352,184 +350,7 @@ pub fn update_kanban_task_tool() -> McpTool {
                         .map_err(|e| anyhow::anyhow!("Failed to update profile: {e}"))?;
                     }
 
-                    // If status is being updated to 'todo', create a pending seq-0 message
-                    if was_status_todo {
-                        // Fetch the task to get its details
-                        #[derive(Debug, FromRow)]
-                        struct TaskRow {
-                            id: String,
-                            title: String,
-                            body: Option<String>,
-                            status: String,
-                            channel_id: Option<i64>,
-                            profile: Option<String>,
-                        }
-                        let task: Option<TaskRow> = sql_forge!(
-                            TaskRow,
-                            r#"
-                            SELECT id, title, body, status, channel_id, profile
-                            FROM kanban_tasks
-                            WHERE id = :id
-                            "#,
-                            ( :id = &id_clone )
-                        )
-                        .fetch_optional(&pool)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to fetch task: {e}"))?;
-
-                        if let Some(t) = task {
-                            if was_status_todo {
-                                // Resolve channel_id: task's channel_id, or default cron channel
-                                let task_channel_id = if let Some(cid) = t.channel_id {
-                                    cid
-                                } else {
-                                    match queries::get_channel_by_platform_name(&pool, "cron", "cron-default").await {
-                                        Ok(Some(ch)) => ch.id,
-                                        _ => anyhow::bail!("No default cron channel found for ready task. Create a channel with platform='cron' and name='cron-default' first."),
-                                    }
-                                };
-
-                                // Resolve profile: task's profile, or channel's current_profile
-                                #[derive(Debug, FromRow)]
-                                struct ChannelCfgRow {
-                                    current_profile: String,
-                                    current_provider: Option<String>,
-                                    current_model: Option<String>,
-                                }
-                                let channel_cfg: ChannelCfgRow = sql_forge!(
-                                    ChannelCfgRow,
-                                    r#"
-                                    SELECT current_profile, current_provider, current_model FROM channels WHERE id = :channel_id
-                                    "#,
-                                    ( :channel_id = task_channel_id )
-                                )
-                                .fetch_one(&pool)
-                                .await
-                                .unwrap_or_else(|_| ChannelCfgRow {
-                                    current_profile: "default".to_string(),
-                                    current_provider: None,
-                                    current_model: None,
-                                });
-
-                                let profile_name = t.profile.clone().unwrap_or(channel_cfg.current_profile);
-
-                                // Resolve provider+model for stamping on the seq-0 message
-                                // Order: channel.current_provider → profile provider → env → default
-                                let profile_registry = crate::profile::ProfileRegistry::new(&ctx.data_dir);
-                                let kanban_prof = profile_registry.get(&profile_name).cloned().unwrap_or_else(|| {
-                                    crate::profile::Profile::default("default")
-                                });
-                                let provider = channel_cfg.current_provider.clone()
-                                    .or_else(|| kanban_prof.provider.clone())
-                                    .or_else(|| Some(std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "opencode-go".to_string())));
-                                let model = channel_cfg.current_model.clone()
-                                    .or_else(|| kanban_prof.model.clone())
-                                    .or_else(|| Some(std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())));
-
-                                let content = if let Some(ref body) = t.body {
-                                    if !body.is_empty() {
-                                        body.clone()
-                                    } else {
-                                        format!("Execute kanban task: {}", t.title)
-                                    }
-                                } else {
-                                    format!("Execute kanban task: {}", t.title)
-                                };
-
-                                // Check dependencies: task stays as "todo" until all deps are done/archived
-                                let blocked_deps: i64 = sql_forge!(
-                                    scalar i64,
-                                    r#"
-                                    SELECT COUNT(*)
-                                    FROM kanban_task_dependencies d
-                                    JOIN kanban_tasks t_dep ON t_dep.id = d.depends_on_id
-                                    WHERE d.task_id = :task_id
-                                      AND t_dep.status != 'done'
-                                      AND NOT t_dep.archived
-                                    "#,
-                                    ( :task_id = &t.id )
-                                )
-                                .fetch_one(&pool)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Failed to check dependencies for task '{}': {e}", t.id))?;
-
-                                if blocked_deps > 0 {
-                                    tracing::info!(
-                                        "Kanban task '{}' has {} unsatisfied dependencies — staying as todo",
-                                        t.id, blocked_deps
-                                    );
-                                    // Do not create thread or advance to ready
-                                    return Ok(());
-                                }
-
-                                // Create a thread with cause='kanban' and task_id linking to kanban task
-                                let thread = queries::create_thread(
-                                    &pool,
-                                    "kanban",
-                                    task_channel_id,
-                                    &profile_name,
-                                    provider.as_deref(),
-                                    model.as_deref(),
-                                    Some(&t.id),
-                                )
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Failed to create thread for todo task '{}': {e}", t.id))?;
-
-                                // Add a cause message with the task content
-                                let cause_msg = MessageNew {
-                                    thread_id: thread.id,
-                                    role: "cause".to_string(),
-                                    content,
-                                    thread_sequence: 0,
-                                    external_id: Some(format!("kanban:{}", t.id)),
-                                    metadata: serde_json::json!({
-                                        "kanban_task_id": t.id,
-                                        "kanban_task_title": t.title,
-                                    }),
-                                    embedding: None,
-                                    summary_text: None,
-                                    is_summary: false,
-                                    msg_type: "kanban".to_string(),
-                                    msg_subtype: Some(t.id.clone()),
-                                    processing_time_ms: None,
-                                    token_usage: None,
-                                };
-
-                                match queries::create_cause_and_set_pending(&pool, &cause_msg).await {
-                                    Ok(created) => {
-                                        tracing::info!(
-                                            "Created cause message {} and set thread {} pending for kanban task '{}' channel {}",
-                                            created.id, thread.id, t.id, task_channel_id
-                                        );
-                                    }
-                                    Err(e) => {
-                                        anyhow::bail!("Failed to create cause message for ready task '{}': {e}", t.id);
-                                    }
-                                }
-
-                                // Set thread status to 'pending' — handled inside create_cause_and_set_pending
-
-                                tracing::info!(
-                                    "Thread {} set to pending for kanban task '{}'",
-                                    thread.id, t.id
-                                );
-
-                                // Advance kanban task to 'ready' now that a thread has been queued
-                                sql_forge!(
-                                    "UPDATE kanban_tasks SET status = 'ready', updated_at = NOW() WHERE id = :id",
-                                    ( :id = &t.id )
-                                )
-                                .execute(&pool)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("Failed to advance task '{}' to ready: {e}", t.id))?;
-
-                                tracing::info!(
-                                    "Kanban task '{}' advanced to ready with thread {}",
-                                    t.id, thread.id
-                                );
-                            }
-                        }
-                    }
+                    // Note: Todo→ready flow is handled by kanban_dispatcher cron job
 
                     Ok::<_, anyhow::Error>(())
                 })

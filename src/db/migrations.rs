@@ -587,5 +587,22 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // ── Cron job mode, direct_task_type, active columns ──
+    sql_forge!(
+        r#"ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'agentic'"#,
+    )
+    .execute(pool)
+    .await?;
+    sql_forge!(
+        r#"ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS direct_task_type TEXT DEFAULT NULL"#,
+    )
+    .execute(pool)
+    .await?;
+    sql_forge!(
+        r#"ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true"#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

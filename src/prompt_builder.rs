@@ -19,10 +19,21 @@ const ENTRY_DELIMITER: &str = "\n§\n";
 
 // ── Character limits ────────────────────────────────────────────
 
-/// Max characters for the MEMORY block in the system prompt.
-const MEMORY_CHAR_LIMIT: usize = 10_000;
-/// Max characters for the USER profile block in the system prompt.
-const USER_CHAR_LIMIT: usize = 2_000;
+/// Read MEMORY_MAX_CHARS from env, default 5_000.
+fn memory_max_chars() -> usize {
+    std::env::var("MEMORY_MAX_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000)
+}
+
+/// Read USER_MAX_CHARS from env, default 1_000.
+fn user_max_chars() -> usize {
+    std::env::var("USER_MAX_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000)
+}
 
 // ── Stable identity / guidance texts ────────────────────────────
 
@@ -158,11 +169,11 @@ impl MemoryStore {
 
         self.snapshot.insert(
             "memory".to_string(),
-            self.render_block("memory", &memory_entries, MEMORY_CHAR_LIMIT),
+            self.render_block("memory", &memory_entries, memory_max_chars()),
         );
         self.snapshot.insert(
             "user".to_string(),
-            self.render_block("user", &user_entries, USER_CHAR_LIMIT),
+            self.render_block("user", &user_entries, user_max_chars()),
         );
     }
 
@@ -207,6 +218,17 @@ impl MemoryStore {
         }
         let content = entries.join(ENTRY_DELIMITER);
         let current = content.len();
+        let truncated = if current > limit {
+            let truncate_at = content
+                .char_indices()
+                .nth(limit)
+                .map(|(i, _)| i)
+                .unwrap_or(content.len());
+            content[..truncate_at].to_string()
+        } else {
+            content.clone()
+        };
+        let effective = truncated.len();
         let pct = if limit > 0 {
             std::cmp::min(100, (current as f64 / limit as f64 * 100.0) as usize)
         } else {
@@ -217,20 +239,20 @@ impl MemoryStore {
             format!(
                 "USER PROFILE (who the user is) [{}% — {}/{} chars]",
                 pct,
-                format_thousands(current),
+                format_thousands(effective),
                 format_thousands(limit)
             )
         } else {
             format!(
                 "MEMORY (your personal notes) [{}% — {}/{} chars]",
                 pct,
-                format_thousands(current),
+                format_thousands(effective),
                 format_thousands(limit)
             )
         };
 
         let separator = "═".repeat(46);
-        format!("{}\n{}\n{}\n{}", separator, header, separator, content)
+        format!("{}\n{}\n{}\n{}", separator, header, separator, truncated)
     }
 }
 

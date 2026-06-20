@@ -46,6 +46,14 @@ cargo sqlx prepare -- --bin omniagent
 - `src/prompt_builder.rs` — System prompt assembly
 - `src/context_builder.rs` — Context retrieval assembly
 
+### UI Modal Behavior
+
+**Modal close-on-outside-click rules:**
+1. **Form modals** (inputs, selects, textareas — user data entry): MUST NOT close when clicking outside. User must use Cancel/Close buttons. Examples: Create Schedule, Create Task, Edit Task, Install Plugin.
+2. **Information/confirmation modals** (read-only display, simple confirmations): MAY close on outside click. Examples: status popups, simple confirm dialogs.
+
+All modals should provide explicit close buttons (✕ close button + Cancel/Confirm buttons in footer).
+
 ### Tool Development
 - Each MCP tool gets its own file in `src/mcp/tools/<name>.rs`
 - Register in `default_registry()` in `src/mcp/mod.rs`

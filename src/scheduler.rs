@@ -108,7 +108,7 @@ async fn tick(pool: &PgPool, data_dir: &str) -> Result<()> {
                             "[cron-scheduler] Running kanban_dispatcher for job '{}'",
                             display_name
                         );
-                        run_kanban_dispatcher(pool).await?;
+                        run_kanban_dispatcher(pool, data_dir).await?;
                     }
                     "relevance_indexer" => {
                         info!(
@@ -159,12 +159,20 @@ async fn tick(pool: &PgPool, data_dir: &str) -> Result<()> {
         let prof = profile_registry.get(&profile_name).cloned().unwrap_or_else(|| {
             crate::profile::Profile::default("default")
         });
-        let provider = channel.current_provider.clone()
-            .or_else(|| prof.provider.clone())
-            .or_else(|| Some(std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "opencode-go".to_string())));
-        let model = channel.current_model.clone()
-            .or_else(|| prof.model.clone())
-            .or_else(|| Some(std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())));
+
+        // Use the shared resolution function for provider and model
+        let resolved = resolve_thread_config(
+            job.profile.as_deref(),
+            &channel.current_profile,
+            channel.current_provider.as_deref(),
+            channel.current_model.as_deref(),
+            prof.provider.as_deref(),
+            prof.model.as_deref(),
+        );
+        let (provider, model) = match resolved {
+            Some(cfg) => (Some(cfg.provider), Some(cfg.model)),
+            None => (None, None),
+        };
 
         // ── Create a thread with cause='cron' ──
         let thread = match queries::create_thread(
@@ -298,7 +306,7 @@ async fn ensure_cron_channel(pool: &PgPool) -> Result<crate::models::Channel> {
 /// Run the kanban_dispatcher: move all 'todo' tasks to 'ready' by creating
 /// threads and messages for each, respecting dependencies and ordering by
 /// priority DESC, position ASC.
-async fn run_kanban_dispatcher(pool: &PgPool) -> Result<()> {
+async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> {
     #[derive(Debug, FromRow)]
     struct TodoTaskRow {
         id: String,
@@ -368,24 +376,65 @@ async fn run_kanban_dispatcher(pool: &PgPool) -> Result<()> {
             }
         };
 
-        // Resolve profile
-        let profile_name = if let Some(ref p) = t.profile {
-            p.clone()
-        } else {
-            match queries::find_channel_by_id(pool, task_channel_id).await {
-                Ok(Some(ch)) => ch.current_profile.clone(),
-                _ => "default".to_string(),
+        // Load channel unconditionally (needed for profile, provider, model resolution)
+        let channel = match queries::find_channel_by_id(pool, task_channel_id).await {
+            Ok(Some(ch)) => ch,
+            _ => {
+                warn!(
+                    "[kanban-dispatcher] Channel {} not found for task '{}'",
+                    task_channel_id, t.id
+                );
+                continue;
             }
         };
 
-        // Create thread
+        // Resolve profile: task → channel → default
+        let profile_name = t
+            .profile
+            .clone()
+            .unwrap_or(channel.current_profile.clone());
+        if profile_name.is_empty() {
+            warn!(
+                "[kanban-dispatcher] No profile resolved for task '{}' (channel {})",
+                t.id, task_channel_id
+            );
+            continue;
+        }
+
+        // Resolve provider+model: channel → profile → env vars
+        let profile_registry = crate::profile::ProfileRegistry::new(data_dir);
+        let prof = profile_registry.get(&profile_name).cloned().unwrap_or_else(|| {
+            crate::profile::Profile::default("default")
+        });
+
+        let resolved = resolve_thread_config(
+            t.profile.as_deref(),
+            &channel.current_profile,
+            channel.current_provider.as_deref(),
+            channel.current_model.as_deref(),
+            prof.provider.as_deref(),
+            prof.model.as_deref(),
+        );
+
+        let (provider, model) = match resolved {
+            Some(cfg) => (cfg.provider, cfg.model),
+            None => {
+                warn!(
+                    "[kanban-dispatcher] Could not resolve config for task '{}' — empty profile",
+                    t.id
+                );
+                continue;
+            }
+        };
+
+        // Create thread with resolved profile, provider, and model
         let thread = match queries::create_thread(
             pool,
             "kanban",
             task_channel_id,
             &profile_name,
-            None,
-            None,
+            Some(&provider),
+            Some(&model),
             Some(&t.id),
             None,
         )
@@ -481,5 +530,280 @@ fn calculate_next_run(expression: &str, now: &DateTime<Utc>) -> DateTime<Utc> {
             warn!("Invalid cron expression '{}': {}", expression, e);
             *now + chrono::Duration::hours(1)
         }
+    }
+}
+
+// ─── Resolved thread config ───
+
+/// Resolved profile, provider, and model for thread creation.
+/// The chain is: explicit → channel → profile → env fallback.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedThreadConfig {
+    pub profile_name: String,
+    pub provider: String,
+    pub model: String,
+}
+
+/// Resolve the profile, provider, and model for a thread using the chain:
+///    profile_name: task/override → channel.current_profile
+///    provider:     channel.current_provider → profile.provider → LLM_PROVIDER env
+///    model:        channel.current_model → profile.model → LLM_MODEL env
+///
+/// Returns `None` when the resolved profile name is empty.
+pub(crate) fn resolve_thread_config(
+    explicit_profile: Option<&str>,
+    channel_profile: &str,
+    channel_provider: Option<&str>,
+    channel_model: Option<&str>,
+    profile_provider: Option<&str>,
+    profile_model: Option<&str>,
+) -> Option<ResolvedThreadConfig> {
+    let profile_name = explicit_profile
+        .filter(|s| !s.is_empty())
+        .unwrap_or(channel_profile)
+        .to_string();
+
+    if profile_name.is_empty() {
+        return None;
+    }
+
+    let provider = channel_provider
+        .filter(|s| !s.is_empty())
+        .or_else(|| profile_provider.filter(|s| !s.is_empty()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            std::env::var("LLM_PROVIDER")
+                .unwrap_or_else(|_| "opencode-go".to_string())
+        });
+
+    let model = channel_model
+        .filter(|s| !s.is_empty())
+        .or_else(|| profile_model.filter(|s| !s.is_empty()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            std::env::var("LLM_MODEL")
+                .unwrap_or_else(|_| "deepseek-v4-flash".to_string())
+        });
+
+    Some(ResolvedThreadConfig {
+        profile_name,
+        provider,
+        model,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Profile resolution ───
+
+    #[test]
+    fn test_profile_from_task() {
+        let cfg = resolve_thread_config(
+            Some("task-profile"),
+            "channel-profile",
+            None, None, None, None,
+        );
+        assert_eq!(cfg.unwrap().profile_name, "task-profile");
+    }
+
+    #[test]
+    fn test_profile_from_channel_when_task_none() {
+        let cfg = resolve_thread_config(
+            None,
+            "channel-profile",
+            None, None, None, None,
+        );
+        assert_eq!(cfg.unwrap().profile_name, "channel-profile");
+    }
+
+    #[test]
+    fn test_profile_from_channel_when_task_empty() {
+        let cfg = resolve_thread_config(
+            Some(""),
+            "channel-profile",
+            None, None, None, None,
+        );
+        assert_eq!(cfg.unwrap().profile_name, "channel-profile");
+    }
+
+    #[test]
+    fn test_profile_empty_returns_none() {
+        let cfg = resolve_thread_config(
+            None,
+            "",
+            None, None, None, None,
+        );
+        assert!(cfg.is_none());
+    }
+
+    #[test]
+    fn test_profile_empty_channel_with_empty_task_returns_none() {
+        let cfg = resolve_thread_config(
+            Some(""),
+            "",
+            None, None, None, None,
+        );
+        assert!(cfg.is_none());
+    }
+
+    // ─── Provider resolution ───
+
+    #[test]
+    fn test_provider_from_channel() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            Some("deepseek"), None,
+            Some("anthropic"), None,
+        );
+        assert_eq!(cfg.unwrap().provider, "deepseek");
+    }
+
+    #[test]
+    fn test_provider_falls_back_to_profile() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            None, None,
+            Some("anthropic"), None,
+        );
+        assert_eq!(cfg.unwrap().provider, "anthropic");
+    }
+
+    #[test]
+    fn test_provider_skip_empty_channel() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            Some(""), None,
+            Some("anthropic"), None,
+        );
+        assert_eq!(cfg.unwrap().provider, "anthropic");
+    }
+
+    #[test]
+    fn test_provider_channel_overrides_profile() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            Some("deepseek"), None,
+            Some("anthropic"), None,
+        );
+        assert_eq!(cfg.unwrap().provider, "deepseek");
+    }
+
+    // ─── Model resolution ───
+
+    #[test]
+    fn test_model_from_channel() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            None, Some("deepseek-v4-flash"),
+            None, Some("claude-3"),
+        );
+        assert_eq!(cfg.unwrap().model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn test_model_falls_back_to_profile() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            None, None,
+            None, Some("claude-3"),
+        );
+        assert_eq!(cfg.unwrap().model, "claude-3");
+    }
+
+    #[test]
+    fn test_model_channel_overrides_profile() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            None, Some("deepseek-v4-flash"),
+            None, Some("claude-3"),
+        );
+        assert_eq!(cfg.unwrap().model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn test_model_skip_empty_channel() {
+        let cfg = resolve_thread_config(
+            None, "default",
+            None, Some(""),
+            None, Some("claude-3"),
+        );
+        assert_eq!(cfg.unwrap().model, "claude-3");
+    }
+
+    // ─── Combined scenarios ───
+
+    #[test]
+    fn test_full_resolution_chain() {
+        let cfg = resolve_thread_config(
+            Some("my-profile"),
+            "channel-profile",
+            Some("deepseek"), Some("deepseek-v4-flash"),
+            None, None,
+        );
+        let c = cfg.unwrap();
+        assert_eq!(c.profile_name, "my-profile");
+        assert_eq!(c.provider, "deepseek");
+        assert_eq!(c.model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn test_full_fallback_all_from_channel() {
+        let cfg = resolve_thread_config(
+            None, "chan-profile",
+            Some("deepseek"), Some("deepseek-v4-flash"),
+            None, None,
+        );
+        let c = cfg.unwrap();
+        assert_eq!(c.profile_name, "chan-profile");
+        assert_eq!(c.provider, "deepseek");
+        assert_eq!(c.model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn test_full_fallback_all_from_profile() {
+        let cfg = resolve_thread_config(
+            None, "prof-profile",
+            None, None,
+            Some("anthropic"), Some("claude-3"),
+        );
+        let c = cfg.unwrap();
+        assert_eq!(c.profile_name, "prof-profile");
+        assert_eq!(c.provider, "anthropic");
+        assert_eq!(c.model, "claude-3");
+    }
+
+    #[test]
+    fn test_provider_and_model_fallthrough_together() {
+        // Both come from channel, ignoring profile values
+        let cfg = resolve_thread_config(
+            None, "default",
+            Some("deepseek"), Some("deepseek-v4-flash"),
+            Some("anthropic"), Some("claude-3"),
+        );
+        let c = cfg.unwrap();
+        assert_eq!(c.provider, "deepseek");
+        assert_eq!(c.model, "deepseek-v4-flash");
+    }
+
+    // ─── Agent validation scenario: thread without provider/model ───
+
+    #[test]
+    fn test_thread_without_provider_rejected() {
+        // Simulates the scenario that caused the bug:
+        // thread created with provider=None, model=None should be rejected
+        // by the agent's validation (tested via the resolve function contract)
+        let cfg = resolve_thread_config(
+            None, "default",
+            None, None,
+            None, None,
+        );
+        // resolve_thread_config always returns Some as long as profile is non-empty
+        // (it falls back to env vars). The *agent* checks thread.provider directly.
+        let c = cfg.unwrap();
+        // The strings should come from env var fallbacks (not None/empty)
+        assert!(!c.provider.is_empty(), "provider must not be empty even after full fallback");
+        assert!(!c.model.is_empty(), "model must not be empty even after full fallback");
     }
 }

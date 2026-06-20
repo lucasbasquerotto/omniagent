@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, FromRow)]
 struct KanbanTaskRow {
     id: String,
+    #[allow(dead_code)]
+    display_id: Option<i64>,
     title: String,
     body: Option<String>,
     status: String,
@@ -150,7 +152,7 @@ pub fn list_kanban_tasks_tool() -> McpTool {
                         sql_forge!(
                             KanbanTaskRow,
                             r#"
-                            SELECT id, title, body, status, priority, assignee, created_at, updated_at
+                            SELECT id, display_id, title, body, status, priority, assignee, created_at, updated_at
                             FROM kanban_tasks
                             WHERE status = :status
                             ORDER BY priority DESC, created_at DESC
@@ -164,7 +166,7 @@ pub fn list_kanban_tasks_tool() -> McpTool {
                         sql_forge!(
                             KanbanTaskRow,
                             r#"
-                            SELECT id, title, body, status, priority, assignee, created_at, updated_at
+                            SELECT id, display_id, title, body, status, priority, assignee, created_at, updated_at
                             FROM kanban_tasks
                             WHERE 1 = :_one
                             ORDER BY status, priority DESC, created_at DESC

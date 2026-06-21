@@ -90,6 +90,7 @@ pub fn plugin_manager_tool() -> McpTool {
                     let plugin_type_str = match manifest.plugin_type {
                         plugin::PluginType::Platform => "platform",
                         plugin::PluginType::Mcp => "mcp",
+                        plugin::PluginType::Provider => "provider",
                     };
 
                     let row = tokio::task::block_in_place(|| {

@@ -30,7 +30,8 @@ pub struct PluginManifest {
     #[serde(rename = "type")]
     pub plugin_type: PluginType,
     pub description: Option<String>,
-    pub entrypoint: PluginEntrypoint,
+    #[serde(default)]
+    pub entrypoint: Option<PluginEntrypoint>,
     pub capabilities: Option<PluginCapabilities>,
     #[serde(default)]
     pub config_schema: Vec<ConfigSchemaField>,
@@ -39,6 +40,12 @@ pub struct PluginManifest {
     /// Only used for platform plugins (ignored for MCP tools).
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Default base URL for provider plugins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_base_url: Option<String>,
+    /// API mode for provider plugins ("chat_completions", "anthropic_messages", "dynamic").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,6 +53,7 @@ pub struct PluginManifest {
 pub enum PluginType {
     Platform,
     Mcp,
+    Provider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +410,7 @@ pub async fn sync_plugins_from_disk(pool: &PgPool, data_dir: &str) -> Result<()>
         let plugin_type_str = match manifest.plugin_type {
             PluginType::Platform => "platform",
             PluginType::Mcp => "mcp",
+            PluginType::Provider => "provider",
         };
 
         match upsert_plugin(

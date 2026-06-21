@@ -23,12 +23,12 @@ use crate::server::AppState;
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct UpdateConfigRequest {
+pub(crate) struct UpdateConfigRequest {
     config: serde_json::Value,
 }
 
 #[derive(Deserialize)]
-struct InstallUrlRequest {
+pub(crate) struct InstallUrlRequest {
     url: String,
 }
 
@@ -62,12 +62,12 @@ fn err_response(msg: impl Into<String>) -> Json<ApiResponse<serde_json::Value>> 
 pub fn plugin_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/plugins", get(list_plugins_handler))
-        .route("/api/plugins/:name", get(get_plugin_handler))
-        .route("/api/plugins/:name/config", post(update_config_handler))
-        .route("/api/plugins/:name/enable", post(enable_plugin_handler))
-        .route("/api/plugins/:name/disable", post(disable_plugin_handler))
-        .route("/api/plugins/:name/reinstall", post(reinstall_plugin_handler))
-        .route("/api/plugins/:name", delete(delete_plugin_handler))
+        .route("/api/plugins/{name}", get(get_plugin_handler))
+        .route("/api/plugins/{name}/config", post(update_config_handler))
+        .route("/api/plugins/{name}/enable", post(enable_plugin_handler))
+        .route("/api/plugins/{name}/disable", post(disable_plugin_handler))
+        .route("/api/plugins/{name}/reinstall", post(reinstall_plugin_handler))
+        .route("/api/plugins/{name}", delete(delete_plugin_handler))
         .route("/api/plugins/install-url", post(install_url_handler))
 }
 
@@ -76,7 +76,7 @@ pub fn plugin_router() -> Router<Arc<AppState>> {
 // ---------------------------------------------------------------------------
 
 /// GET /api/plugins — list all plugins (with health/enriched data).
-async fn list_plugins_handler(
+pub async fn list_plugins_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     match plugin::list_plugins(&state.pool).await {
@@ -99,7 +99,7 @@ async fn list_plugins_handler(
 }
 
 /// GET /api/plugins/:name — get single plugin detail.
-async fn get_plugin_handler(
+pub async fn get_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -128,7 +128,7 @@ async fn get_plugin_handler(
 }
 
 /// POST /api/plugins/:name/config — update plugin config.
-async fn update_config_handler(
+pub async fn update_config_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateConfigRequest>,
@@ -160,7 +160,7 @@ async fn update_config_handler(
 }
 
 /// POST /api/plugins/:name/enable — set status to 'enabled'.
-async fn enable_plugin_handler(
+pub async fn enable_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -191,7 +191,7 @@ async fn enable_plugin_handler(
 }
 
 /// POST /api/plugins/:name/disable — set status to 'disabled'.
-async fn disable_plugin_handler(
+pub async fn disable_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -222,7 +222,7 @@ async fn disable_plugin_handler(
 }
 
 /// POST /api/plugins/:name/reinstall — re-scan from disk and reload.
-async fn reinstall_plugin_handler(
+pub async fn reinstall_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -263,7 +263,7 @@ async fn reinstall_plugin_handler(
 }
 
 /// DELETE /api/plugins/:name — remove from registry and files.
-async fn delete_plugin_handler(
+pub async fn delete_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -294,7 +294,7 @@ async fn delete_plugin_handler(
 }
 
 /// POST /api/plugins/install-url — install a plugin from a URL.
-async fn install_url_handler(
+pub async fn install_url_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InstallUrlRequest>,
 ) -> impl IntoResponse {

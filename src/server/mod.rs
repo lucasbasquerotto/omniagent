@@ -37,6 +37,7 @@ use crate::mcp::{AppContext, McpRegistry, McpToolCall};
 use crate::prompt_builder::{build_planning_prompt, build_system_prompt, MemoryStore};
 
 pub mod plugins;
+mod diagnostic;
 /// Shared application state for the HTTP server.
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -72,23 +73,39 @@ pub async fn start_server(
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/stop/:channel_id", post(stop_handler))
-        .route("/stop/:channel_id", get(stop_handler))
-        .route("/close/:channel_id", post(close_handler))
-        .route("/close/:channel_id", get(close_handler))
-        .route("/open/:channel_id", post(open_handler))
-        .route("/open/:channel_id", get(open_handler))
-        .route("/status/:channel_id", get(status_handler))
-        .route("/prompt/:channel_name", get(prompt_handler))
-        .route("/prompt-preview/:channel_name", post(prompt_preview_handler))
+        .route("/stop/{channel_id}", post(stop_handler))
+        .route("/stop/{channel_id}", get(stop_handler))
+        .route("/close/{channel_id}", post(close_handler))
+        .route("/close/{channel_id}", get(close_handler))
+        .route("/open/{channel_id}", post(open_handler))
+        .route("/open/{channel_id}", get(open_handler))
+        .route("/status/{channel_id}", get(status_handler))
+        .route("/prompt/{channel_name}", get(prompt_handler))
+        .route("/prompt-preview/{channel_name}", post(prompt_preview_handler))
         .route("/actions", get(list_actions_handler))
         .route("/actions", post(create_action_handler))
-        .route("/actions/:id", put(update_action_handler))
-        .route("/actions/:id", delete(delete_action_handler))
-        .route("/actions/:id/run", post(run_action_handler))
+        .route("/actions/{id}", put(update_action_handler))
+        .route("/actions/{id}", delete(delete_action_handler))
+        .route("/actions/{id}/run", post(run_action_handler))
         .route("/mcp/tools", get(list_mcp_tools_handler))
-        .nest("/settings", settings::settings_router())
-        .merge(plugins::plugin_router())
+        // ── Plugin management routes ──
+        .route("/api/plugins/ping", get(|| async { "pong" }))
+        .route("/api/plugins/check-state", get(diagnostic::check_state))
+        .route("/api/plugins/check-db", get(diagnostic::check_db))
+        .route("/api/plugins/check-list", get(diagnostic::check_list_plugins))
+        .route("/api/plugins/check-env", get(diagnostic::check_env_read))
+        .route("/api/plugins/check-enrich", get(diagnostic::check_enrich_json))
+        .route("/api/plugins", get(plugins::list_plugins_handler))
+        .route("/api/plugins/{name}", get(plugins::get_plugin_handler))
+        .route("/api/plugins/{name}/config", post(plugins::update_config_handler))
+        .route("/api/plugins/{name}/enable", post(plugins::enable_plugin_handler))
+        .route("/api/plugins/{name}/disable", post(plugins::disable_plugin_handler))
+        .route("/api/plugins/{name}/reinstall", post(plugins::reinstall_plugin_handler))
+        .route("/api/plugins/{name}", delete(plugins::delete_plugin_handler))
+        .route("/api/plugins/install-url", post(plugins::install_url_handler))
+        // ── Settings routes ──
+        .route("/settings", get(settings::get_settings_handler))
+        .route("/settings", put(settings::update_settings_handler))
         .with_state(app_state);
 
     let addr = format!("{}:{}", host, port);
@@ -670,7 +687,7 @@ async fn run_action_handler(
 
     // 3. Execute via MCP registry
     let ctx = state.app_context.clone();
-    match state.mcp_registry.execute(&mcp_call, ctx) {
+    match state.mcp_registry.execute(&mcp_call, ctx).await {
         Ok(result) => {
             Json(serde_json::json!({
                 "action_id": action.id,

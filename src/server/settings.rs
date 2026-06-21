@@ -463,11 +463,16 @@ fn categorize_settings(defs: Vec<(String, String, SettingMeta)>) -> Vec<SettingC
 // ── Handlers ──
 
 /// GET /settings — return all settings organized by category.
-async fn get_settings_handler(
+pub async fn get_settings_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<SettingsResponse> {
     // Reload .env file to get current values, then merge with defaults
-    let env_vars = load_env_file(&state.env_path);
+    let env_path = state.env_path.clone();
+    let env_vars = tokio::task::spawn_blocking(move || {
+        load_env_file(&env_path)
+    })
+    .await
+    .unwrap_or_default();
 
     let defs: Vec<(String, String, SettingMeta)> = get_all_setting_definitions()
         .into_iter()
@@ -488,7 +493,7 @@ async fn get_settings_handler(
 }
 
 /// PUT /settings — update one or more settings and write to .env.
-async fn update_settings_handler(
+pub async fn update_settings_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateSettingsRequest>,
 ) -> impl IntoResponse {
@@ -499,7 +504,12 @@ async fn update_settings_handler(
         );
     }
 
-    let mut env_vars = load_env_file(&state.env_path);
+    let env_path_read = state.env_path.clone();
+    let mut env_vars = tokio::task::spawn_blocking(move || {
+        load_env_file(&env_path_read)
+    })
+    .await
+    .unwrap_or_default();
 
     // Known writable setting names for validation
     let writable_keys: std::collections::HashSet<&str> = [
@@ -545,7 +555,13 @@ async fn update_settings_handler(
         applied.push(update.name.clone());
     }
 
-    match write_env_file(&state.env_path, &env_vars) {
+    let env_path_write = state.env_path.clone();
+    match tokio::task::spawn_blocking(move || {
+        write_env_file(&env_path_write, &env_vars)
+    })
+    .await
+    .unwrap_or(Err("spawn_blocking failed".to_string()))
+    {
         Ok(()) => {
             tracing::info!("Settings updated: {:?}", applied);
             (

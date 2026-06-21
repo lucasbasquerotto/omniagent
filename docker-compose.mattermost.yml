@@ -1,0 +1,75 @@
+services:
+  mattermost-db:
+    image: postgres:16.14
+    container_name: omm-mm-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: omniagent
+      POSTGRES_PASSWORD: omniagent
+      POSTGRES_DB: mattermost
+    volumes:
+      - mattermost-db-vol:/var/lib/postgresql/data:rw
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omniagent -d mattermost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    mem_limit: 256M
+    networks:
+      - omniagent_default
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:10.11.20
+    container_name: omm-mattermost
+    restart: unless-stopped
+    command: ["/mattermost/bin/mattermost", "server"]
+    depends_on:
+      mattermost-db:
+        condition: service_healthy
+    expose:
+      - "8065"
+    ports:
+      - "12340:8065"
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgres://omniagent:omniagent@mattermost-db:5432/mattermost?sslmode=disable
+      MM_SERVICESETTINGS_SITEURL: http://localhost:12340
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+    volumes:
+      - mattermost-config-vol:/mattermost/config:rw
+      - mattermost-data-vol:/mattermost/data:rw
+      - mattermost-logs-vol:/mattermost/logs:rw
+      - mattermost-plugins-vol:/mattermost/plugins:rw
+    mem_limit: 1G
+    networks:
+      - omniagent_default
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  omniagent_default:
+    external: true
+
+volumes:
+  mattermost-db-vol:
+    name: omm-mm-db
+  mattermost-config-vol:
+    name: omm-mm-config
+  mattermost-data-vol:
+    name: omm-mm-data
+  mattermost-logs-vol:
+    name: omm-mm-logs
+  mattermost-plugins-vol:
+    name: omm-mm-plugins

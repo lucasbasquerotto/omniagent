@@ -242,106 +242,13 @@ pub fn uninstall(name: &str, data_dir: &str) -> Result<()> {
 /// Scans:
 /// - `<data_dir>/plugins/installed/<name>/plugin.json` — source: "installed"
 /// - `<workspace_dir>/plugins/<type>/<name>/plugin.json` — source: "bundled"
-///
-/// For backward compatibility, ALSO scans:
-/// - `<data_dir>/config/platforms.json` — source: "legacy_platform"
-/// - `<data_dir>/config/mcp-servers.json` — source: "legacy_mcp"
 pub fn discover_plugins(
     data_dir: &str,
     workspace_dir: &str,
 ) -> Vec<(PluginManifest, String, String)> {
     let mut results = Vec::new();
 
-    // [ORDER IMPORTANT] Legacy backward-compatibility scans MUST come FIRST
-    // so that real plugin.json files from installed/bundled scans OVERRIDE them.
-    // The upsert in sync_plugins_from_disk uses ON CONFLICT DO UPDATE, so
-    // later entries with the same name win over earlier ones.
-
-    // A. Legacy backward compatibility: platforms.json → synthetic platform plugin
-    let platforms_config = format!("{}/config/platforms.json", data_dir);
-    if Path::new(&platforms_config).exists() {
-        match std::fs::read_to_string(&platforms_config) {
-            Ok(content) => {
-                if let Ok(config) = serde_json::from_str::<crate::platform::external::PlatformPluginsConfig>(&content) {
-                    for plugin_cfg in &config.platforms {
-                        let manifest = PluginManifest {
-                            name: plugin_cfg.name.clone(),
-                            version: "0.1.0".to_string(),
-                            plugin_type: PluginType::Platform,
-                            description: Some(format!(
-                                "Legacy platform plugin '{}'",
-                                plugin_cfg.name
-                            )),
-                            entrypoint: crate::plugin::PluginEntrypoint {
-                                command: plugin_cfg.command.clone(),
-                                args: plugin_cfg.args.clone(),
-                                transport: "stdio".to_string(),
-                                url: None,
-                            },
-                            capabilities: Some(crate::plugin::PluginCapabilities {
-                                inbound: true,
-                                outbound: true,
-                            }),
-                            config_schema: vec![],
-                        };
-                        results.push((manifest, "legacy_platform".to_string(), platforms_config.clone()));
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read legacy platforms config {}: {:?}",
-                    platforms_config,
-                    e
-                );
-            }
-        }
-    }
-
-    // B. Legacy backward compatibility: mcp-servers.json → synthetic MCP plugin
-    let mcp_config = format!("{}/config/mcp-servers.json", data_dir);
-    if Path::new(&mcp_config).exists() {
-        match std::fs::read_to_string(&mcp_config) {
-            Ok(content) => {
-                if let Ok(config) = serde_json::from_str::<crate::mcp::external::config::McpServersConfig>(&content) {
-                    for server_cfg in &config.servers {
-                        let transport_str = match server_cfg.transport {
-                            crate::mcp::external::config::McpTransport::Stdio => "stdio",
-                            crate::mcp::external::config::McpTransport::Http => "http",
-                        };
-                        let manifest = PluginManifest {
-                            name: server_cfg.name.clone(),
-                            version: "0.1.0".to_string(),
-                            plugin_type: PluginType::Mcp,
-                            description: Some(format!(
-                                "Legacy MCP server '{}'",
-                                server_cfg.name
-                            )),
-                            entrypoint: crate::plugin::PluginEntrypoint {
-                                command: server_cfg.command.clone().unwrap_or_default(),
-                                args: server_cfg.args.clone(),
-                                transport: transport_str.to_string(),
-                                url: server_cfg.url.clone(),
-                            },
-                            capabilities: None,
-                            config_schema: vec![],
-                        };
-                        results.push((manifest, "legacy_mcp".to_string(), mcp_config.clone()));
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read legacy MCP config {}: {:?}",
-                    mcp_config,
-                    e
-                );
-            }
-        }
-    }
-
-    // C. Scan installed plugins: <data_dir>/plugins/installed/<name>/plugin.json
-    //    Runs AFTER legacy scans so real plugin.json data (including config_schema) overrides synthetic manifests.
+    // A. Scan installed plugins: <data_dir>/plugins/installed/<name>/plugin.json
     let installed_base = format!("{}/plugins/installed", data_dir);
     if let Ok(entries) = std::fs::read_dir(&installed_base) {
         for entry in entries.flatten() {
@@ -364,8 +271,7 @@ pub fn discover_plugins(
         }
     }
 
-    // D. Scan bundled plugins: <workspace_dir>/plugins/<type>/<name>/plugin.json
-    //    Runs AFTER legacy scans so real plugin.json data overrides synthetic manifests.
+    // B. Scan bundled plugins: <workspace_dir>/plugins/<type>/<name>/plugin.json
     let bundled_base = format!("{}/plugins", workspace_dir);
     if let Ok(bundled_entries) = std::fs::read_dir(&bundled_base) {
         for entry in bundled_entries.flatten() {
@@ -426,6 +332,7 @@ pub fn discover_plugins(
                 },
                 capabilities: None,
                 config_schema: vec![],
+                env: std::collections::HashMap::new(),
             };
             results.push((manifest, "mcp_config".to_string(), String::new()));
         }

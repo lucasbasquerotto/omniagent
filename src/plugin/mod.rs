@@ -11,8 +11,10 @@ pub mod installer;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sql_forge::sql_forge;
 use sqlx::{FromRow, PgPool};
+use std::collections::HashMap;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +34,11 @@ pub struct PluginManifest {
     pub capabilities: Option<PluginCapabilities>,
     #[serde(default)]
     pub config_schema: Vec<ConfigSchemaField>,
+    /// Environment variables for the plugin subprocess.
+    /// Supports ${VAR} syntax for runtime resolution from the host env.
+    /// Only used for platform plugins (ignored for MCP tools).
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -128,6 +135,11 @@ pub struct PluginDetail {
     pub manifest: serde_json::Value,
     pub config: serde_json::Value,
     pub config_schema: Vec<ConfigSchemaField>,
+    /// Resolved environment variables from the manifest's env block.
+    /// ${VAR} references are resolved against the process environment.
+    /// Merged with DB config: DB config values take precedence over env.
+    #[serde(default)]
+    pub resolved_env: HashMap<String, String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -294,7 +306,7 @@ pub async fn delete_plugin(pool: &PgPool, name: &str) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
-/// Convert a PluginRegistryRow into a PluginDetail (enriched with parsed schema).
+/// Convert a PluginRegistryRow into a PluginDetail (enriched with parsed schema + resolved env).
 pub fn enrich_plugin(row: &PluginRegistryRow) -> PluginDetail {
     let config_schema = row.manifest["config_schema"]
         .as_array()
@@ -304,6 +316,24 @@ pub fn enrich_plugin(row: &PluginRegistryRow) -> PluginDetail {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
+    // Resolve env vars from manifest's env block, then merge DB config on top
+    let manifest_env = row.manifest["env"].as_object().cloned().unwrap_or_default();
+    let mut resolved = HashMap::new();
+    for (key, val) in &manifest_env {
+        let raw = val.as_str().unwrap_or("");
+        let resolved_val = resolve_env_var(raw);
+        resolved.insert(key.clone(), resolved_val);
+    }
+    // DB config overrides env vars
+    if let Some(db_config) = row.config.as_object() {
+        for (key, val) in db_config {
+            resolved.insert(
+                key.clone(),
+                val.as_str().map(|s| s.to_string()).unwrap_or_default(),
+            );
+        }
+    }
 
     PluginDetail {
         id: row.id,
@@ -315,9 +345,27 @@ pub fn enrich_plugin(row: &PluginRegistryRow) -> PluginDetail {
         manifest: row.manifest.clone(),
         config: row.config.clone(),
         config_schema,
+        resolved_env: resolved,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
+}
+
+/// Resolve ${VAR} references in a string against the process environment.
+/// Leaves unresolvable references as-is (e.g. ${MISSING_VAR} stays literal).
+fn resolve_env_var(value: &str) -> String {
+    let mut result = value.to_string();
+    // Match ${VAR_NAME} patterns and replace with env value if found
+    while let Some(start) = result.find("${") {
+        if let Some(end) = result[start..].find('}') {
+            let var_name = &result[start + 2..start + end];
+            let replacement = std::env::var(var_name).unwrap_or_else(|_| format!("${{{}}}", var_name));
+            result.replace_range(start..start + end + 1, &replacement);
+        } else {
+            break;
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------

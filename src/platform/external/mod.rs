@@ -50,14 +50,17 @@ pub struct PlatformPluginsConfig {
     pub platforms: Vec<PlatformPluginConfig>,
 }
 
-/// Load platform plugin configurations from config file.
+/// Load platform plugin configurations from config file and installed plugins.
 ///
-/// Looks for the config file at:
-/// 1. Path specified in `PLATFORMS_CONFIG` env var
-/// 2. `<data_dir>/config/platforms.json`
+/// Sources (later entries override earlier ones by name):
+/// 1. `<data_dir>/config/platforms.json` — legacy config
+/// 2. `<data_dir>/plugins/installed/<name>/plugin.json` — installed plugins with type=platform
 ///
-/// Returns an empty list if no config file is found.
+/// Returns an empty list if no platform plugins are found.
 pub fn load_plugins_config(data_dir: &str) -> Vec<PlatformPluginConfig> {
+    let mut results: Vec<PlatformPluginConfig> = Vec::new();
+
+    // 1. Legacy platforms.json
     let config_path = std::env::var("PLATFORMS_CONFIG").ok().or_else(|| {
         let default = format!("{}/config/platforms.json", data_dir);
         let path = Path::new(&default);
@@ -68,8 +71,8 @@ pub fn load_plugins_config(data_dir: &str) -> Vec<PlatformPluginConfig> {
         }
     });
 
-    match config_path {
-        Some(path) => match std::fs::read_to_string(&path) {
+    if let Some(path) = config_path {
+        match std::fs::read_to_string(&path) {
             Ok(content) => match serde_json::from_str::<PlatformPluginsConfig>(&content) {
                 Ok(config) => {
                     tracing::info!(
@@ -77,7 +80,7 @@ pub fn load_plugins_config(data_dir: &str) -> Vec<PlatformPluginConfig> {
                         config.platforms.len(),
                         path
                     );
-                    config.platforms
+                    results = config.platforms;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -85,7 +88,6 @@ pub fn load_plugins_config(data_dir: &str) -> Vec<PlatformPluginConfig> {
                         path,
                         e
                     );
-                    vec![]
                 }
             },
             Err(e) => {
@@ -94,14 +96,71 @@ pub fn load_plugins_config(data_dir: &str) -> Vec<PlatformPluginConfig> {
                     path,
                     e
                 );
-                vec![]
             }
-        },
-        None => {
-            tracing::info!("No platforms config found (set PLATFORMS_CONFIG env var)");
-            vec![]
+        }
+    } else {
+        tracing::info!("No platforms config found (set PLATFORMS_CONFIG env var)");
+    }
+
+    // 2. Installed platform plugins (override legacy by name)
+    let installed_dir = format!("{}/plugins/installed", data_dir);
+    if let Ok(entries) = std::fs::read_dir(&installed_dir) {
+        for entry in entries.flatten() {
+            let plugin_dir = entry.path();
+            if !plugin_dir.is_dir() {
+                continue;
+            }
+            let plugin_json_path = plugin_dir.join("plugin.json");
+            if !plugin_json_path.exists() {
+                continue;
+            }
+            match std::fs::read_to_string(&plugin_json_path) {
+                Ok(content) => {
+                    match serde_json::from_str::<crate::plugin::PluginManifest>(&content) {
+                        Ok(manifest) => {
+                            if manifest.plugin_type != crate::plugin::PluginType::Platform {
+                                continue;
+                            }
+                            let config = PlatformPluginConfig {
+                                name: manifest.name.clone(),
+                                enabled: true,
+                                command: manifest.entrypoint.command,
+                                args: manifest.entrypoint.args,
+                                env: manifest.env,
+                                max_retries: 3,
+                            };
+                            // Override legacy entry with same name
+                            if let Some(pos) = results.iter().position(|p| p.name == manifest.name) {
+                                tracing::info!(
+                                    "Platform plugin '{}' overridden by installed manifest",
+                                    manifest.name
+                                );
+                                results[pos] = config;
+                            } else {
+                                results.push(config);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse installed plugin manifest {}: {:?}",
+                                plugin_json_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read installed plugin manifest {}: {:?}",
+                        plugin_json_path.display(),
+                        e
+                    );
+                }
+            }
         }
     }
+
+    results
 }
 
 /// Resolve environment variable references in a config value.

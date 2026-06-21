@@ -1,0 +1,85 @@
+{
+  "name": "mattermost",
+  "version": "1.0.0",
+  "type": "platform",
+  "description": "Mattermost platform — send and receive messages via Mattermost REST API",
+  "entrypoint": {
+    "command": "./plugins/platforms/mattermost/target/release/mattermost-platform",
+    "args": [],
+    "transport": "stdio"
+  },
+  "capabilities": {
+    "inbound": true,
+    "outbound": true
+  },
+  "config_schema": [
+    {
+      "key": "server_url",
+      "label": "Mattermost Server URL",
+      "type": "string",
+      "required": false,
+      "default": "http://mattermost:8065",
+      "description": "Base URL of the Mattermost server. Pre-configured via MATTERMOST_SERVER_URL env var."
+    },
+    {
+      "key": "access_token",
+      "label": "Personal Access Token",
+      "type": "secret",
+      "required": false,
+      "secret": true,
+      "description": "Mattermost personal access token for the bot account. Pre-configured via MATTERMOST_ACCESS_TOKEN env var."
+    },
+    {
+      "key": "polling_enabled",
+      "label": "Enable inbound polling",
+      "type": "boolean",
+      "required": false,
+      "default": true,
+      "description": "Poll Mattermost for incoming messages (only used in polling mode)"
+    },
+    {
+      "key": "polling_interval",
+      "label": "Polling interval (seconds)",
+      "type": "integer",
+      "required": false,
+      "default": 15,
+      "min": 5,
+      "max": 300,
+      "description": "How often to poll for new messages (only used in polling mode)"
+    },
+    {
+      "key": "channel_ids",
+      "label": "Channel IDs to watch",
+      "type": "string",
+      "required": false,
+      "default": "",
+      "description": "Comma-separated list of channel IDs to watch for inbound messages"
+    },
+    {
+      "key": "bot_username",
+      "label": "Bot Username",
+      "type": "string",
+      "required": false,
+      "default": "omniagent",
+      "description": "Username of the Mattermost bot account"
+    },
+    {
+      "key": "connection_mode",
+      "label": "Connection Mode",
+      "type": "enum",
+      "required": false,
+      "default": "polling",
+      "allowed_values": ["polling", "websocket"],
+      "description": "How to detect new messages: 'polling' or 'websocket' (real-time)"
+    }
+  ],
+  "env": {
+    "MATTERMOST_SERVER_URL": "${MATTERMOST_SERVER_URL}",
+    "MATTERMOST_ACCESS_TOKEN": "${MATTERMOST_ACCESS_TOKEN}",
+    "MATTERMOST_POLLING_ENABLED": "${MATTERMOST_POLLING_ENABLED}",
+    "MATTERMOST_POLLING_INTERVAL": "${MATTERMOST_POLLING_INTERVAL}",
+    "MATTERMOST_BOT_USERNAME": "${MATTERMOST_BOT_USERNAME}",
+    "MATTERMOST_CHANNEL_IDS": "${MATTERMOST_CHANNEL_IDS}",
+    "MATTERMOST_CONNECTION_MODE": "${MATTERMOST_CONNECTION_MODE}"
+  }
+}

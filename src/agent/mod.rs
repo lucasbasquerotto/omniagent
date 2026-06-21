@@ -81,12 +81,9 @@ impl AgentConfig {
         Ok(Self {
             llm_api_key: std::env::var("LLM_API_KEY")
                 .or_else(|_| {
-                    let provider = std::env::var("LLM_PROVIDER").unwrap_or_default();
-                    if provider == "deepseek" {
-                        std::env::var("DEEPSEEK_API_KEY")
-                    } else {
-                        Err(std::env::VarError::NotPresent)
-                    }
+                    // Backward compat: DEEPSEEK_API_KEY is the legacy env var
+                    // for the deepseek provider, registered via provider plugin.
+                    std::env::var("DEEPSEEK_API_KEY")
                 })
                 .unwrap_or_default(),
             llm_model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4".to_string()),

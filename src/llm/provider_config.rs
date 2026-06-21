@@ -29,15 +29,7 @@ pub async fn resolve_provider_config(
             let manifest: plugin::PluginManifest =
                 serde_json::from_value(row.manifest.clone())?;
             let base_url = manifest.default_base_url.unwrap_or_else(|| {
-                // Built-in defaults match from_env()
-                match provider_name {
-                    "opencode-go" => "https://opencode.ai/zen/go/v1",
-                    "openai" => "https://api.openai.com/v1",
-                    "anthropic" => "https://api.anthropic.com/v1",
-                    "deepseek" => "https://api.deepseek.com/v1",
-                    _ => "",
-                }
-                .to_string()
+                crate::llm::resolve_default_base_url(provider_name)
             });
             let api_mode = manifest
                 .api_mode

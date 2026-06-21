@@ -14,8 +14,11 @@
 //!   API mode is auto-detected from the model name.
 
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 
 pub mod provider_config;
 
@@ -41,6 +44,121 @@ impl fmt::Display for ProviderId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Provider metadata — loaded from plugin manifests at startup
+// ---------------------------------------------------------------------------
+
+/// Provider defaults loaded from plugin manifests (plugins/providers/*/plugin.json).
+#[derive(Debug, Clone)]
+pub struct ProviderMetadata {
+    pub name: String,
+    pub default_base_url: String,
+    pub api_mode: String,
+}
+
+/// Scan filesystem directories for provider plugin manifests and return a map.
+fn scan_provider_manifests(dirs: &[&str]) -> HashMap<String, ProviderMetadata> {
+    let mut map = HashMap::new();
+    for dir in dirs {
+        let base = Path::new(dir);
+        if !base.exists() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(base) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let plugin_dir = entry.path();
+            if !plugin_dir.is_dir() {
+                continue;
+            }
+            let manifest_path = plugin_dir.join("plugin.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&manifest_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let manifest: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let plugin_type = manifest.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if plugin_type != "provider" {
+                continue;
+            }
+            let name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let default_base_url = manifest
+                .get("default_base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let api_mode = manifest
+                .get("api_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("chat_completions")
+                .to_string();
+            map.insert(name.clone(), ProviderMetadata {
+                name,
+                default_base_url,
+                api_mode,
+            });
+        }
+    }
+    map
+}
+
+/// Static cache of provider metadata loaded from plugin manifests.
+/// Scans development sources first (plugins/providers/), then installed
+/// plugins (data/plugins/installed/). Installed plugins override bundled ones.
+pub static PROVIDER_METADATA: Lazy<HashMap<String, ProviderMetadata>> = Lazy::new(|| {
+    let workspace_dir = std::env::var("WORKSPACE_DIR").unwrap_or_else(|_| "/opt/workspace".to_string());
+    let data_dir = std::env::var("OMNI_DATA_DIR").unwrap_or_else(|_| "/opt/data".to_string());
+
+    let bundled = format!("{}/plugins/providers", workspace_dir);
+    let installed = format!("{}/plugins/installed", data_dir);
+
+    // Bundled first, then installed overrides
+    let mut map = scan_provider_manifests(&[&bundled, &installed]);
+
+    // If no providers found, add minimal builtin defaults as last resort
+    if map.is_empty() {
+        map.insert("opencode-go".to_string(), ProviderMetadata {
+            name: "opencode-go".to_string(),
+            default_base_url: "https://opencode.ai/zen/go/v1".to_string(),
+            api_mode: "dynamic".to_string(),
+        });
+        map.insert("deepseek".to_string(), ProviderMetadata {
+            name: "deepseek".to_string(),
+            default_base_url: "https://api.deepseek.com/v1".to_string(),
+            api_mode: "chat_completions".to_string(),
+        });
+    }
+
+    map
+});
+
+/// Resolve the default base URL for a provider from the plugin metadata.
+pub fn resolve_default_base_url(provider_name: &str) -> String {
+    PROVIDER_METADATA
+        .get(provider_name)
+        .map(|m| m.default_base_url.clone())
+        .unwrap_or_default()
+}
+
+/// Resolve the API mode for a provider from the plugin metadata.
+pub fn resolve_provider_api_mode(provider_name: &str) -> String {
+    PROVIDER_METADATA
+        .get(provider_name)
+        .map(|m| m.api_mode.clone())
+        .unwrap_or_else(|| "chat_completions".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -73,17 +191,14 @@ pub fn opencode_model_api_mode(model_id: &str) -> ApiMode {
 
 impl ApiMode {
     /// Resolve the API mode for a given provider + model combination.
+    /// Provider defaults come from the plugin manifest (PROVIDER_METADATA).
+    /// The "dynamic" mode auto-detects based on model name (used by opencode-go).
     pub fn resolve(provider_name: &str, model_id: &str) -> Self {
-        match provider_name {
-            "opencode-go" => opencode_model_api_mode(model_id),
-            "openai" => ApiMode::ChatCompletions,
-            "anthropic" => ApiMode::AnthropicMessages,
-            "deepseek" => ApiMode::ChatCompletions,
-            _ => {
-                // For unknown/custom providers, default to chat_completions
-                // as it's more common
-                ApiMode::ChatCompletions
-            }
+        let mode = resolve_provider_api_mode(provider_name);
+        match mode.as_str() {
+            "dynamic" => opencode_model_api_mode(model_id),
+            "anthropic_messages" => ApiMode::AnthropicMessages,
+            _ => ApiMode::ChatCompletions,
         }
     }
 }
@@ -121,16 +236,14 @@ impl LLMConfig {
         let provider = ProviderId::new(&provider_name);
         let api_mode = ApiMode::resolve(&provider_name, &model);
 
-        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match provider_name.as_str() {
-            "opencode-go" => "https://opencode.ai/zen/go/v1".to_string(),
-            "openai" => "https://api.openai.com/v1".to_string(),
-            "anthropic" => "https://api.anthropic.com/v1".to_string(),
-            "deepseek" => "https://api.deepseek.com/v1".to_string(),
-            _ => String::new(),
+        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| {
+            resolve_default_base_url(&provider_name)
         });
 
         let api_key = match provider_name.as_str() {
             "deepseek" => {
+                // Backward compat: DEEPSEEK_API_KEY is the legacy env var
+                // for the deepseek provider, registered via provider plugin.
                 std::env::var("DEEPSEEK_API_KEY")
                     .or_else(|_| std::env::var("LLM_API_KEY"))
                     .unwrap_or_default()

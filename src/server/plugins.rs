@@ -317,6 +317,7 @@ async fn install_url_handler(
     let plugin_type_str = match manifest.plugin_type {
         plugin::PluginType::Platform => "platform",
         plugin::PluginType::Mcp => "mcp",
+        plugin::PluginType::Provider => "provider",
     };
 
     match plugin::upsert_plugin(

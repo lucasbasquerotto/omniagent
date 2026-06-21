@@ -425,17 +425,7 @@ async fn prompt_preview_handler(
         };
 
         // Resolve provider enum for the resolved provider name
-        let resolved_provider: crate::llm::ProviderKind = match provider_name.parse() {
-            Ok(p) => p,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("Unknown LLM provider: '{}'", provider_name)
-                    })),
-                );
-            }
-        };
+        let resolved_provider = crate::llm::ProviderId::new(&provider_name);
 
         // Build planning prompt
         let planning_prompt = build_planning_prompt(
@@ -453,11 +443,12 @@ async fn prompt_preview_handler(
         // as primary, NOT DEEPSEEK_API_KEY. Only fall back to
         // DEEPSEEK_API_KEY if LLM_API_KEY is absent (matches the
         // AgentConfig::from_env() fallback logic).
-        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match resolved_provider {
-            crate::llm::ProviderKind::OpenCodeGo => "https://opencode.ai/zen/go/v1".to_string(),
-            crate::llm::ProviderKind::OpenAI => "https://api.openai.com/v1".to_string(),
-            crate::llm::ProviderKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
-            crate::llm::ProviderKind::DeepSeek => "https://api.deepseek.com/v1".to_string(),
+        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match provider_name.as_str() {
+            "opencode-go" => "https://opencode.ai/zen/go/v1".to_string(),
+            "openai" => "https://api.openai.com/v1".to_string(),
+            "anthropic" => "https://api.anthropic.com/v1".to_string(),
+            "deepseek" => "https://api.deepseek.com/v1".to_string(),
+            _ => String::new(),
         });
         let api_key = std::env::var("LLM_API_KEY")
             .or_else(|_| {
@@ -470,7 +461,7 @@ async fn prompt_preview_handler(
                 }
             })
             .unwrap_or_default();
-        let api_mode = crate::llm::ApiMode::resolve(resolved_provider, &model_name);
+        let api_mode = crate::llm::ApiMode::resolve(&provider_name, &model_name);
 
         let llm_config = crate::llm::LLMConfig {
             provider: resolved_provider,

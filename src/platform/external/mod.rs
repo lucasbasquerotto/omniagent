@@ -124,8 +124,8 @@ pub fn load_plugins_config(data_dir: &str) -> Vec<PlatformPluginConfig> {
                             let config = PlatformPluginConfig {
                                 name: manifest.name.clone(),
                                 enabled: true,
-                                command: manifest.entrypoint.command,
-                                args: manifest.entrypoint.args,
+                                command: manifest.entrypoint.clone().unwrap().command,
+                                args: manifest.entrypoint.unwrap().args,
                                 env: manifest.env,
                                 max_retries: 3,
                             };

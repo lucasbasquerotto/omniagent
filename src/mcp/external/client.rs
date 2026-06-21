@@ -163,7 +163,9 @@ pub trait McpServerClient: Send + Sync {
                         });
                     }
 
-                    let inner_result = call_tool_direct(&sn, &tn, &args);
+                    let inner_result = tokio::task::block_in_place(|| {
+                        call_tool_direct(&sn, &tn, &args)
+                    });
                     match inner_result {
                         Ok(res) => {
                             circuit.record_success();
@@ -191,24 +193,29 @@ pub trait McpServerClient: Send + Sync {
 
 /// Direct tool call helper that dispatches to the right transport.
 fn call_tool_direct(server_name: &str, tool_name: &str, args: &Value) -> Result<McpToolResult> {
-    // This is a bridge function. In a full implementation, we'd look up
-    // the client instance by server_name. For now, we use a global registry.
-    let mut clients = CLIENT_REGISTRY.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
-    let client = clients.get_mut(server_name)
-        .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found in registry", server_name))?;
+    // Clone the Arc out of the registry under the lock, then release the lock
+    // before doing any blocking I/O. This prevents two tokio workers from
+    // spinning on the same std::sync::Mutex when one is blocked on I/O.
+    let client = {
+        let clients = CLIENT_REGISTRY.lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        clients.get(server_name)
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found in registry", server_name))?
+            .clone()
+    };
     client.call_tool(tool_name, args)
 }
 
 // Global registry of active MCP server clients.
 use once_cell::sync::Lazy;
 use std::sync::Mutex as StdMutex;
-static CLIENT_REGISTRY: Lazy<StdMutex<HashMap<String, Box<dyn McpServerClient>>>> =
+static CLIENT_REGISTRY: Lazy<StdMutex<HashMap<String, Arc<dyn McpServerClient>>>> =
     Lazy::new(|| StdMutex::new(HashMap::new()));
 
 /// Register an MCP client in the global registry.
 pub fn register_client(name: &str, client: Box<dyn McpServerClient>) {
     if let Ok(mut registry) = CLIENT_REGISTRY.lock() {
-        registry.insert(name.to_string(), client);
+        registry.insert(name.to_string(), Arc::from(client));
     }
 }
 
@@ -305,6 +312,24 @@ impl StdioMcpClient {
         request: &str,
         server_name: &str,
     ) -> Result<String> {
+        // Check if child is still alive before proceeding — prevents blocking
+        // on a subprocess that already exited.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(anyhow::anyhow!(
+                    "MCP server '{}' exited with status {} before responding",
+                    server_name, status
+                ));
+            }
+            Ok(None) => { /* still running, proceed */ }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to check MCP server '{}' status: {}",
+                    server_name, e
+                ));
+            }
+        }
+
         let stdin = child.stdin.as_mut()
             .ok_or_else(|| anyhow::anyhow!("Failed to open stdin for MCP server"))?;
         stdin.write_all(request.as_bytes())
@@ -317,8 +342,15 @@ impl StdioMcpClient {
             .ok_or_else(|| anyhow::anyhow!("Failed to open stdout for MCP server"))?;
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
-        reader.read_line(&mut line)
+        let bytes_read = reader.read_line(&mut line)
             .with_context(|| format!("Failed to read response from MCP server '{}'", server_name))?;
+
+        if bytes_read == 0 {
+            return Err(anyhow::anyhow!(
+                "MCP server '{}' closed stdout without sending a response",
+                server_name
+            ));
+        }
 
         Ok(line.trim().to_string())
     }

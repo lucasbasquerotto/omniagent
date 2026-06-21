@@ -16,50 +16,30 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::str::FromStr;
+
+pub mod provider_config;
 
 // ---------------------------------------------------------------------------
-// Provider kind
+// Provider identification — String-based, extensible via plugin_registry
 // ---------------------------------------------------------------------------
 
-/// Supported LLM provider backends.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProviderKind {
-    #[serde(rename = "opencode-go")]
-    OpenCodeGo,
-    #[serde(rename = "openai")]
-    OpenAI,
-    #[serde(rename = "anthropic")]
-    Anthropic,
-    #[serde(rename = "deepseek")]
-    DeepSeek,
-}
+/// A provider identifier — stores the plugin name.
+///
+/// Custom provider names work out of the box; no enum variants needed.
+/// Resolution against the plugin_registry happens at config-time via
+/// `resolve_provider_config()`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderId(pub String);
 
-impl fmt::Display for ProviderKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProviderKind::OpenCodeGo => write!(f, "opencode-go"),
-            ProviderKind::OpenAI => write!(f, "openai"),
-            ProviderKind::Anthropic => write!(f, "anthropic"),
-            ProviderKind::DeepSeek => write!(f, "deepseek"),
-        }
+impl ProviderId {
+    pub fn new(name: &str) -> Self {
+        Self(name.to_string())
     }
 }
 
-impl FromStr for ProviderKind {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "opencode-go" | "opencode_go" | "opencodego" => Ok(ProviderKind::OpenCodeGo),
-            "openai" => Ok(ProviderKind::OpenAI),
-            "anthropic" => Ok(ProviderKind::Anthropic),
-            "deepseek" => Ok(ProviderKind::DeepSeek),
-            other => Err(anyhow::anyhow!(
-                "Unknown LLM provider: {other}. Expected one of: opencode-go, openai, anthropic, deepseek"
-            )),
-        }
+impl fmt::Display for ProviderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -93,12 +73,17 @@ pub fn opencode_model_api_mode(model_id: &str) -> ApiMode {
 
 impl ApiMode {
     /// Resolve the API mode for a given provider + model combination.
-    pub fn resolve(provider: ProviderKind, model_id: &str) -> Self {
-        match provider {
-            ProviderKind::OpenCodeGo => opencode_model_api_mode(model_id),
-            ProviderKind::OpenAI => ApiMode::ChatCompletions,
-            ProviderKind::Anthropic => ApiMode::AnthropicMessages,
-            ProviderKind::DeepSeek => ApiMode::ChatCompletions,
+    pub fn resolve(provider_name: &str, model_id: &str) -> Self {
+        match provider_name {
+            "opencode-go" => opencode_model_api_mode(model_id),
+            "openai" => ApiMode::ChatCompletions,
+            "anthropic" => ApiMode::AnthropicMessages,
+            "deepseek" => ApiMode::ChatCompletions,
+            _ => {
+                // For unknown/custom providers, default to chat_completions
+                // as it's more common
+                ApiMode::ChatCompletions
+            }
         }
     }
 }
@@ -110,7 +95,7 @@ impl ApiMode {
 /// Configuration loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct LLMConfig {
-    pub provider: ProviderKind,
+    pub provider: ProviderId,
     pub api_mode: ApiMode,
     pub api_key: String,
     pub base_url: String,
@@ -128,24 +113,24 @@ impl LLMConfig {
     ///
     /// Panics if `LLM_PROVIDER` contains an unrecognised value.
     pub fn from_env() -> Self {
-        let provider: ProviderKind = std::env::var("LLM_PROVIDER")
-            .unwrap_or_else(|_| "opencode-go".to_string())
-            .parse()
-            .expect("Invalid LLM_PROVIDER value");
+        let provider_name = std::env::var("LLM_PROVIDER")
+            .unwrap_or_else(|_| "opencode-go".to_string());
 
         let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
 
-        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match provider {
-            ProviderKind::OpenCodeGo => "https://opencode.ai/zen/go/v1".to_string(),
-            ProviderKind::OpenAI => "https://api.openai.com/v1".to_string(),
-            ProviderKind::Anthropic => "https://api.anthropic.com/v1".to_string(),
-            ProviderKind::DeepSeek => "https://api.deepseek.com/v1".to_string(),
+        let provider = ProviderId::new(&provider_name);
+        let api_mode = ApiMode::resolve(&provider_name, &model);
+
+        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match provider_name.as_str() {
+            "opencode-go" => "https://opencode.ai/zen/go/v1".to_string(),
+            "openai" => "https://api.openai.com/v1".to_string(),
+            "anthropic" => "https://api.anthropic.com/v1".to_string(),
+            "deepseek" => "https://api.deepseek.com/v1".to_string(),
+            _ => String::new(),
         });
 
-        let api_mode = ApiMode::resolve(provider, &model);
-
-        let api_key = match provider {
-            ProviderKind::DeepSeek => {
+        let api_key = match provider_name.as_str() {
+            "deepseek" => {
                 std::env::var("DEEPSEEK_API_KEY")
                     .or_else(|_| std::env::var("LLM_API_KEY"))
                     .unwrap_or_default()
@@ -427,7 +412,7 @@ impl LLMClient {
             "stream": request.stream,
         });
 
-        if matches!(self.config.provider, ProviderKind::OpenCodeGo | ProviderKind::DeepSeek) {
+        if matches!(self.config.provider.0.as_str(), "opencode-go" | "deepseek") {
             body["include_reasoning"] = serde_json::Value::Bool(true);
         }
 
@@ -568,7 +553,7 @@ impl LLMClient {
         }
 
         // Enable thinking if we want to capture reasoning (only for Anthropic provider)
-        if matches!(self.config.provider, ProviderKind::Anthropic) {
+        if self.config.provider.0 == "anthropic" {
             body["thinking"] = serde_json::json!({
                 "type": "enabled",
                 "budget_tokens": request.max_tokens.min(32000),
@@ -581,8 +566,8 @@ impl LLMClient {
             .post(&url)
             .header("Content-Type", "application/json");
 
-        match self.config.provider {
-            ProviderKind::Anthropic => {
+        match self.config.provider.0.as_str() {
+            "anthropic" => {
                 req = req
                     .header("x-api-key", &self.config.api_key)
                     .header("anthropic-version", "2023-06-01");

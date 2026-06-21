@@ -242,6 +242,7 @@ pub fn uninstall(name: &str, data_dir: &str) -> Result<()> {
 /// Scans:
 /// - `<data_dir>/plugins/installed/<name>/plugin.json` — source: "installed"
 /// - `<workspace_dir>/plugins/<type>/<name>/plugin.json` — source: "bundled"
+///   where `<type>` is one of: platforms, mcp, providers
 pub fn discover_plugins(
     data_dir: &str,
     workspace_dir: &str,
@@ -324,15 +325,17 @@ pub fn discover_plugins(
                 version: "0.1.0".to_string(),
                 plugin_type: PluginType::Mcp,
                 description: Some(format!("MCP server '{}' (from mcp-config.json)", srv.name)),
-                entrypoint: crate::plugin::PluginEntrypoint {
+                entrypoint: Some(crate::plugin::PluginEntrypoint {
                     command: srv.command.clone().unwrap_or_default(),
                     args: srv.args.clone(),
                     transport: transport_str.to_string(),
                     url: srv.url.clone(),
-                },
+                }),
                 capabilities: None,
                 config_schema: vec![],
                 env: std::collections::HashMap::new(),
+                default_base_url: None,
+                api_mode: None,
             };
             results.push((manifest, "mcp_config".to_string(), String::new()));
         }

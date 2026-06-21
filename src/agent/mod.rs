@@ -153,7 +153,11 @@ impl Agent {
     pub fn new(pool: PgPool, config: AgentConfig, mcp: McpRegistry, ctx: AppContext) -> Self {
         let env_cfg = crate::llm::LLMConfig::from_env();
         let llm_config = crate::llm::LLMConfig {
-            provider: config.llm_provider.parse().unwrap_or(env_cfg.provider),
+            provider: if config.llm_provider.is_empty() {
+                env_cfg.provider
+            } else {
+                crate::llm::ProviderId::new(&config.llm_provider)
+            },
             api_key: if config.llm_api_key.is_empty() {
                 env_cfg.api_key
             } else {

@@ -174,8 +174,14 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
                             };
                             let r = mcp_registry
                                 .execute(&call, app_context.clone())
-                                .map(|_result| ())
-                                .map_err(|e| format!("{:#}", e));
+                                .map(|result| {
+                                    if result.is_error {
+                                        Err(result.content)
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
+                                .unwrap_or_else(|e| Err(format!("{:#}", e)));
                             (action.name, r)
                         }
                         Ok(None) => {

@@ -134,65 +134,168 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
         }
 
         // ── Action mode: run built-in action by action_id ──
-        if job_mode == "action" {
-            if let Some(ref action_id) = job.action_id {
-                match action_id.as_str() {
-                    "builtin_kanban_dispatcher" => {
-                        info!(
-                            "[cron-scheduler] Running action '{}' (kanban_dispatcher) for job '{}'",
-                            action_id, display_name
-                        );
-                        run_kanban_dispatcher(pool, data_dir).await?;
-                    }
-                    "builtin_relevance_indexer" => {
-                        info!(
-                            "[cron-scheduler] Running action '{}' (relevance_indexer) for job '{}'",
-                            action_id, display_name
-                        );
-                        crate::relevance::run_relevance_indexer(pool, data_dir).await?;
-                    }
-                    other => {
-                        info!(
-                            "[cron-scheduler] Looking up user-defined action '{}' for job '{}'",
-                            other, display_name
-                        );
-                        // Look up action from DB, then call its MCP tool
-                        match queries::get_action(pool, other).await {
-                            Ok(Some(action)) => {
-                                let call = McpToolCall {
-                                    id: String::new(),
-                                    name: action.tool_name.clone(),
-                                    arguments: action.params.clone(),
-                                };
-                                match mcp_registry.execute(&call, app_context.clone()) {
-                                    Ok(result) => {
-                                        info!(
-                                            "[cron-scheduler] Action '{}' completed for job '{}': {}",
-                                            other, display_name, result.content
-                                        );
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "[cron-scheduler] Action '{}' failed for job '{}': {:?}",
-                                            other, display_name, e
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                warn!(
-                                    "[cron-scheduler] Action '{}' not found in DB for job '{}'",
-                                    other, display_name
-                                );
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[cron-scheduler] Failed to look up action '{}' for job '{}': {:?}",
-                                    other, display_name, e
-                                );
-                            }
+        // Writes result as terminal system messages (seq-0: action name, type=cron, subtype=job name).
+
+        /// Helper: run a single action, producing terminal messages on the given thread.
+        async fn run_action_and_report(
+            pool: &PgPool,
+            data_dir: &str,
+            mcp_registry: &McpRegistry,
+            app_context: &AppContext,
+            job: &CronJobDueRow,
+            display_name: &str,
+            action_id: &str,
+            thread_id: i64,
+            now_ts: i64,
+        ) -> anyhow::Result<()> {
+            // ── Resolve action name and execute ──
+            let (action_name, exec_result): (String, Result<(), String>) = match action_id {
+                "builtin_kanban_dispatcher" => {
+                    let name = "Kanban Dispatcher".to_string();
+                    let r = run_kanban_dispatcher(pool, data_dir)
+                        .await
+                        .map_err(|e| format!("{:#}", e));
+                    (name, r)
+                }
+                "builtin_relevance_indexer" => {
+                    let name = "Relevance Indexer".to_string();
+                    let r = crate::relevance::run_relevance_indexer(pool, data_dir)
+                        .await
+                        .map_err(|e| format!("{:#}", e));
+                    (name, r)
+                }
+                other => {
+                    match queries::get_action(pool, other).await {
+                        Ok(Some(action)) => {
+                            let call = McpToolCall {
+                                id: String::new(),
+                                name: action.tool_name.clone(),
+                                arguments: action.params.clone(),
+                            };
+                            let r = mcp_registry
+                                .execute(&call, app_context.clone())
+                                .map(|_result| ())
+                                .map_err(|e| format!("{:#}", e));
+                            (action.name, r)
+                        }
+                        Ok(None) => {
+                            (other.to_string(), Err(format!("Action '{}' not found", other)))
+                        }
+                        Err(e) => {
+                            (other.to_string(), Err(format!("DB lookup failed: {:#}", e)))
                         }
                     }
+                }
+            };
+
+            let cron_name = job.name.clone().unwrap_or_default();
+            let metadata = serde_json::json!({
+                "cron_job_id": job.id,
+                "cron_job_name": job.name,
+                "cron_display_name": display_name,
+                "scheduled_at": job.schedule,
+            });
+
+            match exec_result {
+                Ok(()) => {
+                    // ── Success: system terminal + seq-0 ──
+                    queries::set_thread_system(pool, thread_id).await?;
+                    let msg = MessageNew {
+                        thread_id,
+                        role: "system".to_string(),
+                        content: action_name,
+                        thread_sequence: 0,
+                        external_id: Some(format!("cron:{}:{}", job.id, now_ts)),
+                        metadata,
+                        embedding: None,
+                        summary_text: None,
+                        is_summary: false,
+                        msg_type: "cron".to_string(),
+                        msg_subtype: Some(cron_name),
+                        processing_time_ms: None,
+                        token_usage: None,
+                    };
+                    queries::create_message(pool, &msg).await?;
+                }
+                Err(err_msg) => {
+                    // ── Failure: failed thread + seq-0 + seq-1 error ──
+                    let err_subtype = if let Some(code) = extract_error_code(&err_msg) {
+                        Some(code)
+                    } else {
+                        None
+                    };
+
+                    sql_forge!(
+                        "UPDATE threads SET status = 'failed', terminal = true WHERE id = :id",
+                        ( :id = thread_id )
+                    )
+                    .execute(pool)
+                    .await?;
+
+                    // seq-0: action name
+                    let msg0 = MessageNew {
+                        thread_id,
+                        role: "system".to_string(),
+                        content: action_name,
+                        thread_sequence: 0,
+                        external_id: Some(format!("cron:{}:{}", job.id, now_ts)),
+                        metadata: metadata.clone(),
+                        embedding: None,
+                        summary_text: None,
+                        is_summary: false,
+                        msg_type: "cron".to_string(),
+                        msg_subtype: Some(cron_name.clone()),
+                        processing_time_ms: None,
+                        token_usage: None,
+                    };
+                    queries::create_message(pool, &msg0).await?;
+
+                    // seq-1: error details
+                    let msg1 = MessageNew {
+                        thread_id,
+                        role: "system".to_string(),
+                        content: err_msg,
+                        thread_sequence: 1,
+                        external_id: Some(format!("cron:{}:{}:error", job.id, now_ts)),
+                        metadata,
+                        embedding: None,
+                        summary_text: None,
+                        is_summary: false,
+                        msg_type: "error".to_string(),
+                        msg_subtype: err_subtype,
+                        processing_time_ms: None,
+                        token_usage: None,
+                    };
+                    queries::create_message(pool, &msg1).await?;
+                }
+            }
+
+            Ok(())
+        }
+
+        if job_mode == "action" {
+            if let Some(ref action_id) = job.action_id {
+                let cron_channel = ensure_cron_channel(pool).await?;
+                let thread = queries::create_thread(
+                    pool,
+                    "cron",
+                    cron_channel.id,
+                    "cron",
+                    None,
+                    None,
+                    None,
+                    Some(&job.id),
+                )
+                .await?;
+
+                if let Err(e) = run_action_and_report(
+                    pool, data_dir, mcp_registry, app_context,
+                    &job, display_name, action_id, thread.id, now.timestamp(),
+                ).await {
+                    error!(
+                        "[cron-scheduler] Action reporting failed for job '{}': {:?}",
+                        display_name, e
+                    );
                 }
             }
             let new_next = calculate_next_run(&job.schedule, &now);
@@ -369,7 +472,12 @@ async fn release_job(
 
 /// Ensure a cron channel exists (upsert on conflict).
 async fn ensure_cron_channel(pool: &PgPool) -> Result<crate::models::Channel> {
-    queries::create_channel(pool, "cron-session", "cron", "cron", "cron", "cron-session").await
+    // First try to find existing cron channel
+    if let Ok(Some(ch)) = queries::get_channel_by_platform_and_resource(pool, "cron", "cron-session").await {
+        return Ok(ch);
+    }
+    queries::create_channel(pool, "cron-session", "cron", "cron-default", "cron", "cron-session").await
+        .map_err(|e| anyhow::anyhow!("Failed to create cron channel: {:#}", e))
 }
 
 /// Run the kanban_dispatcher: move all 'todo' tasks to 'ready' by creating
@@ -659,6 +767,27 @@ pub(crate) fn resolve_thread_config(
         provider,
         model,
     })
+}
+
+/// Extract an error code from an error message string we generated.
+/// Only matches our own error patterns: "error (<code>):"
+///
+/// Examples that match:
+///   "MCP tool call error (-32603): Internal error" → "-32603"
+///   "MCP initialize error (0): ..."                 → "0"
+///   "Plugin 'name' initialize error (-1): Failed"   → "-1"
+fn extract_error_code(err_msg: &str) -> Option<String> {
+    if let Some(start) = err_msg.find("error (") {
+        let after = &err_msg[start + 7..];
+        let code: String = after
+            .chars()
+            .take_while(|c| *c == '-' || c.is_ascii_digit())
+            .collect();
+        if !code.is_empty() {
+            return Some(code);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

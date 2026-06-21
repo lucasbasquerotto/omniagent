@@ -172,16 +172,19 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
                                 name: action.tool_name.clone(),
                                 arguments: action.params.clone(),
                             };
-                            let r = mcp_registry
+                            let r = match mcp_registry
                                 .execute(&call, app_context.clone())
-                                .map(|result| {
+                                .await
+                            {
+                                Ok(result) => {
                                     if result.is_error {
                                         Err(result.content)
                                     } else {
                                         Ok(())
                                     }
-                                })
-                                .unwrap_or_else(|e| Err(format!("{:#}", e)));
+                                }
+                                Err(e) => Err(format!("{:#}", e)),
+                            };
                             (action.name, r)
                         }
                         Ok(None) => {

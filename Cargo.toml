@@ -7,7 +7,7 @@ description = "OmniAgent — Next-generation agent system with Rust, Postgres + 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "chrono", "uuid", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

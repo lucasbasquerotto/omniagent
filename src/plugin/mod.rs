@@ -361,14 +361,23 @@ pub fn enrich_plugin(row: &PluginRegistryRow) -> PluginDetail {
 
 /// Resolve ${VAR} references in a string against the process environment.
 /// Leaves unresolvable references as-is (e.g. ${MISSING_VAR} stays literal).
+/// If the variable is not set, the reference is left unchanged and the loop
+/// terminates to prevent infinite re-resolution of unresolvable references.
 fn resolve_env_var(value: &str) -> String {
     let mut result = value.to_string();
     // Match ${VAR_NAME} patterns and replace with env value if found
     while let Some(start) = result.find("${") {
         if let Some(end) = result[start..].find('}') {
             let var_name = &result[start + 2..start + end];
-            let replacement = std::env::var(var_name).unwrap_or_else(|_| format!("${{{}}}", var_name));
-            result.replace_range(start..start + end + 1, &replacement);
+            match std::env::var(var_name) {
+                Ok(val) => {
+                    result.replace_range(start..start + end + 1, &val);
+                }
+                Err(_) => {
+                    // Var not set — leave literal ${VAR_NAME} and stop resolving
+                    break;
+                }
+            }
         } else {
             break;
         }

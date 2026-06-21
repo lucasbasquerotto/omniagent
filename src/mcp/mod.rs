@@ -139,11 +139,15 @@ impl McpRegistry {
     }
 
     /// Execute a tool call.
-    pub fn execute(&self, call: &McpToolCall, ctx: AppContext) -> Result<McpToolResult> {
+    pub async fn execute(&self, call: &McpToolCall, ctx: AppContext) -> Result<McpToolResult> {
         let tool = self
             .get(&call.name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", call.name))?;
-        (tool.handler)(call.arguments.clone(), ctx)
+            .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", call.name))?
+            .clone();
+        let args = call.arguments.clone();
+        tokio::task::spawn_blocking(move || (tool.handler)(args, ctx))
+            .await
+            .map_err(|e| anyhow::anyhow!("Tool handler panicked: {}", e))?
     }
 
     /// Build the OpenAI-compatible tools array for the LLM.

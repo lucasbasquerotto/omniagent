@@ -236,8 +236,12 @@ impl LLMConfig {
         let provider = ProviderId::new(&provider_name);
         let api_mode = ApiMode::resolve(&provider_name, &model);
 
-        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| {
-            resolve_default_base_url(&provider_name)
+        let base_url = std::env::var("LLM_BASE_URL").unwrap_or_else(|_| match provider_name.as_str() {
+            "opencode-go" => "https://opencode.ai/zen/go/v1".to_string(),
+            "openai" => "https://api.openai.com/v1".to_string(),
+            "anthropic" => "https://api.anthropic.com/v1".to_string(),
+            "deepseek" => "https://api.deepseek.com/v1".to_string(),
+            _ => String::new(),
         });
 
         let api_key = match provider_name.as_str() {

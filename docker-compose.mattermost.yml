@@ -37,7 +37,7 @@ services:
     expose:
       - "8065"
     ports:
-      - "12340:8065"
+      - "12349:8065"
     environment:
       MM_SQLSETTINGS_DRIVERNAME: postgres
       MM_SQLSETTINGS_DATASOURCE: postgres://omniagent:omniagent@mattermost-db:5432/mattermost?sslmode=disable

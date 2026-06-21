@@ -90,9 +90,20 @@ def handle_tools_list(req_id):
                 "required": ["path"],
             },
         },
+        {
+            "name": "test_error",
+            "description": "Return a test error: 'Test error from python: <input>'",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string", "description": "Error message input"}
+                },
+                "required": ["input"],
+            },
+        },
     ]
     send_json(make_success(req_id, {"tools": tools}))
-    log.info("tools/list returned 3 tools")
+    log.info("tools/list returned 4 tools")
 
 
 def handle_wait(req_id, arguments):
@@ -206,6 +217,22 @@ def handle_save_datetime(req_id, arguments):
         log.warning("save_datetime tool failed to write to %s: %s", path, e)
 
 
+def handle_test_error(req_id, arguments):
+    input_val = (arguments or {}).get("input", "")
+    text = f"Test error from python: {input_val}"
+    log.info("test_error tool called: input='%s'", input_val)
+    send_json(
+        make_success(
+            req_id,
+            {
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+            },
+        )
+    )
+    log.info("test_error tool completed")
+
+
 def main():
     global initialized
 
@@ -270,6 +297,8 @@ def main():
                     handle_echo(req_id, arguments)
                 elif tool_name == "save_datetime":
                     handle_save_datetime(req_id, arguments)
+                elif tool_name == "test_error":
+                    handle_test_error(req_id, arguments)
                 else:
                     if req_id is not None:
                         send_json(

@@ -139,7 +139,7 @@ pub struct CallToolParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<ToolContent>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false", rename = "isError")]
     pub is_error: bool,
 }
 

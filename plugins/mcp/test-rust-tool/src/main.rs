@@ -110,7 +110,7 @@ struct CallToolParams {
 #[derive(Debug, Serialize)]
 struct CallToolResult {
     content: Vec<ToolContent>,
-    #[serde(default)]
+    #[serde(default, rename = "isError")]
     is_error: bool,
 }
 
@@ -307,8 +307,23 @@ async fn handle_tools_list<W: AsyncWriteExt + Unpin>(
         }),
     };
 
+    let test_error_tool = McpTool {
+        name: "test_error".to_string(),
+        description: "Return a test error: 'Test error from rust: <input>'".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Error message input"
+                }
+            },
+            "required": ["input"]
+        }),
+    };
+
     let result = ListToolsResult {
-        tools: vec![wait_tool, echo_tool, save_datetime_tool],
+        tools: vec![wait_tool, echo_tool, save_datetime_tool, test_error_tool],
     };
 
     let response = JsonRpcSuccess {
@@ -322,7 +337,7 @@ async fn handle_tools_list<W: AsyncWriteExt + Unpin>(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
 
-    tracing::info!("tools/list returned 3 tools");
+    tracing::info!("tools/list returned 4 tools");
     Ok(())
 }
 
@@ -337,6 +352,7 @@ async fn handle_tools_call<W: AsyncWriteExt + Unpin>(
         "wait" => handle_wait(writer, req_id, params).await?,
         "echo" => handle_echo(writer, req_id, params).await?,
         "save_datetime" => handle_save_datetime(writer, req_id, params).await?,
+        "test_error" => handle_test_error(writer, req_id, params).await?,
         _ => {
             send_error(
                 writer,
@@ -578,6 +594,43 @@ async fn handle_save_datetime<W: AsyncWriteExt + Unpin>(
         }
     }
 
+    Ok(())
+}
+// ---- test_error command ----------------------------------------------------
+
+async fn handle_test_error<W: AsyncWriteExt + Unpin>(
+    writer: &mut tokio::io::BufWriter<W>,
+    req_id: u64,
+    params: &CallToolParams,
+) -> Result<()> {
+    let input_val = params
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get("input"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let text = format!("Test error from rust: {}", input_val);
+
+    tracing::info!("test_error tool called: input='{}'", input_val);
+
+    let result = CallToolResult {
+        content: vec![ToolContent::Text { text }],
+        is_error: true,
+    };
+
+    let response = JsonRpcSuccess {
+        jsonrpc: "2.0".to_string(),
+        id: req_id,
+        result: serde_json::to_value(result)?,
+    };
+
+    let json = serde_json::to_string(&response)?;
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    tracing::info!("test_error tool completed");
     Ok(())
 }
 

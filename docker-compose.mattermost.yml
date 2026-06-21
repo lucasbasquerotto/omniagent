@@ -44,6 +44,7 @@ services:
       MM_SERVICESETTINGS_SITEURL: ${MATTERMOST_SITE_URL:-https://hermes-app-5.nexuslbs.org}
       MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
       MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_ANALYTICS_SETTINGS_ENABLE: "false"
     volumes:
       - mattermost-config-vol:/mattermost/config:rw
       - mattermost-data-vol:/mattermost/data:rw

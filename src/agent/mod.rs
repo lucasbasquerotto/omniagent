@@ -761,6 +761,10 @@ async fn process_thread(
         };
         let saved = queries::create_message(pool, &err_msg).await?;
         let _ = queries::complete_thread(pool, thread.id, "failed", 0, 0, 0, 0).await;
+        // Deliver the error message back to the user's platform
+        if let Ok(Some(channel)) = queries::get_channel_by_id(pool, thread.channel_id).await {
+            enqueue_delivery(ctx, &saved, &channel, thread, cause_msg.external_id.clone()).await;
+        }
         return Ok(saved);
     }
 
@@ -817,6 +821,10 @@ async fn process_thread(
         };
         let saved = queries::create_message(pool, &err_msg).await?;
         let _ = queries::complete_thread(pool, thread.id, "failed", 0, 0, 0, 0).await;
+        // Deliver the error message back to the user's platform
+        if let Ok(Some(channel)) = queries::get_channel_by_id(pool, thread.channel_id).await {
+            enqueue_delivery(ctx, &saved, &channel, thread, cause_msg.external_id.clone()).await;
+        }
         return Ok(saved);
     }
 
@@ -845,6 +853,10 @@ async fn process_thread(
         };
         let saved = queries::create_message(pool, &err_msg).await?;
         let _ = queries::complete_thread(pool, thread.id, "failed", 0, 0, 0, 0).await;
+        // Deliver the error message back to the user's platform
+        if let Ok(Some(channel)) = queries::get_channel_by_id(pool, thread.channel_id).await {
+            enqueue_delivery(ctx, &saved, &channel, thread, cause_msg.external_id.clone()).await;
+        }
         return Ok(saved);
     }
 

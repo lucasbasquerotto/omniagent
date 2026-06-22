@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(manifest.name, "test-plugin");
         assert_eq!(manifest.version, "1.0.0");
         assert_eq!(manifest.plugin_type, PluginType::Mcp);
-        assert_eq!(manifest.entrypoint.command, "python3");
+        assert_eq!(manifest.entrypoint.as_ref().unwrap().command, "python3");
         assert_eq!(manifest.config_schema.len(), 1);
         assert_eq!(manifest.config_schema[0].key, "api_key");
     }
@@ -651,8 +651,8 @@ mod tests {
         std::fs::write(&manifest_path, manifest_content).unwrap();
         let manifest = load_manifest(manifest_path.to_str().unwrap()).unwrap();
         assert_eq!(manifest.version, "0.1.0");
-        assert_eq!(manifest.entrypoint.transport, "stdio");
-        assert!(manifest.entrypoint.url.is_none());
+        assert_eq!(manifest.entrypoint.as_ref().unwrap().transport, "stdio");
+        assert!(manifest.entrypoint.as_ref().unwrap().url.is_none());
         assert!(manifest.config_schema.is_empty());
         assert!(manifest.capabilities.is_none());
     }

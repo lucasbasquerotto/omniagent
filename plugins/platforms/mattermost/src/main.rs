@@ -541,10 +541,12 @@ async fn main() -> Result<()> {
     let inbound_handle: Option<tokio::task::JoinHandle<()>> = if use_websocket {
         let bot_id = bot_user.id.clone();
         Some(tokio::spawn(async move {
+            // WebSocket mode: watch ALL channels — the WS stream already
+            // scopes to channels the bot can access. No filter needed.
             ws_event_loop(
                 server_url,
                 access_token,
-                channel_ids,
+                vec![], // empty = watch_all = true
                 bot_id,
             ).await;
         }))

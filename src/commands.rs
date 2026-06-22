@@ -47,8 +47,11 @@ pub struct ModelCommand {
 ///   `//model reset provider`         → Reset provider only
 ///   `//model reset model`            → Reset model only
 pub fn parse_model_command(input: &str) -> Result<ModelCommand> {
-    let input = input.trim();
-    let rest = input.strip_prefix("//model").unwrap_or(input).trim();
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix("//model")
+        .or_else(|| trimmed.strip_prefix("/model"))
+        .unwrap_or(trimmed)
+        .trim();
 
     if rest.is_empty() {
         return Ok(ModelCommand {
@@ -157,8 +160,11 @@ pub struct NewCommand;
 
 /// Parse a `/new` command text. Valid form: `/new` (no arguments).
 pub fn parse_new_command(input: &str) -> Result<NewCommand> {
-    let input = input.trim();
-    let rest = input.strip_prefix("//new").unwrap_or(input).trim();
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix("//new")
+        .or_else(|| trimmed.strip_prefix("/new"))
+        .unwrap_or(trimmed)
+        .trim();
     if !rest.is_empty() {
         anyhow::bail!("Usage: /new (no arguments)");
     }
@@ -187,8 +193,11 @@ pub enum ChannelCommand {
 ///   `/channel list`   → List
 ///   `/channel <name>` → Switch
 pub fn parse_channel_command(input: &str) -> Result<ChannelCommand> {
-    let input = input.trim();
-    let rest = input.strip_prefix("//channel").unwrap_or(input).trim();
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix("//channel")
+        .or_else(|| trimmed.strip_prefix("/channel"))
+        .unwrap_or(trimmed)
+        .trim();
     if rest.is_empty() {
         return Ok(ChannelCommand::Show);
     }
@@ -221,8 +230,11 @@ pub enum ProfileCommand {
 ///   `/profile <name>`    → Set
 ///   `/profile reset`     → Reset
 pub fn parse_profile_command(input: &str) -> Result<ProfileCommand> {
-    let input = input.trim();
-    let rest = input.strip_prefix("//profile").unwrap_or(input).trim();
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix("//profile")
+        .or_else(|| trimmed.strip_prefix("/profile"))
+        .unwrap_or(trimmed)
+        .trim();
     if rest.is_empty() {
         return Ok(ProfileCommand::Show);
     }

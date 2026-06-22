@@ -418,13 +418,17 @@ static DYNAMIC_ENUM_CACHE: Lazy<Mutex<HashMap<String, DynamicEnumEntry>>> =
 const DYNAMIC_ENUM_TTL: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
 
 /// Fetch model IDs from an OpenAI-compatible `/v1/models` endpoint and return them.
-async fn fetch_enum_values(url: &str) -> Result<Vec<String>> {
+/// If an `api_key` is provided, it's sent as a Bearer token in the Authorization header.
+async fn fetch_enum_values(url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .context("Failed to build HTTP client")?;
-    let resp = client
-        .get(url)
+    let mut req = client.get(url);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    let resp = req
         .send()
         .await
         .with_context(|| format!("Failed to fetch {}", url))?;
@@ -469,7 +473,13 @@ pub async fn refresh_plugin_models(pool: &PgPool, name: &str) -> Result<Option<P
         };
         had_refresh = true;
 
-        match fetch_enum_values(&refresh_url).await {
+        // Resolve API key: try {NAME}_API_KEY, then LLM_API_KEY
+        let api_key = std::env::var(format!("{}_API_KEY", name.to_uppercase().replace('-', "_")))
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or_else(|| std::env::var("LLM_API_KEY").ok().filter(|k| !k.is_empty()));
+
+        match fetch_enum_values(&refresh_url, api_key.as_deref()).await {
             Ok(values) => {
                 field.allowed_values = Some(values.clone());
                 let mut cache = DYNAMIC_ENUM_CACHE.lock().unwrap();

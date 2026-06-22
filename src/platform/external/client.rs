@@ -86,11 +86,13 @@ pub struct ExternalPlatformClient {
     next_id: AtomicU64,
     /// Circuit breaker state.
     circuit: Arc<Mutex<CircuitBreaker>>,
+    /// Data directory for profile lookups.
+    data_dir: String,
 }
 
 impl ExternalPlatformClient {
     /// Create a new external platform client from configuration.
-    pub fn new(config: PlatformPluginConfig) -> Self {
+    pub fn new(config: PlatformPluginConfig, data_dir: &str) -> Self {
         let max_retries = config.max_retries;
         Self {
             config,
@@ -99,6 +101,7 @@ impl ExternalPlatformClient {
             capabilities: Arc::new(Mutex::new(None)),
             next_id: AtomicU64::new(1),
             circuit: Arc::new(Mutex::new(CircuitBreaker::new(max_retries))),
+            data_dir: data_dir.to_string(),
         }
     }
 
@@ -351,6 +354,28 @@ impl Platform for ExternalPlatformClient {
                                                     inbound.text.chars().take(50).collect::<String>()
                                                 );
 
+                                                // Handle /new BEFORE channel lookup — creates a fresh channel
+                                                if inbound.text.starts_with("/new") {
+                                                    let reply = match crate::commands::handle_new_external(
+                                                        &pool,
+                                                        &plugin_name,
+                                                        &inbound.resource_identifier,
+                                                    ).await {
+                                                        Ok(ch) => format!(
+                                                            "Created new channel '{}' (id={}). You can now send messages.",
+                                                            ch.name, ch.id
+                                                        ),
+                                                        Err(e) => format!("Error creating channel: {}", e),
+                                                    };
+                                                    send_external_reply(
+                                                        &mut stdin,
+                                                        &mut next_id_val,
+                                                        &inbound,
+                                                        &reply,
+                                                    ).await;
+                                                    continue;
+                                                }
+
                                                 match crate::db::types::get_channel_by_platform_and_resource(
                                                     &pool,
                                                     &plugin_name,
@@ -364,29 +389,47 @@ impl Platform for ExternalPlatformClient {
                                                                 channel.id,
                                                                 &inbound.text,
                                                             ).await;
-                                                            let deliver_params = crate::platform::external::DeliverParams {
-                                                                resource_identifier: inbound.resource_identifier.clone(),
-                                                                content: reply,
-                                                                msg_type: "message".to_string(),
-                                                                msg_subtype: None,
-                                                                thread_id: 0,
-                                                                cause_external_id: Some(inbound.external_id),
-                                                                is_summary: false,
-                                                                is_user_thread: false,
-                                                            };
-                                                            let id = next_id_val;
-                                                            next_id_val += 1;
-                                                            let req = crate::platform::external::build_deliver_request(id, &deliver_params);
-                                                            if let Err(e) = stdin.write_all(req.as_bytes()).await {
-                                                                tracing::error!(
-                                                                    "Failed to write /model reply to plugin '{}': {:?}",
-                                                                    plugin_name,
-                                                                    e
-                                                                );
-                                                            }
-                                                            if let Err(e) = stdin.write_all(b"\n").await {
-                                                                tracing::error!("Failed to write newline: {:?}", e);
-                                                            }
+                                                            send_external_reply(
+                                                                &mut stdin,
+                                                                &mut next_id_val,
+                                                                &inbound,
+                                                                &reply,
+                                                            ).await;
+                                                            continue;
+                                                        }
+
+                                                        // Check for /channel command
+                                                        if inbound.text.starts_with("/channel") {
+                                                            let reply = handle_external_channel_command(
+                                                                &pool,
+                                                                &plugin_name,
+                                                                &inbound.text,
+                                                                &channel,
+                                                                &inbound.resource_identifier,
+                                                            ).await;
+                                                            send_external_reply(
+                                                                &mut stdin,
+                                                                &mut next_id_val,
+                                                                &inbound,
+                                                                &reply,
+                                                            ).await;
+                                                            continue;
+                                                        }
+
+                                                        // Check for /profile command
+                                                        if inbound.text.starts_with("/profile") {
+                                                            let reply = handle_external_profile_command(
+                                                                &pool,
+                                                                &inbound.text,
+                                                                &channel,
+                                                                &self.data_dir,
+                                                            ).await;
+                                                            send_external_reply(
+                                                                &mut stdin,
+                                                                &mut next_id_val,
+                                                                &inbound,
+                                                                &reply,
+                                                            ).await;
                                                             continue;
                                                         }
 
@@ -569,6 +612,153 @@ async fn handle_external_model_command(
                 "Channel {} reset — will fall back to profile/env defaults.",
                 parts.join(" and ")
             )
+        }
+    }
+}
+
+/// Helper: send a text reply back to the external platform for an inbound message.
+async fn send_external_reply(
+    stdin: &mut tokio::process::ChildStdin,
+    next_id_val: &mut u64,
+    inbound: &crate::platform::external::InboundMessage,
+    reply: &str,
+) {
+    let deliver_params = crate::platform::external::DeliverParams {
+        resource_identifier: inbound.resource_identifier.clone(),
+        content: reply.to_string(),
+        msg_type: "message".to_string(),
+        msg_subtype: None,
+        thread_id: 0,
+        cause_external_id: Some(inbound.external_id.clone()),
+        is_summary: false,
+        is_user_thread: false,
+    };
+    let id = *next_id_val;
+    *next_id_val += 1;
+    let req = crate::platform::external::build_deliver_request(id, &deliver_params);
+    if let Err(e) = stdin.write_all(req.as_bytes()).await {
+        tracing::error!("Failed to write reply to plugin: {:?}", e);
+    }
+    if let Err(e) = stdin.write_all(b"\n").await {
+        tracing::error!("Failed to write newline: {:?}", e);
+    }
+}
+
+/// Handle a `/channel` command received via an external platform plugin.
+async fn handle_external_channel_command(
+    pool: &sqlx::PgPool,
+    plugin_name: &str,
+    text: &str,
+    current_channel: &crate::models::Channel,
+    resource_identifier: &str,
+) -> String {
+    let parsed = match crate::commands::parse_channel_command(text) {
+        Ok(cmd) => cmd,
+        Err(e) => return format!("Error: {}", e),
+    };
+
+    match parsed {
+        crate::commands::ChannelCommand::Show => {
+            format!(
+                "Current channel: {} (id={}, profile={}, platform={})",
+                current_channel.name,
+                current_channel.id,
+                current_channel.current_profile,
+                current_channel.platform.as_deref().unwrap_or("unknown"),
+            )
+        }
+        crate::commands::ChannelCommand::List => {
+            let channels = match crate::commands::handle_channel_list(pool, plugin_name).await {
+                Ok(chs) => chs,
+                Err(e) => return format!("Error listing channels: {}", e),
+            };
+            if channels.is_empty() {
+                return format!("No channels for platform '{}'.", plugin_name);
+            }
+            let mut result = format!("Channels for platform '{}':\n", plugin_name);
+            for (i, ch) in channels.iter().enumerate() {
+                let current_mark = if ch.resource_identifier.as_deref() == Some(resource_identifier) {
+                    " ← current"
+                } else {
+                    ""
+                };
+                result.push_str(&format!(
+                    "  {}. {} (id={}){}\n",
+                    i + 1,
+                    ch.name,
+                    ch.id,
+                    current_mark,
+                ));
+            }
+            result
+        }
+        crate::commands::ChannelCommand::Switch(ref name) => {
+            let channel = match crate::db::types::get_channel_by_platform_name(pool, plugin_name, name).await {
+                Ok(Some(ch)) => ch,
+                Ok(None) => return format!("Channel '{}' not found for platform '{}'.", name, plugin_name),
+                Err(e) => return format!("Error looking up channel: {}", e),
+            };
+            // Claim the channel by updating resource_identifier
+            if let Err(e) = crate::db::types::claim_channel_resource(pool, channel.id, resource_identifier).await {
+                return format!("Error claiming channel: {}", e);
+            }
+            format!("Switched to channel '{}' (id={}).", channel.name, channel.id)
+        }
+    }
+}
+
+/// Handle a `/profile` command received via an external platform plugin.
+async fn handle_external_profile_command(
+    pool: &sqlx::PgPool,
+    text: &str,
+    current_channel: &crate::models::Channel,
+    data_dir: &str,
+) -> String {
+    let parsed = match crate::commands::parse_profile_command(text) {
+        Ok(cmd) => cmd,
+        Err(e) => return format!("Error: {}", e),
+    };
+
+    match parsed {
+        crate::commands::ProfileCommand::Show => {
+            let profile_registry = crate::profile::ProfileRegistry::new(data_dir);
+            let profile_names = profile_registry.list_names();
+            let mut result = format!(
+                "Current profile: {}\nAvailable profiles: {}",
+                current_channel.current_profile,
+                profile_names.join(", "),
+            );
+            if let Some(profile) = profile_registry.get(&current_channel.current_profile) {
+                result.push_str(&format!(
+                    "\n  Provider: {}",
+                    profile.provider.as_deref().unwrap_or("(not set)")
+                ));
+                result.push_str(&format!(
+                    "\n  Model:    {}",
+                    profile.model.as_deref().unwrap_or("(not set)")
+                ));
+            }
+            result
+        }
+        crate::commands::ProfileCommand::Set(ref name) => {
+            let profile_registry = crate::profile::ProfileRegistry::new(data_dir);
+            if profile_registry.get(name).is_none() {
+                return format!(
+                    "Unknown profile '{}'. Available profiles: {}",
+                    name,
+                    profile_registry.list_names().join(", ")
+                );
+            }
+            if let Err(e) = crate::commands::handle_profile_set(pool, current_channel.id, name).await {
+                return format!("Error setting profile: {}", e);
+            }
+            format!("Profile set to '{}'.", name)
+        }
+        crate::commands::ProfileCommand::Reset => {
+            if let Err(e) = crate::commands::handle_profile_set(pool, current_channel.id, "default").await {
+                return format!("Error resetting profile: {}", e);
+            }
+            "Profile reset to 'default'.".to_string()
         }
     }
 }

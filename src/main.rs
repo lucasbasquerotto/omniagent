@@ -141,7 +141,7 @@ async fn run_server() -> Result<()> {
             plugin_config.command,
             plugin_config.args.join(" ")
         );
-        let client = platform::external::client::ExternalPlatformClient::new(plugin_config.clone());
+        let client = platform::external::client::ExternalPlatformClient::new(plugin_config.clone(), &data_dir);
         registry.register(Box::new(client));
     }
 
@@ -326,10 +326,12 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
         .or_else(|| Some(std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())))
         .unwrap_or_else(|| "deepseek-v4-flash".to_string());
 
-    println!("\n┌─────────────────────────────────────────────────────────┐");
+    println!("┌─────────────────────────────────────────────────────────┐");
     println!("│  OmniAgent CLI — channel: {}, profile: {}  │", current_channel_name, channel.current_profile);
     println!("│  Type your messages. /exit to quit. /new for new channel  │");
     println!("│  /channel to create or claim a channel                   │");
+    println!("│  /profile to view/set the active profile                 │");
+    println!("│  /model to view/set the active provider and model        │");
     println!("│  /subscribe <name> to receive summaries from a channel    │");
     println!("│  /unsubscribe <name> to stop receiving summaries          │");
     println!("│  /subscriptions to list your current subscriptions        │");
@@ -404,13 +406,6 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
                         // User cancelled
                     }
                 }
-                continue;
-            }
-            "/new" if !session_has_channel => {
-                eprintln!(
-                    "\n[ERR_SESSION_NO_CHANNEL] This session no longer has a channel. \
-                     Use /channel to claim one.\n"
-                );
                 continue;
             }
             "/new" => {
@@ -589,6 +584,15 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
             }
             cmd if cmd.starts_with("/model") => {
                 handle_cli_model_command(&pool, cmd, current_channel_id).await?;
+                continue;
+            }
+            cmd if cmd.starts_with("/profile") => {
+                handle_cli_profile_command(
+                    &pool,
+                    cmd,
+                    current_channel_id,
+                    data_dir,
+                ).await?;
                 continue;
             }
             _ => {}
@@ -1437,6 +1441,67 @@ async fn handle_cli_model_command(
             ];
             let parts: Vec<&str> = parts.into_iter().filter(|s| !s.is_empty()).collect();
             println!("Channel {} reset — will fall back to profile/env defaults.", parts.join(" and "));
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle the `/profile` command in the CLI.
+async fn handle_cli_profile_command(
+    pool: &PgPool,
+    input: &str,
+    channel_id: i64,
+    data_dir: &str,
+) -> anyhow::Result<()> {
+    let parsed = match commands::parse_profile_command(input) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            println!("Error: {}", e);
+            return Ok(());
+        }
+    };
+
+    match parsed {
+        commands::ProfileCommand::Show => {
+            let channel = match db::types::get_channel_by_id(pool, channel_id).await? {
+                Some(ch) => ch,
+                None => {
+                    println!("Channel not found.");
+                    return Ok(());
+                }
+            };
+            let profile_registry = crate::profile::ProfileRegistry::new(data_dir);
+            let profile_names = profile_registry.list_names();
+            println!("Current profile: {}", channel.current_profile);
+            println!("Available profiles: {}", profile_names.join(", "));
+            if let Some(profile) = profile_registry.get(&channel.current_profile) {
+                println!(
+                    "  Provider: {}",
+                    profile.provider.as_deref().unwrap_or("(not set)")
+                );
+                println!(
+                    "  Model:    {}",
+                    profile.model.as_deref().unwrap_or("(not set)")
+                );
+            }
+        }
+        commands::ProfileCommand::Set(ref name) => {
+            let profile_registry = crate::profile::ProfileRegistry::new(data_dir);
+            if profile_registry.get(name).is_none() {
+                println!(
+                    "Unknown profile '{}'. Available profiles: {}",
+                    name,
+                    profile_registry.list_names().join(", ")
+                );
+                return Ok(());
+            }
+            commands::handle_profile_set(pool, channel_id, name).await?;
+            println!("Profile set to '{}'.", name);
+        }
+        commands::ProfileCommand::Reset => {
+            commands::handle_profile_set(pool, channel_id, "default").await?;
+            println!("Profile reset to 'default'.");
         }
     }
 

@@ -17,6 +17,7 @@ struct KanbanTaskRow {
     status: String,
     priority: Option<i32>,
     assignee: Option<String>,
+    template: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
 }
@@ -56,6 +57,10 @@ pub fn create_kanban_task_tool() -> McpTool {
                 "profile": {
                     "type": "string",
                     "description": "Optional profile name to use when executing this task. If omitted, uses the channel's current_profile."
+                },
+                "template": {
+                    "type": "string",
+                    "description": "Optional template name to use for structured guidance when executing this task. Templates are .md files in profiles/<name>/templates/"
                 }
             },
             "required": ["title"]
@@ -75,6 +80,7 @@ pub fn create_kanban_task_tool() -> McpTool {
             let assignee = args["assignee"].as_str().unwrap_or("");
             let channel_id_arg = args["channel_id"].as_i64();
             let profile = args["profile"].as_str().map(|s| s.to_string());
+            let template = args["template"].as_str().unwrap_or("");
 
             // Validate status
             let valid_statuses = ["backlog", "todo", "ready", "running", "review", "done", "blocked"];
@@ -108,10 +114,10 @@ pub fn create_kanban_task_tool() -> McpTool {
 
                     sql_forge!(
                         r#"
-                        INSERT INTO kanban_tasks (id, title, body, status, priority, assignee, channel_id, profile)
-                        VALUES (:id, :title, :body, :status, :priority, :assignee, :channel_id, NULLIF(:profile, '')::text)
+                        INSERT INTO kanban_tasks (id, title, body, status, priority, assignee, channel_id, profile, template)
+                        VALUES (:id, :title, :body, :status, :priority, :assignee, :channel_id, NULLIF(:profile, '')::text, :template)
                         "#,
-                        ( :id = &id, :title = title, :body = body, :status = status, :priority = priority, :assignee = assignee, :channel_id = resolved_channel_id, :profile = profile.as_deref().unwrap_or("") )
+                        ( :id = &id, :title = title, :body = body, :status = status, :priority = priority, :assignee = assignee, :channel_id = resolved_channel_id, :profile = profile.as_deref().unwrap_or(""), :template = template )
                     )
                     .execute(&pool)
                     .await
@@ -152,7 +158,7 @@ pub fn list_kanban_tasks_tool() -> McpTool {
                         sql_forge!(
                             KanbanTaskRow,
                             r#"
-                            SELECT id, display_id, title, body, status, priority, assignee, created_at, updated_at
+                            SELECT id, display_id, title, body, status, priority, assignee, template, created_at, updated_at
                             FROM kanban_tasks
                             WHERE status = :status
                             ORDER BY priority DESC, created_at DESC
@@ -166,7 +172,7 @@ pub fn list_kanban_tasks_tool() -> McpTool {
                         sql_forge!(
                             KanbanTaskRow,
                             r#"
-                            SELECT id, display_id, title, body, status, priority, assignee, created_at, updated_at
+                            SELECT id, display_id, title, body, status, priority, assignee, template, created_at, updated_at
                             FROM kanban_tasks
                             WHERE 1 = :_one
                             ORDER BY status, priority DESC, created_at DESC

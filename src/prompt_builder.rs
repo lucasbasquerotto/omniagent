@@ -17,6 +17,45 @@ use std::path::{Path, PathBuf};
 
 const ENTRY_DELIMITER: &str = "\n§\n";
 
+// ── Template loader ─────────────────────────────────────────────
+
+/// Load a template file from `profiles/<name>/templates/<name>.md`.
+/// Returns None if the file doesn't exist or is empty.
+pub fn load_template(data_dir: &str, profile_name: &str, template_name: &str) -> Option<String> {
+    if template_name.is_empty() {
+        return None;
+    }
+    let path: PathBuf = [data_dir, "profiles", profile_name, "templates", template_name]
+        .iter()
+        .collect();
+    // Try with .md extension if not already present
+    let path = if path.extension().is_some() {
+        path
+    } else {
+        let mut with_ext = path;
+        with_ext.set_extension("md");
+        with_ext
+    };
+    if !path.exists() {
+        tracing::warn!("Template file not found: {:?}", path);
+        return None;
+    }
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read template {:?}: {}", path, e);
+            None
+        }
+    }
+}
+
 // ── Character limits ────────────────────────────────────────────
 
 /// Read MEMORY_MAX_CHARS from env, default 5_000.
@@ -58,10 +97,6 @@ response must be a concise summary of what was accomplished. Cover key results, 
 decisions, and any follow-up actions needed. This replaces the need for a \
 separate summarization step.";
 
-const RESEARCH_WORKFLOW: &str = "";
-
-const SKILLS_GUIDANCE: &str = "";
-
 /// Grounding policy — instructions for evidence-based answers.
 const GROUNDING_POLICY: &str = "GROUNDING POLICY:\n\
 1. Prefer retrieved evidence over prior assumptions — when evidence is \
@@ -73,34 +108,15 @@ whenever possible (message IDs, wiki file paths, tool call IDs).\n\
 4. If you lack sufficient evidence to answer, either ask a clarifying \
 question or trigger a search/retrieval tool before responding.";
 
-const WIKI_GUIDANCE: &str = "";
-
-const DB_SCHEMA: &str = "DATABASE SCHEMA (PostgreSQL):\n\
-channels: id, name, platform, external_id, cause, metadata (JSONB), \
-current_profile, current_provider, current_model, closed, created_at, updated_at\n\
-threads: id, channel_id, status, cause, profile, provider, model, \
-terminal, input_tokens, cached_tokens, output_tokens, duration_ms, \
-created_at, started_at, ended_at\n\
-messages: id, thread_id, role, content, thread_sequence, msg_type, msg_subtype, \
-external_id, metadata (JSONB), embedding, summary_text, is_summary, \
-processing_time_ms (tool latency), token_usage (JSONB), created_at\n\
-summaries: id, channel_id, next_thread_id, content, created_at\n\
-cron_jobs: id, channel_id, name, schedule, prompt, script, enabled, \
-deliver, profile, model_override, created_at\n\
-kanban_tasks: id, lane, title, description, epic, assignee, priority, \
-size, status, order, tags, dependencies, created_at, updated_at\n\
-\n\
-Key relationships:\n\
-  threads.channel_id -> channels.id\n\
-  messages.thread_id -> threads.id\n\
-  summaries.channel_id -> channels.id\n\
-  cron_jobs.channel_id -> channels.id\n\
-\
-The query_database MCP tool gives you read-only SQL access (SELECT only). \
-Query these tables directly via sql-forge or SQL. \
-Use search_messages for full-text search across messages. \
-Use summaries to understand what happened in prior threads.";
-const DOCKER_EXECUTION_GUIDANCE: &str = "";
+// Compact summary (not raw DDL) — ~150 chars vs 500+ for the full schema.
+const DB_SCHEMA: &str = "DATABASE SCHEMA SUMMARY:\n\
+Tables: channels (config per conversation space), threads (per-topic runs), \
+messages (per-turn content), summaries (cross-thread), cron_jobs (schedules), \
+kanban_tasks (board items), thread_subtasks (step tracking), actions (tools).\n\
+Key FK: messages.thread_id→threads.id, threads.channel_id→channels.id, \
+threads.task_id→kanban_tasks.id, cron_jobs.channel_id→channels.id.\n\
+Use query_database (SELECT-only SQL) for structured data, search_messages for \
+full-text across messages, search_wiki for project knowledge.";
 
 const PROFILE_HINT: &str = "Active OmniAgent profile: default. \
 Your profile configuration determines which model, provider, and tools are available. \

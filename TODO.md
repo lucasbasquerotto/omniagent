@@ -1,131 +1,48 @@
-# TODO — Improve Context Grounding, Memory, and MCP Extensibility
+# OmniAgent Memory & Performance Improvements
 
-## 1) Context Builder (Selective, Ranked Prompt Assembly)
+## Tracking what needs to be done
 
-- [x] Create a `ContextBuilder` pipeline before each LLM call in `agent::process_message`.
-- [x] Assemble prompt context from ordered blocks:
-  - [x] System/profile instructions
-  - [x] `MEMORY.md` (always include, size-capped by user config; default < 5000 chars)
-  - [x] Recent thread messages (recency window)
-  - [ ] Last user messages (pinned)
-  - [x] Retrieved past messages (relevance-ranked via ILIKE)
-  - [ ] Retrieved wiki snippets (relevance-ranked)
-  - [ ] Allowed tool definitions only
-- [x] Add token budgeting per block (reserve output tokens, trim lowest-priority blocks first).
-  - [x] Never trim: System/profile instructions
-  - [x] Never trim: `MEMORY.md`
-- [x] Persist context assembly metadata in `messages.metadata` (selected message IDs, wiki files, token counts).
+### ✅ Implemented
 
-## 2) Retrieval Strategy (Past Messages + Wiki)
+#### Leaner System Prompt (prompt_builder.rs)
+- [x] Remove empty constants: `RESEARCH_WORKFLOW`, `SKILLS_GUIDANCE`, `WIKI_GUIDANCE`, `DOCKER_EXECUTION_GUIDANCE` — all `""`, removed
+- [x] Shorten `DB_SCHEMA` — from raw DDL (~500 tokens) to compact summary format (~150 chars)
+- [x] Bench: saves ~600 chars/tokens per turn — immediate token reduction
 
-- [x] Implement hybrid retrieval for historical context:
-  - [x] Semantic retrieval (pgvector / embeddings)
-  - [x] Keyword fallback (ILIKE / lexical)
-- [x] Reflect project defaults in retrieval sources:
-  - [x] postgres messages (objective facts, focus on recent conversations)
-  - [x] pgvector over messages (subjective/semantic facts over objective message facts)
-  - [x] wiki (long-term objective facts)
-  - [x] qdrant over wiki (vectorized wikis)
-- [x] Add re-ranking step favoring:
-  - [x] Recency
-  - [x] Same thread/channel
-  - [x] User-confirmed facts
-- [x] Add retrieval guardrails:
-  - [x] Max snippets per source type
-  - [x] Per-snippet char/token cap
-  - [ ] Dedup by semantic similarity
+#### Templates for Kanban & Cron Tasks
+- [x] **Migration:** Add `template TEXT` to `kanban_tasks`, `instruction_file TEXT` to `cron_jobs`
+- [x] **Template loader:** `load_template(data_dir, profile, template_name)` in `prompt_builder.rs`
+- [x] **Kanban dispatcher (scheduler.rs):** Fetch `template` from task, store in cause message metadata
+- [x] **Cron scheduler (scheduler.rs):** Fetch `instruction_file` from job, store in cause message metadata
+- [x] **process_thread (agent/mod.rs):** If cause is kanban/cron with template metadata, load template and inject as system message
+- [x] **Template example:** Created `code-improvement.md` sample at `/opt/data/profiles/default/templates/`
+- [x] **MCP tool (kanban.rs):** Added `template` parameter to `create_kanban_task` tool
 
-## 3) Hallucination Reduction / Grounding Policy
+#### Adaptive Planning (Task Classification)
+- [x] **context_builder.rs:** Replaced `classify_query` with `classify_complexity` returning `Complexity::Simple | Standard | Complex`
+  - [x] Simple: < 60 chars, greeting, acknowledgment → skip plan entirely
+  - [x] Standard: > 100 chars, clear request → plan as before
+  - [x] Complex: contains keywords (implement, refactor, design) OR kanban/cron task → auto-create subtasks
+- [x] **agent/mod.rs:** Uses complexity classification to gate:
+  - [x] Planning activation (skip for Simple)
+  - [x] Subtask creation (auto-create for Complex)
 
-- [x] Update system/profile prompt policy:
-  - [x] Prefer retrieved evidence over prior assumptions
-  - [x] If uncertain, explicitly state uncertainty
-  - [x] For factual/project-specific claims, provide grounding references
-- [x] Add internal evidence structure in metadata for each final answer:
-  - [x] `context.selected_message_ids[]` (message IDs)
-  - [x] `context.wiki_files[]` (file paths/sections)
-  - [ ] `evidence.tools[]` (tool call IDs)
-- [x] Add low-confidence fallback behavior:
-  - [x] Ask clarifying question, or
-  - [x] Trigger retrieval/tool call before answering
-- [ ] Add contradiction check between drafted answer and retrieved evidence.
+#### Subtask Automation
+- [x] **agent/mod.rs:** After plan generation for complex tasks, parse plan lines and create subtasks via `subtask::add_subtask`
+  - [x] Parses numbered or bulleted plan lines (max 6)
+  - [x] Priority order preserved from plan
+  - [x] Subtasks appear in the system prompt as "Current Task Progress"
 
-## 4) Memory Model (Short-Term vs Long-Term)
+### ✅ Hindsight Memory Integration
+- [x] `HINDSIGHT_URL` config option (env var, set in docker-compose.yml)
+- [x] `context_builder.rs`: `hindsight_recall` call for semantic memory via recall API
+- [x] Hindsight results injected as Low-priority context block
+- [x] `hindsight_populator.rs`: background message retain into hindsight (batch 200, watermarked)
+- [x] Builtin action `builtin_hindsight_populator` with cron scheduling (deactivated by default)
+- [x] Impact: Richer cross-session memory retrieval
 
-- [x] Keep full raw history in `messages` table (all roles/types) as source of truth.
-- [x] Introduce explicit long-term memory promotion workflow to wiki:
-  - [x] Promote only validated/repeatedly useful facts
-  - [x] Store provenance (source message IDs / tool outputs)
-  - [x] Store confidence and `last_verified_at`
-- [x] Add review/expiry workflow for long-term memory entries.
-- [x] Keep `MEMORY.md` user-authored and always-included (size-capped by user config).
-- [ ] Evaluate adding an episodic/hindsight memory layer for relationship-over-time summaries with provenance and confidence.
-
-## 5) “Remember to Retrieve” Behavior
-
-- [x] Add question classifier (fast heuristic/model): decide when retrieval is required.
-- [x] Auto-trigger `search_messages` / `search_wiki` for factual or repo-specific queries.
-- [x] Add profile-level knobs:
-  - [x] `auto_retrieval_enabled`
-  - [x] `retrieval_aggressiveness`
-  - [x] `grounding_required`
-
-## 6) MCP Runtime Hardening (Current Built-in Tools)
-
-- [ ] Enforce strict JSON Schema validation for tool inputs.
-- [ ] Add per-tool timeout/retry policy and error taxonomy.
-- [ ] Add idempotency and side-effect classification (`read_only`, `mutating`, `external_network`).
-- [ ] Require confirmation gate for high-risk mutating tools.
-- [ ] Improve observability:
-  - [ ] Persist tool latency, success/failure class, retry count
-  - [ ] Link tool call/result records with stable IDs
-
-## 7) MCP Extensibility (Add Tools Without Binary Release)
-
-- [ ] Design external MCP server integration:
-  - [ ] Transport support: `stdio` first, HTTP/SSE next
-  - [ ] Capability negotiation + tool discovery
-- [ ] Add dynamic tool registry layer:
-  - [ ] Merge built-in + external tools at runtime
-  - [ ] Profile-level allowlist enforcement across both
-- [ ] Add secure secret handling for external tool auth.
-- [ ] Add health checks / circuit breaker per external MCP server.
-
-## 8) Data/Schema & Telemetry Enhancements
-
-- [x] Extend `messages.metadata` schema conventions for:
-  - [x] context selection diagnostics
-  - [x] evidence references
-  - [ ] confidence score
-- [ ] Add tables (or JSON schema) for:
-  - [ ] feedback signals (explicit/implicit)
-  - [ ] wiki memory provenance and verification status
-- [ ] Add periodic metrics jobs:
-  - [ ] Groundedness rate
-  - [ ] Retrieval hit rate
-  - [ ] Tool success rate
-  - [ ] Hallucination proxy metrics (user corrections/re-asks)
-
-## 9) Evaluation Loop (Continuous Improvement)
-
-- [x] Build eval dataset from real conversations + expected outcomes.
-- [x] Add regression suite for profile/model/prompt changes.
-- [x] Track quality/cost/latency per profile and model.
-- [ ] Block prompt/profile rollouts on eval regressions.
-
-## 10) Rollout Plan
-
-- [x] Phase 1: Context builder + grounding policy + metadata evidence logging.
-- [x] Phase 2: Hybrid retrieval + auto-retrieval trigger + contradiction checks.
-- [x] Phase 3: Memory promotion workflow + provenance + review cycle.
-- [x] Phase 4: MCP external servers + dynamic tool registry.
-- [x] Phase 5: Full eval/feedback-driven optimization.
-
-## 11) Documentation Updates
-
-- [x] Update `AGENTS.md` with:
-  - [x] Context assembly rules
-  - [x] Grounding/citation policy
-  - [ ] Memory promotion criteria
-  - [ ] MCP extension model (built-in vs external)
-- [ ] Add operator runbook for tuning retrieval and grounding settings.
+### 🔲 Future Ideas
+- [ ] Cron editing tool (mcp) — add `template`/`instruction_file` field to cron edit UI
+- [ ] Kanban task editing tool (mcp) — add `template` field update
+- [ ] Template listing/management MCP tool
+- [ ] Dashboard UI for template management

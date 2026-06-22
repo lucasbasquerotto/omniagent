@@ -34,6 +34,7 @@ struct CronJobDueRow {
     mode: Option<String>,
     action_id: Option<String>,
     silent: Option<bool>,
+    instruction_file: Option<String>,
 }
 
 /// Spawn the cron scheduler loop as a background task.
@@ -289,6 +290,7 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
                 "scheduled_at": job.schedule,
                 "channel_id": channel.id,
                 "profile": profile_name,
+                "instruction_file": job.instruction_file.as_deref().unwrap_or(""),
             }),
             embedding: None,
             summary_text: None,
@@ -333,7 +335,7 @@ async fn fetch_due_jobs(pool: &PgPool) -> Result<Vec<CronJobDueRow>> {
     let rows: Vec<CronJobDueRow> = sql_forge!(
         CronJobDueRow,
         r#"
-        SELECT id, name, display_name, schedule, prompt, channel_id, profile, mode, action_id, silent
+        SELECT id, name, display_name, schedule, prompt, channel_id, profile, mode, action_id, silent, instruction_file
         FROM cron_jobs
         WHERE enabled = true
           AND active = true
@@ -405,6 +407,16 @@ async fn resolve_and_execute_action(
             let name = "Relevance Indexer".to_string();
             let r = crate::relevance::run_relevance_indexer(pool, data_dir)
                 .await
+                .map_err(|e| format!("{:#}", e));
+            (name, r)
+        }
+        "builtin_hindsight_populator" => {
+            let name = "Hindsight Populator".to_string();
+            let r = crate::hindsight_populator::run_hindsight_populator(pool, data_dir)
+                .await
+                .map(|summary| {
+                    tracing::info!("[hindsight-populator] {}", summary);
+                })
                 .map_err(|e| format!("{:#}", e));
             (name, r)
         }
@@ -509,6 +521,7 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
         id: String,
         title: String,
         body: Option<String>,
+        template: Option<String>,
         channel_id: Option<i64>,
         profile: Option<String>,
     }
@@ -516,7 +529,7 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
     let tasks: Vec<TodoTaskRow> = sql_forge!(
         TodoTaskRow,
         r#"
-        SELECT id, title, body, channel_id, profile
+        SELECT id, title, body, template, channel_id, profile
         FROM kanban_tasks
         WHERE status = 'todo'
           AND NOT archived
@@ -664,6 +677,7 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
             metadata: serde_json::json!({
                 "kanban_task_id": t.id,
                 "kanban_task_title": t.title,
+                "template": t.template.as_deref().unwrap_or(""),
             }),
             embedding: None,
             summary_text: None,

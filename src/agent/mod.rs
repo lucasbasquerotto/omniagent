@@ -626,23 +626,38 @@ async fn check_and_generate_summary(
         _ => String::new(),
     };
 
-    // 5. Build summarization prompt
+    // 5. Build summarization prompt — structured output
+    //    The LLM produces a structured summary that can be parsed, searched, and
+    //    cross-referenced with hindsight and Qdrant.
+    let system_summarizer_prompt =
+        "You are a conversation summarizer for an autonomous agent system. \
+         Produce a structured summary in the exact format below. \
+         Be specific — include file paths, config keys, exact numbers, and command names. \
+         Do NOT repeat information covered in the previous summary (if provided). \
+         Every claim must be grounded in the provided conversation content.\n\n\
+         ## Format:\n\
+         ### Topics\n\
+         - topic: <topic_name> | detail: <one sentence with specifics>\n\n\
+         ### Key Decisions\n\
+         - decision: <what was decided> | context: <why> | files: <affected files, if any>\n\n\
+         ### Action Items\n\
+         - status: <done|pending|failed> | task: <what> | details: <specifics>\n\n\
+         ### Entities Referenced\n\
+         - <entity_name> (<type>): <relation to conversation>\n\n\
+         ### Thread Count\n\
+         - total: <number> | first: <id> | last: <id>\n\n\
+         Keep each entry on a single line. Use | as field separator.";
+
     let summary_prompt = if previous_summary_text.is_empty() {
         format!(
-            "Summarize the following conversations from a single channel. \
-             Focus on key topics, decisions, user requests, and agent actions. \
-             Be concise but comprehensive.\n\n{}",
+            "Summarize the following conversations from a single channel.\n\n{}",
             all_thread_content
         )
     } else {
         format!(
-            "The following is the previous summary of earlier conversations. \
-             Do NOT repeat information already covered there.\n\n\
-             PREVIOUS SUMMARY:\n{}\n\n\
-             ---\n\n\
-             Now summarize the following new conversations. \
-             Focus on key topics, decisions, user requests, and agent actions. \
-             Be concise but comprehensive, and connect to the previous summary if relevant.\n\n{}",
+            "PREVIOUS SUMMARY (do NOT repeat):\n{}\n\n---\n\n\
+             Now summarize the following new conversations, \
+             connecting to the previous summary if relevant.\n\n{}",
             previous_summary_text, all_thread_content
         )
     };
@@ -650,14 +665,11 @@ async fn check_and_generate_summary(
     // 6. Call LLM for summary
     let summary_request = CompletionRequest {
         messages: vec![
-            ChatMessage::system(
-                "You are a conversation summarizer. Create a concise but thorough \
-                 summary of the provided conversations.",
-            ),
+            ChatMessage::system(&system_summarizer_prompt),
             ChatMessage::user(&summary_prompt),
         ],
         max_tokens: config.summary_tokens,
-        temperature: 0.3,
+        temperature: 0.2, // lower temperature for factual consistency
         stream: false,
         tools: None,
     };
@@ -917,7 +929,43 @@ async fn process_thread(
         }
     };
 
-    // 4b. Assemble additional context blocks via ContextBuilder
+    // 4b. Load template from cause message metadata (for kanban/cron tasks)
+    let template_section: Option<String> = {
+        let msg_type = cause_msg.msg_type.as_str();
+        if msg_type == "kanban" || msg_type == "cron" {
+            let template_name = cause_msg.metadata
+                .get("template")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    cause_msg.metadata
+                        .get("instruction_file")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                });
+            if let Some(template) = template_name {
+                let content = crate::prompt_builder::load_template(&ctx.data_dir, &profile_name, template);
+                if let Some(ref tmpl) = content {
+                    info!(
+                        "Loaded template '{}' for thread {} ({} chars)",
+                        template, thread.id, tmpl.len()
+                    );
+                    Some(format!(
+                        "=== Task Template ===\nThe following template provides structured guidance for this task type:\n\n{}",
+                        tmpl
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // 4c. Assemble additional context blocks via ContextBuilder
     let ctx_assembly_meta: Option<ContextAssemblyMeta>;
     let context_messages = {
         let (context_text, meta) = crate::context_builder::build_thread_context(
@@ -947,14 +995,27 @@ async fn process_thread(
         .and_then(|v| v.as_str())
         .unwrap_or("auto");
 
+    // Classify message complexity for adaptive behavior
+    let complexity = crate::context_builder::classify_complexity(
+        &cause_msg.content,
+        &cause_msg.msg_type,
+        cause_msg.metadata.get("kanban_task_id").or_else(|| cause_msg.metadata.get("cron_job_id")).map(|_| cause_msg.content.len()),
+    );
+
+    // Determine if we should run the planning phase
     let should_plan = match planning_mode {
         "never" => false,
         "always" => true,
         _ => {
-            // Auto: plan if message > 200 chars AND is first in thread
-            config.prompt_plan_enabled 
-                && cause_msg.content.len() > 200 
-                && cause_msg.thread_sequence == 0
+            if complexity == crate::context_builder::Complexity::Simple {
+                // Simple messages skip planning entirely for faster response
+                false
+            } else {
+                // Auto: plan if message > 100 chars AND is first in thread
+                config.prompt_plan_enabled 
+                    && cause_msg.content.len() > 100
+                    && cause_msg.thread_sequence == 0
+            }
         }
     };
 
@@ -1046,6 +1107,31 @@ async fn process_thread(
                         Err(e) => warn!("[plan] Failed to persist plan for thread {}: {:?}", thread.id, e),
                     }
 
+                    // For complex tasks, auto-create subtasks from the plan content
+                    if complexity == crate::context_builder::Complexity::Complex && content.len() > 100 {
+                        let plan_lines: Vec<&str> = content.lines()
+                            .filter(|l| {
+                                let t = l.trim();
+                                (t.starts_with(|c: char| c.is_ascii_digit()) || t.starts_with("- ") || t.starts_with("* ")) 
+                                    && t.len() > 10
+                                    && !t.contains("tool") && !t.contains("step") && !t.contains("Note") 
+                                    && t.find(|c: char| c == '.' || c == ')').map(|i| i < 5).unwrap_or(false)
+                            })
+                            .take(6) // max 6 subtasks
+                            .collect();
+                        for (i, line) in plan_lines.iter().enumerate() {
+                            let clean = line.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == '-' || c == '*' || c == ' ').trim();
+                            if !clean.is_empty() {
+                                let priority = (plan_lines.len() - i) as i32; // higher prio first
+                                if let Err(e) = crate::subtask::add_subtask(pool, thread.id, clean, priority).await {
+                                    warn!("[plan] Failed to create subtask '{}': {:?}", clean, e);
+                                } else {
+                                    info!("[plan] Created subtask '{}' for complex thread {}", clean, thread.id);
+                                }
+                            }
+                        }
+                    }
+
                     last_plan = Some(content);
 
                     // If no refinement iterations configured, one shot is enough
@@ -1081,6 +1167,11 @@ async fn process_thread(
     // Inject subtask context section if the thread has active subtasks
     if let Some(ref subtask_section) = subtask_section {
         messages.push(ChatMessage::system(subtask_section));
+    }
+
+    // Inject task template if the thread has a template from kanban/cron metadata
+    if let Some(ref template_section) = template_section {
+        messages.push(ChatMessage::system(template_section));
     }
 
     // Add context blocks as system messages (before the user message)

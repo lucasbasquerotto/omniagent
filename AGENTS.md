@@ -61,6 +61,18 @@ All modals should provide explicit close buttons (✕ close button + Cancel/Conf
 - Add to default profile's `allowed_tools` if it should be available by default
 - Tool descriptions must include: ACTION PREFIX + USE CASE + NEGATIVE SPACE
 
+### Hindsight Populator (`hindsight_populator.rs`)
+- Located at `src/hindsight_populator.rs`
+- Queries new messages from the DB (id > watermark) and retains them into omniagent-hindsight
+- Watermark stored at `{data_dir}/hindsight_watermark.json` (JSON with `last_message_id`, `last_run_at`)
+- Processes in batches of 200, sub-batches of 50
+- Uses `strategy: "fast"` to skip LLM extraction (works offline)
+- Tags messages by role, type, and subtype for semantic filtering at recall time
+- **Builtin action**: `builtin_hindsight_populator` registered in both DB `actions` table and scheduler dispatch
+- **MCP tool**: `actions_hindsight_populator` for manual agent triggering
+- **Cron**: Job `hindsight_populator` (every 15 min, `mode=action`, deactivated by default)
+- **Recall integration**: `context_builder.rs` calls `POST /v1/default/banks/{bank}/memories/recall` with the user query, injects results as Low-priority block
+
 ### Subtask Tool (`manage_subtasks`)
 - Located at `src/mcp/tools/subtasks.rs`
 - Backend module at `src/subtask/mod.rs` — uses `sql_forge!()` for all DB operations

@@ -1262,88 +1262,52 @@ pub async fn update_message_embedding(
 }
 
 // ---------------------------------------------------------------------------
-// Hybrid retrieval: pgvector semantic search for messages — unchanged
+// Hybrid retrieval: pgvector semantic search — two-stage recency-weighted
 // ---------------------------------------------------------------------------
 
 /// Search messages by embedding similarity with recency-weighted two-stage decay.
 ///
-/// Stage 1: Fetch top N candidates using HNSW-indexed vector similarity (cosine distance).
-/// Stage 2: Re-rank candidates by distance × recency decay so recent messages rank higher.
+/// Stage 1: Fetch top N candidates using HNSW-indexed ANN search (cosine distance).
+/// Stage 2: Re-rank candidates by `distance × (1 + days_old)` so recent messages
+/// rank higher than older ones with similar semantic match.
 ///
-/// When the pgvector extension is unavailable (embedding_vec column doesn't exist),
-/// falls back to the TEXT cast approach for maximal compatibility.
+/// The `embedding_vec` column and HNSW index are created by the startup migration.
+/// No fallback to TEXT-cast search — the two-stage decay is the only path.
 pub async fn search_messages_semantic(
     pool: &PgPool,
     embedding_str: &str,
     channel_id: i64,
     limit: i64,
 ) -> anyhow::Result<Vec<Message>> {
-    // Detect whether the native vector column exists (pgvector available)
-    let has_vec_column: bool = sqlx::query_scalar(
-        r#"SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'messages' AND column_name = 'embedding_vec'
-        )"#,
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or(false);
-
-    let rows: Vec<MessageDb> = if has_vec_column {
-        // Two-stage decay: HNSW-indexed ANN search → recency re-rank
-        sqlx::query_as(
-            r#"
-            WITH vector_candidates AS (
-                SELECT m.id, m.created_at,
-                       (m.embedding_vec <=> $2::vector(1536)) AS distance_raw
-                FROM messages m
-                JOIN threads t ON t.id = m.thread_id
-                WHERE t.channel_id = $1
-                  AND m.embedding_vec IS NOT NULL
-                  AND m.role IN ('user', 'agent')
-                ORDER BY m.embedding_vec <=> $2::vector(1536)
-                LIMIT 100
-            )
-            SELECT
-                m.id, m.thread_id, m.role, m.content, m.thread_sequence, m.external_id,
-                m.metadata::text AS "metadata", m.embedding, m.summary_text, m.is_summary,
-                m.msg_type, m.msg_subtype,
-                COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
-            FROM messages m
-            JOIN vector_candidates vc ON vc.id = m.id
-            ORDER BY vc.distance_raw * (1 + EXTRACT(EPOCH FROM (NOW() - vc.created_at)) / 86400)
-            LIMIT $3
-            "#,
-        )
-        .bind(channel_id)
-        .bind(embedding_str)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    } else {
-        // Fallback: plain cosine distance via TEXT cast (no HNSW index)
-        sqlx::query_as(
-            r#"
-            SELECT
-                m.id, m.thread_id, m.role, m.content, m.thread_sequence, m.external_id,
-                m.metadata::text AS "metadata", m.embedding, m.summary_text, m.is_summary,
-                m.msg_type, m.msg_subtype,
-                COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+    let rows: Vec<MessageDb> = sqlx::query_as(
+        r#"
+        WITH vector_candidates AS (
+            SELECT m.id, m.created_at,
+                   (m.embedding_vec <=> $2::vector(1536)) AS distance_raw
             FROM messages m
             JOIN threads t ON t.id = m.thread_id
             WHERE t.channel_id = $1
-              AND m.embedding IS NOT NULL
+              AND m.embedding_vec IS NOT NULL
               AND m.role IN ('user', 'agent')
-            ORDER BY m.embedding::vector(1536) <=> $2::vector(1536)
-            LIMIT $3
-            "#,
+            ORDER BY m.embedding_vec <=> $2::vector(1536)
+            LIMIT 100
         )
-        .bind(channel_id)
-        .bind(embedding_str)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    };
+        SELECT
+            m.id, m.thread_id, m.role, m.content, m.thread_sequence, m.external_id,
+            m.metadata::text AS "metadata", m.embedding, m.summary_text, m.is_summary,
+            m.msg_type, m.msg_subtype,
+            COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
+        FROM messages m
+        JOIN vector_candidates vc ON vc.id = m.id
+        ORDER BY vc.distance_raw * (1 + EXTRACT(EPOCH FROM (NOW() - vc.created_at)) / 86400)
+        LIMIT $3
+        "#,
+    )
+    .bind(channel_id)
+    .bind(embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
 
     rows.into_iter().map(|r| r.try_into()).collect()
 }

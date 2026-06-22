@@ -19,6 +19,7 @@ mod plugin;
 mod profile;
 mod prompt_builder;
 mod relevance;
+mod hindsight_populator;
 mod scheduler;
 mod server;
 mod subtask;

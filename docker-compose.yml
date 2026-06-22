@@ -40,6 +40,7 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
       WORKSPACE_DIR: /opt/workspace
+      HINDSIGHT_URL: http://omniagent-hindsight:8888
     volumes:
       - ./:/app
       - cargo-registry:/usr/local/cargo/registry
@@ -72,8 +73,25 @@ services:
     volumes:
       - ./data:/opt/data:rw
 
+  # hindsight — persistent memory provider
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:0.7.2
+    container_name: omniagent-hindsight
+    restart: unless-stopped
+    expose:
+      - "8888"
+      - "9999"
+    env_file:
+      - /opt/data/.env
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    mem_limit: 2G
+    logging:
+      driver: journald
+
 volumes:
   postgres_data:
   qdrant_data:
   cargo-registry:
   cargo-git:
+  hindsight-data:

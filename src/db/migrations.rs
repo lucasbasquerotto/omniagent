@@ -727,10 +727,50 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO actions (id, name, tool_name, params, is_builtin)
+        VALUES ('builtin_hindsight_populator', 'Hindsight Populator', 'actions_hindsight_populator', '{}', true)
+        ON CONFLICT (id) DO NOTHING;
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     // ── Add silent column to cron_jobs table ──
     sqlx::query(
         r#"ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS silent BOOLEAN NOT NULL DEFAULT false;"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Add template column to kanban_tasks ──
+    sqlx::query(
+        r#"ALTER TABLE kanban_tasks ADD COLUMN IF NOT EXISTS template TEXT DEFAULT '';"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── Add instruction_file column to cron_jobs ──
+    sqlx::query(
+        r#"ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS instruction_file TEXT DEFAULT '';"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // ── GIN trigram index for ILIKE search performance ──
+    // Enables pg_trgm extension (idempotent) and creates a GIN index on
+    // messages.content for fast ILIKE / LIKE / similarity queries.
+    sqlx::query(
+        r#"CREATE EXTENSION IF NOT EXISTS pg_trgm;"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_messages_content_trgm
+        ON messages USING gin (content gin_trgm_ops)
+        "#,
     )
     .execute(pool)
     .await?;

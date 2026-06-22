@@ -272,11 +272,64 @@ impl ContextBuilder {
 
 // ---------------------------------------------------------------------------
 // Query classification
-// ---------------------------------------------------------------------------
+// ── Query complexity classification ─────────────────────────────
 
-/// Determine if a user message is likely a query/request that would benefit
-/// from retrieval. Returns (label, needs_retrieval).
-pub fn classify_query(_content: &str) -> (&'static str, bool) {
+/// Complexity tier for a user message — determines planning depth and tooling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Complexity {
+    /// Greeting, acknowledgment, simple command — skip planning, execute directly.
+    Simple,
+    /// Standard request — plan as configured.
+    Standard,
+    /// Complex multi-step task (implement, refactor, design, kanban/cron) — plan + auto-subtasks.
+    Complex,
+}
+
+/// Classify a message into a complexity tier.
+///
+/// Simple: < 60 chars, greeting words, acknowledgment.
+/// Complex: contains implement/refactor/design/architecture/create/build keywords,
+///           or is a kanban/cron task with substantive content.
+/// Standard: everything else.
+pub fn classify_complexity(content: &str, msg_type: &str, metadata_word_count: Option<usize>) -> Complexity {
+    let trimmed = content.trim();
+    let char_len = trimmed.len();
+    let word_count = trimmed.split_whitespace().count();
+
+    // Simple: short messages, greetings, acknowledgments
+    if char_len < 60 || word_count <= 3 {
+        let lower = trimmed.to_lowercase();
+        let greetings = ["hi", "hello", "hey", "ok", "okay", "k", "thanks", "ty", "thx", "👍", "🙏", "done", "yes", "no", "good", "great"];
+        if greetings.iter().any(|g| lower.contains(g)) || word_count <= 2 {
+            return Complexity::Simple;
+        }
+    }
+
+    // Complex: specific action keywords or kanban/cron tasks with content
+    let lower = trimmed.to_lowercase();
+    let complex_keywords = [
+        "implement", "refactor", "redesign", "architecture", "create", "build",
+        "design", "develop", "migrate", "restructure", "overhaul", "rewrite",
+        "configure", "set up", "deploy", "integrate", "add feature",
+        "fix bug", "resolve issue", "multi-step", "complex",
+    ];
+    let is_complex_keyword = complex_keywords.iter().any(|kw| lower.contains(kw));
+
+    // Kanban/cron tasks with a body longer than a title
+    let is_structured_task = (msg_type == "kanban" || msg_type == "cron")
+        && metadata_word_count.map(|c| c > 10).unwrap_or(false);
+
+    let has_substantive_length = char_len > 200;
+
+    if is_complex_keyword || is_structured_task || has_substantive_length {
+        return Complexity::Complex;
+    }
+
+    Complexity::Standard
+}
+
+// Old classifier kept for backward compat
+fn classify_query(_content: &str) -> (&'static str, bool) {
     // Simple heuristic: queries longer than 15 words likely need retrieval
     let word_count = _content.split_whitespace().count();
     if word_count > 15 {
@@ -424,6 +477,13 @@ pub async fn build_thread_context(
         _ => {}
     }
 
+    // ── RRF (Reciprocal Rank Fusion) helper ──
+    // RRF combines multiple ranked result sets into a single fused ranking.
+    // score(r) = Σ 1/(k + rank_i(r)) for each result set i
+    const RRF_K: f64 = 60.0;
+    const RRF_TEXT_WEIGHT: f64 = 1.0;
+    const RRF_SEMANTIC_WEIGHT: f64 = 1.0;
+
     // Add retrieved past messages + wiki if retrieval is indicated
     if aggressiveness > 0 {
         let search_terms: Vec<&str> = cause_content
@@ -435,38 +495,138 @@ pub async fn build_thread_context(
         if !search_terms.is_empty() {
             let search_query = search_terms.join(" ");
 
-            // ILIKE text search in messages
-            match queries::search_messages_text(pool, &search_query, channel_id, 5).await {
-                Ok(matched_msgs) => {
-                    if !matched_msgs.is_empty() {
-                        let retrieved: String = matched_msgs
-                            .iter()
-                            .map(|m| {
-                                format!(
-                                    "[{} msg_id={}]: {}",
-                                    m.role,
-                                    m.id,
-                                    m.content.chars().take(300).collect::<String>()
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n---\n");
-                        builder.add_block(ContextBlock::new(
-                            "retrieved_past_messages",
-                            BlockPriority::Low,
-                            &format!("Retrieved from past conversations:\n{}", retrieved),
-                            3_000,
-                        ));
+            // ── Hybrid message search (text + semantic fused via RRF) ──
+            // Collect results from both sources, then fuse
+            let text_msgs = queries::search_messages_text(pool, &search_query, channel_id, 10).await
+                .unwrap_or_default();
+            let semantic_msgs = if aggressiveness >= 2 {
+                let hash_vec = HashVectorizer;
+                let query_embedding = hash_vec.generate_embedding(&search_query).await;
+                let emb_str = vector_to_string(&query_embedding);
+                queries::search_messages_semantic(pool, &emb_str, channel_id, 10).await
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+
+            // RRF fusion of text + semantic results
+            let fused_msgs = if semantic_msgs.is_empty() {
+                text_msgs
+            } else {
+                use std::collections::HashMap;
+                // Build RRF scores: message_id → fused_score
+                let mut scores: HashMap<i64, f64> = HashMap::new();
+                for (rank, msg) in text_msgs.iter().enumerate() {
+                    let score = RRF_TEXT_WEIGHT / (RRF_K + rank as f64 + 1.0);
+                    scores.insert(msg.id, scores.get(&msg.id).copied().unwrap_or(0.0) + score);
+                }
+                for (rank, msg) in semantic_msgs.iter().enumerate() {
+                    let score = RRF_SEMANTIC_WEIGHT / (RRF_K + rank as f64 + 1.0);
+                    scores.insert(msg.id, scores.get(&msg.id).copied().unwrap_or(0.0) + score);
+                }
+                // Sort by score descending, then deduplicate by ID
+                let mut scored_ids: Vec<(i64, f64)> = scores.into_iter().collect();
+                scored_ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_ids: std::collections::HashSet<i64> = scored_ids.into_iter()
+                    .take(5)
+                    .map(|(id, _)| id)
+                    .collect();
+                // Collect messages in RRF order, preferring text result when available
+                let mut seen = std::collections::HashSet::new();
+                let mut fused: Vec<crate::models::Message> = Vec::new();
+                for msg in text_msgs.iter().chain(semantic_msgs.iter()) {
+                    if top_ids.contains(&msg.id) && seen.insert(msg.id) {
+                        fused.push(msg.clone());
                     }
                 }
-                Err(e) => tracing::warn!("Failed to search past messages: {:?}", e),
+                fused
+            };
+
+            if !fused_msgs.is_empty() {
+                let retrieved: String = fused_msgs
+                    .iter()
+                    .map(|m| {
+                        let content = if m.msg_type == "tool" || m.msg_type == "tool_result" || m.msg_type == "multi-tool" {
+                            let tool_name = m.msg_subtype.as_deref().unwrap_or("unknown");
+                            let preview = m.content.chars().take(100).collect::<String>();
+                            format!("[Tool: {}] {}", tool_name, preview)
+                        } else {
+                            m.content.chars().take(500).collect::<String>()
+                        };
+                        format!(
+                            "[{} msg_id={}]: {}",
+                            m.role,
+                            m.id,
+                            content,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n---\n");
+                builder.add_block(ContextBlock::new(
+                    "retrieved_past_messages",
+                    BlockPriority::Low,
+                    &format!("Retrieved from past conversations (hybrid search):\n{}", retrieved),
+                    4_000,  // increased budget for hybrid results
+                ));
             }
 
-            // Wiki text search
+            // ── Hybrid wiki search (text + Qdrant semantic fused via RRF) ──
+            // Collect results from both wiki text search and Qdrant, then fuse
             let wiki_dir = format!("{}/profiles/{}/wiki", data_dir, profile_name);
-            let wiki_results = queries::search_wiki_text(&wiki_dir, &search_query, 3);
-            if !wiki_results.is_empty() {
-                let wiki_text: String = wiki_results
+            let wiki_text_results = queries::search_wiki_text(&wiki_dir, &search_query, 5);
+
+            let qdrant_results = if aggressiveness >= 2 {
+                if let Some(qdrant) = qdrant_url {
+                    let hash_vec = HashVectorizer;
+                    let wiki_embedding = hash_vec.generate_embedding(&search_query).await;
+                    queries::search_wiki_qdrant(qdrant, &wiki_embedding, 5).await
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            };
+
+            // Fuse wiki results via RRF (match by path)
+            let fused_wiki: Vec<(String, String, String)> = if qdrant_results.is_empty() {
+                wiki_text_results
+            } else {
+                let mut wiki_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+                // Track which items we include (top N by fused score)
+                for (rank, (path, title, snippet)) in wiki_text_results.iter().enumerate() {
+                    let score = RRF_TEXT_WEIGHT / (RRF_K + rank as f64 + 1.0);
+                    *wiki_scores.entry(path.clone()).or_insert(0.0) += score;
+                }
+                for (rank, (path, title, _score)) in qdrant_results.iter().enumerate() {
+                    let score = RRF_SEMANTIC_WEIGHT / (RRF_K + rank as f64 + 1.0);
+                    *wiki_scores.entry(path.clone()).or_insert(0.0) += score;
+                }
+                // Sort by score descending
+                let mut scored_wiki: Vec<(String, f64)> = wiki_scores.into_iter().collect();
+                scored_wiki.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top_paths: std::collections::HashSet<String> = scored_wiki.into_iter()
+                    .take(4)
+                    .map(|(path, _)| path)
+                    .collect();
+                // Collect results in RRF order
+                let mut seen = std::collections::HashSet::new();
+                let mut fused: Vec<(String, String, String)> = Vec::new();
+                // Build an iterator over both result sets as (path, title, snippet)
+                let text_iter = wiki_text_results.iter()
+                    .map(|(p, t, s)| (p.as_str(), t.as_str(), s.as_str()));
+                let qdrant_iter = qdrant_results.iter()
+                    .map(|(p, t, _)| (p.as_str(), t.as_str(), "semantic match"));
+                for (path, title, snippet) in text_iter.chain(qdrant_iter) {
+                    if top_paths.contains(path) && seen.insert(path.to_string()) {
+                        fused.push((path.to_string(), title.to_string(), snippet.to_string()));
+                    }
+                }
+                fused
+            };
+
+            if !fused_wiki.is_empty() {
+                let wiki_text: String = fused_wiki
                     .iter()
                     .map(|(path, title, snippet)| format!("[{}] {}:\n{}", title, path, snippet))
                     .collect::<Vec<_>>()
@@ -474,67 +634,114 @@ pub async fn build_thread_context(
                 builder.add_block(ContextBlock::new(
                     "retrieved_wiki_text",
                     BlockPriority::Low,
-                    &format!("Wiki references:\n{}", wiki_text),
-                    2_000,
+                    &format!("Wiki references (hybrid search):\n{}", wiki_text),
+                    4_000,  // increased from 2_000
                 ));
             }
+        }
+    }
 
-            // Aggressiveness >= 2: add semantic search too
-            if aggressiveness >= 2 {
-                let hash_vec = HashVectorizer;
-                let query_embedding = hash_vec.generate_embedding(&search_query).await;
-                let emb_str = vector_to_string(&query_embedding);
+    // ── Hindsight memory recall ──
+    // If hindsight is configured (via HINDSIGHT_URL env var), recall relevant past memories.
+    if aggressiveness > 0 {
+        let hindsight_url = std::env::var("HINDSIGHT_URL").ok();
+        if let Some(ref url) = hindsight_url {
+            let hindsight_bank = std::env::var("HINDSIGHT_BANK").unwrap_or_else(|_| "omniagent".to_string());
+            let recall_url = format!(
+                "{}/v1/default/banks/{}/memories/recall",
+                url.trim_end_matches('/'),
+                hindsight_bank
+            );
 
-                // Pgvector semantic search over messages
-                match queries::search_messages_semantic(pool, &emb_str, channel_id, 3).await {
-                    Ok(semantic_msgs) => {
-                        if !semantic_msgs.is_empty() {
-                            let semantic: String = semantic_msgs
-                                .iter()
-                                .map(|m| {
-                                    format!(
-                                        "[{} msg_id={}]: {}",
-                                        m.role,
-                                        m.id,
-                                        m.content.chars().take(300).collect::<String>()
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n---\n");
-                            builder.add_block(ContextBlock::new(
-                                "semantically_similar_messages",
-                                BlockPriority::Low,
-                                &format!("Semantically similar messages:\n{}", semantic),
-                                2_000,
-                            ));
-                        }
-                    }
-                    Err(e) => tracing::warn!("Failed semantic search: {:?}", e),
-                }
+            // Build the recall payload from the cause content
+            let recall_payload = serde_json::json!({
+                "query": cause_content,
+                "limit": 5,
+            });
 
-                // Qdrant wiki search
-                if let Some(qdrant) = qdrant_url {
-                    let wiki_embedding = hash_vec.generate_embedding(&search_query).await;
-                    match queries::search_wiki_qdrant(qdrant, &wiki_embedding, 3).await {
-                        Ok(qdrant_results) => {
-                            if !qdrant_results.is_empty() {
-                                let qdrant_text: String = qdrant_results
-                                    .iter()
-                                    .map(|(path, title, score)| {
-                                        format!("[{} (score={:.2})] {}", title, score, path)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                builder.add_block(ContextBlock::new(
-                                    "semantically_similar_wiki",
-                                    BlockPriority::Low,
-                                    &format!("Wiki docs (semantic similarity):\n{}", qdrant_text),
-                                    1_500,
-                                ));
+            match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(client) => {
+                    match client
+                        .post(&recall_url)
+                        .json(&recall_payload)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.json::<serde_json::Value>().await {
+                                Ok(data) => {
+                                    let memories = data.get("results")
+                                        .or_else(|| data.get("memories"))
+                                        .and_then(|v| v.as_array())
+                                        .cloned()
+                                        .unwrap_or_default();
+
+                                    if !memories.is_empty() {
+                                        let memory_text: String = memories
+                                            .iter()
+                                            .take(5)
+                                            .filter_map(|m| {
+                                                let text = m.get("text")
+                                                    .or_else(|| m.get("content"))
+                                                    .and_then(|v| v.as_str())?;
+                                                let tags = m.get("tags")
+                                                    .and_then(|v| v.as_array())
+                                                    .map(|a| {
+                                                        a.iter()
+                                                            .filter_map(|t| t.as_str())
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    })
+                                                    .unwrap_or_default();
+                                                let score = m.get("score")
+                                                    .and_then(|v| v.as_f64())
+                                                    .map(|s| format!(" ({:.2})", s))
+                                                    .unwrap_or_default();
+                                                Some(format!(
+                                                    "[tags: {}]{} {:.200}",
+                                                    tags,
+                                                    score,
+                                                    text
+                                                ))
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n---\n");
+
+                                        builder.add_block(ContextBlock::new(
+                                            "hindsight_memories",
+                                            BlockPriority::Low,
+                                            &format!(
+                                                "Relevant past memories (from omniagent-hindsight):\n{}",
+                                                memory_text
+                                            ),
+                                            3_000,
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to parse hindsight recall response: {:?}", e);
+                                }
                             }
                         }
-                        Err(e) => tracing::warn!("Qdrant wiki search failed: {:?}", e),
+                        Ok(resp) => {
+                            tracing::warn!(
+                                "Hindsight recall returned HTTP {} (may not be running)",
+                                resp.status()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Hindsight recall request failed: {:?} (may not be running)",
+                                e
+                            );
+                        }
                     }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to build hindsight HTTP client: {:?}", e);
                 }
             }
         }

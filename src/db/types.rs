@@ -1200,7 +1200,7 @@ pub async fn search_messages_text(
         JOIN threads t ON t.id = m.thread_id
         WHERE t.channel_id = :channel_id
           AND m.content ILIKE :pattern
-          AND m.role IN ('user', 'agent')
+          AND m.msg_type IN ('cause', 'summary', 'plan', 'message', 'reasoning', 'error', 'tool', 'tool_result')
         ORDER BY m.created_at DESC
         LIMIT :limit
         "#,
@@ -1223,7 +1223,7 @@ pub async fn find_messages_without_embeddings(
         SELECT id, content
         FROM messages
         WHERE embedding IS NULL
-          AND role IN ('user', 'agent')
+          AND msg_type IN ('cause', 'summary', 'plan', 'message', 'reasoning', 'error')
         ORDER BY created_at ASC
         LIMIT :limit
         "#,
@@ -1288,7 +1288,7 @@ pub async fn search_messages_semantic(
             JOIN threads t ON t.id = m.thread_id
             WHERE t.channel_id = $1
               AND m.embedding_vec IS NOT NULL
-              AND m.role IN ('user', 'agent')
+              AND m.msg_type IN ('cause', 'summary', 'plan', 'message', 'reasoning', 'error', 'tool', 'tool_result')
             ORDER BY m.embedding_vec <=> $2::vector(1536)
             LIMIT 100
         )

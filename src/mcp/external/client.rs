@@ -61,20 +61,20 @@ impl CircuitBreaker {
     /// Check if a request is allowed. Returns true if the circuit is closed
     /// or half-open (allowing a test request).
     pub fn is_allowed(&self) -> bool {
-        let inner = self.state.lock().unwrap();
+        let inner = self.state.lock().expect("circuit state lock poisoned");
         matches!(inner.state, CircuitState::Closed | CircuitState::HalfOpen)
     }
 
     /// Record a successful request — resets failure count.
     pub fn record_success(&self) {
-        let mut inner = self.state.lock().unwrap();
+        let mut inner = self.state.lock().expect("circuit state lock poisoned");
         inner.consecutive_failures = 0;
         inner.state = CircuitState::Closed;
     }
 
     /// Record a failed request. Opens the circuit if max retries exceeded.
     pub fn record_failure(&self) {
-        let mut inner = self.state.lock().unwrap();
+        let mut inner = self.state.lock().expect("circuit state lock poisoned");
         inner.consecutive_failures += 1;
         if inner.consecutive_failures >= inner.max_retries {
             inner.state = CircuitState::Open;
@@ -88,7 +88,7 @@ impl CircuitBreaker {
     /// Get the current state (for diagnostics).
     #[allow(dead_code)]
     pub fn state(&self) -> CircuitState {
-        self.state.lock().unwrap().state.clone()
+        self.state.lock().expect("circuit state lock poisoned").state.clone()
     }
 }
 
@@ -301,7 +301,7 @@ impl StdioMcpClient {
             .spawn()
             .with_context(|| format!("Failed to spawn MCP server '{}'", self.config.name))?;
 
-        *self.connected.lock().unwrap() = true;
+        *self.connected.lock().expect("connected lock poisoned") = true;
         *guard = Some(child);
         Ok(guard)
     }
@@ -359,7 +359,7 @@ impl StdioMcpClient {
 impl McpServerClient for StdioMcpClient {
     fn initialize(&mut self) -> Result<Vec<McpExternalTool>> {
         {
-            let tools = self.tools.lock().unwrap();
+            let tools = self.tools.lock().expect("tools lock poisoned");
             if !tools.is_empty() {
                 return Ok(tools.clone());
             }
@@ -367,7 +367,7 @@ impl McpServerClient for StdioMcpClient {
 
         // Step 1: Initialize
         let mut guard = self.spawn_locked()?;
-        let child = guard.as_mut().unwrap();
+        let child = guard.as_mut().expect("process guard should be Some after spawn");
         let server_name = &self.config.name;
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -419,7 +419,7 @@ impl McpServerClient for StdioMcpClient {
             tools.tools.len()
         );
 
-        *self.tools.lock().unwrap() = tools.tools.clone();
+        *self.tools.lock().expect("tools lock poisoned") = tools.tools.clone();
         Ok(tools.tools)
     }
 
@@ -459,7 +459,7 @@ impl McpServerClient for StdioMcpClient {
                 child.wait().ok();
             }
         }
-        *self.connected.lock().unwrap() = false;
+        *self.connected.lock().expect("connected lock poisoned") = false;
         Ok(())
     }
 
@@ -469,10 +469,10 @@ impl McpServerClient for StdioMcpClient {
 
     fn health(&self) -> ServerHealth {
         ServerHealth {
-            connected: *self.connected.lock().unwrap(),
-            tool_count: self.tools.lock().unwrap().len(),
+            connected: *self.connected.lock().expect("connected lock poisoned"),
+            tool_count: self.tools.lock().expect("tools lock poisoned").len(),
             circuit_state: self.circuit.state(),
-            last_error: self.last_error.lock().unwrap().clone(),
+            last_error: self.last_error.lock().expect("last_error lock poisoned").clone(),
         }
     }
 }

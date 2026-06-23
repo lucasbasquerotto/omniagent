@@ -7,7 +7,7 @@ use anyhow::Result;
 use sqlx::PgPool;
 
 use crate::plugin;
-use crate::models::Channel;
+use crate::db::types::Channel;
 
 // ---------------------------------------------------------------------------
 // ModelCommand — parsed result

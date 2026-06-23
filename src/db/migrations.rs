@@ -2,6 +2,17 @@ use anyhow::Result;
 use sqlx::PgPool;
 
 pub async fn run(pool: &PgPool) -> Result<()> {
+    phase_1_core_tables(pool).await?;
+    phase_2_message_channel_migrations(pool).await?;
+    phase_3_feature_tables(pool).await?;
+    phase_4_indexes_and_columns(pool).await?;
+    phase_5_planning_and_search(pool).await?;
+    phase_6_vector_and_secrets(pool).await?;
+    Ok(())
+}
+
+/// Phase 1: Core tables — extensions, channels, messages, channel_stops.
+async fn phase_1_core_tables(pool: &PgPool) -> Result<()> {
     // Enable pgvector extension — wrapped in DO block so it doesn't fail
     // if pgvector isn't installed (optional vector support).
     sqlx::query(
@@ -75,6 +86,11 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Phase 2: Column migrations on messages and channels tables.
+async fn phase_2_message_channel_migrations(pool: &PgPool) -> Result<()> {
     // Migration: add msg_type, msg_subtype, iteration_count columns
     // (idempotent — skips if columns already exist)
     sqlx::query(
@@ -157,6 +173,12 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Phase 3: Feature tables — kanban, cron, summaries, threads, subscriptions,
+/// read-only user, and data migration for threads.
+async fn phase_3_feature_tables(pool: &PgPool) -> Result<()> {
     // ── Kanban tasks table ──
     sqlx::query(
         r#"
@@ -445,11 +467,33 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         EXCEPTION
             WHEN others THEN NULL;
         END $$;
-        "#
+        "#,
     )
     .execute(pool)
     .await?;
 
+    // ── Channel subscriptions table for summary delivery across channels ──
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS channel_subscriptions (
+            id                      BIGSERIAL PRIMARY KEY,
+            channel_id              BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            subscriber_platform     TEXT NOT NULL,
+            subscriber_resource     TEXT NOT NULL,
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(channel_id, subscriber_platform, subscriber_resource)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Phase 4: Indexes and additional columns — closed, resource_identifier,
+/// terminal, kanban dependencies, plugin registry, actions.
+async fn phase_4_indexes_and_columns(pool: &PgPool) -> Result<()> {
     // Add closed column to channels (default false — channels start opened)
     sqlx::query(
         r#"
@@ -520,22 +564,6 @@ pub async fn run(pool: &PgPool) -> Result<()> {
                 UNIQUE (platform, resource_identifier);
             END IF;
         END $$;
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // ── Channel subscriptions table for summary delivery across channels ──
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS channel_subscriptions (
-            id                      BIGSERIAL PRIMARY KEY,
-            channel_id              BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-            subscriber_platform     TEXT NOT NULL,
-            subscriber_resource     TEXT NOT NULL,
-            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(channel_id, subscriber_platform, subscriber_resource)
-        );
         "#,
     )
     .execute(pool)
@@ -758,6 +786,11 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Phase 5: Planning mode columns and GIN trigram search index.
+async fn phase_5_planning_and_search(pool: &PgPool) -> Result<()> {
     // ── Add planning_mode columns ──
     // Threads: single source of truth for planning mode at runtime
     sqlx::query(
@@ -797,6 +830,11 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Phase 6: Native vector column with HNSW index and secrets tables.
+async fn phase_6_vector_and_secrets(pool: &PgPool) -> Result<()> {
     // ── Phase 1: native vector column + HNSW index + two-stage decay ──
     // Adds a native vector(1536) column, backfills existing TEXT embeddings,
     // creates an HNSW index for fast ANN search, then enables two-stage

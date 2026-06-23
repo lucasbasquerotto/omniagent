@@ -341,7 +341,7 @@ pub fn enrich_plugin(row: &PluginRegistryRow) -> PluginDetail {
     // Populate allowed_values from dynamic enum cache for fields with refresh_url
     for field in config_schema.iter_mut() {
         if let Some(ref url) = field.refresh_url {
-            let cache = DYNAMIC_ENUM_CACHE.lock().unwrap();
+            let cache = DYNAMIC_ENUM_CACHE.lock().expect("dynamic enum cache lock poisoned");
             if let Some(entry) = cache.get(url) {
                 if entry.fetched_at.elapsed() < DYNAMIC_ENUM_TTL {
                     field.allowed_values = Some(entry.values.clone());
@@ -508,7 +508,7 @@ pub async fn refresh_plugin_models(pool: &PgPool, name: &str) -> Result<Option<P
         match fetch_enum_values(&refresh_url, api_key.as_deref()).await {
             Ok(values) => {
                 field.allowed_values = Some(values.clone());
-                let mut cache = DYNAMIC_ENUM_CACHE.lock().unwrap();
+                let mut cache = DYNAMIC_ENUM_CACHE.lock().expect("dynamic enum cache lock poisoned");
                 cache.insert(
                     refresh_url,
                     DynamicEnumEntry {

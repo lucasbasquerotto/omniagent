@@ -461,6 +461,60 @@ $OMNI_DATA_DIR/profiles/<name>/memories/
 |----------|---------|-------------|
 | `MEMORY_MAX_CHARS` | `5000` | Maximum characters in MEMORY.md |
 | `USER_MAX_CHARS` | `1000` | Maximum characters for user-specific memory |
+| `PLANNING_MODE` | `auto_subtasks` | Global planning mode: `prompt_only`, `auto_plan`, `auto_subtasks`, or `always` |
+| `PLANNING_COMPLEXITY_SIMPLE_MAX_CHARS` | `60` | Max chars for "simple" (greeting) classification |
+| `PLANNING_COMPLEXITY_STANDARD_MAX_CHARS` | `200` | Max chars for "standard" classification — above this triggers complex planning |
+| `PLANNING_COMPLEXITY_KEYWORDS` | (built-in list) | Comma-separated keywords that trigger complex planning |
+
+## Planning Mode
+
+Planning mode controls how the agent approaches a thread — whether it plans ahead, creates subtasks, or responds immediately. The mode is resolved **at thread creation time** and stamped on the `threads.planning_mode` column.
+
+### Mode Values
+
+| Mode | Description |
+|------|-------------|
+| `prompt_only` | No planning — LLM responds directly. Used for simple/quick interactions. |
+| `auto_plan` | The LLM gets a planning step before responding. A single plan is created and executed. |
+| `auto_subtasks` | Full subtask-based planning. The LLM decomposes the task into subtasks, then works through them sequentially with tool access. |
+| `always` | Legacy alias for `auto_subtasks` (normalized at resolution time). |
+
+### Priority Chain
+
+The planning mode is resolved in this order (first non-empty wins):
+
+1. **Channel `planning_mode`** — set on the `channels` table. If non-empty, it **overrides everything** below. This lets you force a mode for an entire channel (e.g., always plan for a research channel).
+2. **Task/Job `planning_mode`** — for cron jobs (`cron_jobs.planning_mode`). Special keywords `no_plan` → `prompt_only`, `max_plan` → highest mode enabled globally.
+3. **Kanban tasks** — always resolve to the max plan mode currently available (`max_plan` logic based on global `PLANNING_MODE`). Kanban tasks never go through complexity classification.
+4. **User / Cron default** — classified by prompt **complexity** (see below). Falls through to the global `PLANNING_MODE` env var.
+
+### Complexity Classification
+
+For user messages and cron jobs without an explicit mode, the system classifies the prompt content:
+
+```
+char_len < SIMPLE_MAX (60) OR word_count ≤ 3 + greetings  →  prompt_only
+char_len > STANDARD_MAX (200) OR action keywords present   →  auto_subtasks
+otherwise                                                  →  auto_plan (via PLANNING_MODE)
+```
+
+**Simple messages** (short, greetings, confirmations: "hi", "ok", "thanks", "done", thumbs up) → `prompt_only` — no planning overhead.
+
+**Complex messages** (action keywords: "implement", "refactor", "redesign", "migrate", "multi-step", "fix bug" OR character count > 200) → `auto_subtasks` — full decomposition.
+
+**Standard messages** (everything else) → uses the global `PLANNING_MODE` env var (default `auto_subtasks`), resolved to `auto_plan` for user-facing messages.
+
+### Max Iterations Per Mode
+
+Each planning mode maps to a different iteration limit (how many LLM tool-calling rounds allowed):
+
+| Mode | Config Field | Default |
+|------|-------------|---------|
+| `prompt_only` / unset | `max_iterations_no_plan` | 5 |
+| `auto_plan` | `max_iterations_simple_plan` | 10 |
+| `auto_subtasks` / `always` | `max_iterations_complex_plan` | 25 |
+
+These are configured via the profile's `AgentConfig` block, not env vars.
 
 Memory files in the `memories/` directory are loaded and included in every context assembly at the highest priority (NeverTrim tier), ensuring they are always present in the system prompt regardless of token budget constraints.
 

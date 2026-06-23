@@ -34,7 +34,7 @@ use anyhow::{Context, Result};
 use tracing::{error, info};
 
 use crate::db::types as queries;
-use crate::llm::{ChatMessage, CompletionRequest, LLMClient, LLMConfig};
+use crate::llm::{ChatMessage, CompletionRequest, LLMClient};
 use crate::mcp::{AppContext, McpRegistry, McpToolCall};
 use crate::prompt_builder::{build_planning_prompt, build_system_prompt, MemoryStore, PlanningPromptParams};
 

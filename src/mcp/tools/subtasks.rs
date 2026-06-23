@@ -2,7 +2,6 @@ use crate::mcp::{truncate_content, AppContext, McpTool, McpToolResult, DEFAULT_M
 use crate::subtask;
 use anyhow::Result;
 use serde_json::Value;
-use sql_forge::sql_forge;
 use std::sync::Arc;
 
 pub fn manage_subtasks_tool() -> McpTool {

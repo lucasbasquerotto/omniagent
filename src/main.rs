@@ -25,8 +25,6 @@ mod server;
 mod subtask;
 mod vectorizer;
 
-use crate::platform::OutboundSender;
-
 /// OmniAgent — autonomous agent system with Postgres, pgvector, MCP tools.
 #[derive(Parser, Debug)]
 #[command(name = "omniagent", about = "OmniAgent — autonomous agent system")]
@@ -99,7 +97,7 @@ async fn run_server() -> Result<()> {
 
     // Sync plugins from disk after migrations
     let data_dir = std::env::var("OMNI_DATA_DIR").unwrap_or_else(|_| "/opt/data".to_string());
-    let workspace_dir = std::env::var("WORKSPACE_DIR").unwrap_or_else(|_| "/opt/workspace".to_string());
+    let _workspace_dir = std::env::var("WORKSPACE_DIR").unwrap_or_else(|_| "/opt/workspace".to_string());
     if let Err(e) = plugin::sync_plugins_from_disk(&pool, &data_dir).await {
         tracing::warn!("Plugin sync failed (non-fatal): {:?}", e);
     }
@@ -308,7 +306,7 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
     let mut current_channel_name = channel.name.clone();
 
     // Generate a unique session ID for this CLI process
-    let mut session_id = format!(
+    let session_id = format!(
         "cli-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()

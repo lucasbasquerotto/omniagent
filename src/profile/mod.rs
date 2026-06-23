@@ -148,7 +148,6 @@ pub struct ProfileRegistry {
     pub profiles: HashMap<String, Profile>,
     #[expect(dead_code)]
     pub default_profile: String,
-    #[expect(dead_code)]
     pub data_dir: String,
 }
 

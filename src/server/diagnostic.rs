@@ -2,8 +2,6 @@
 
 use axum::{
     extract::State,
-    response::IntoResponse,
-    Json,
 };
 use std::sync::Arc;
 use std::time::Duration;

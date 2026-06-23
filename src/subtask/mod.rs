@@ -4,7 +4,6 @@
 //! with status: pending, completed, cancelled.
 use anyhow::Result;
 use sql_forge::sql_forge;
-use sqlx::FromRow;
 use sqlx::PgPool;
 
 // ---------------------------------------------------------------------------

@@ -46,7 +46,6 @@ pub struct McpToolResult {
     #[expect(dead_code)]
     pub call_id: String,
     pub content: String,
-    #[expect(dead_code)]
     pub is_error: bool,
 }
 

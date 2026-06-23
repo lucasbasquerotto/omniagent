@@ -487,7 +487,7 @@ pub async fn build_thread_context(
                     .collect();
                 // Collect messages in RRF order, preferring text result when available
                 let mut seen = std::collections::HashSet::new();
-                let mut fused: Vec<crate::models::Message> = Vec::new();
+                let mut fused: Vec<crate::db::types::Message> = Vec::new();
                 for msg in text_msgs.iter().chain(semantic_msgs.iter()) {
                     if top_ids.contains(&msg.id) && seen.insert(msg.id) {
                         fused.push(msg.clone());

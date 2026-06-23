@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::db::types as queries;
 use crate::mcp::{AppContext, McpRegistry, McpToolCall};
-use crate::models::MessageNew;
+use crate::db::types::MessageNew;
 
 #[derive(Debug, FromRow)]
 struct CronJobDueRow {
@@ -407,7 +407,7 @@ async fn release_job(
 }
 
 /// Ensure a cron channel exists (upsert on conflict).
-async fn ensure_cron_channel(pool: &PgPool) -> Result<crate::models::Channel> {
+async fn ensure_cron_channel(pool: &PgPool) -> Result<crate::db::types::Channel> {
     // First try to find existing cron channel
     if let Ok(Some(ch)) = queries::get_channel_by_platform_and_resource(pool, "cron", "cron-session").await {
         return Ok(ch);

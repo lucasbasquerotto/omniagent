@@ -676,7 +676,7 @@ pub struct MessageEmbeddingRow {
 /// This function does not return until cancellation (i.e., it loops forever
 /// via `futures::future::pending()`). It is intended to be spawned as its own
 /// tokio task from main.
-pub async fn spawn_vectorizers(pool: PgPool, config: &crate::config::Config, data_dir: &str) {
+pub async fn spawn_vectorizers(pool: PgPool, config: &crate::agent::AgentConfig, data_dir: &str) {
     struct MakeVectorizerConfig<'a> {
         api_url: &'a Option<String>,
         protocol: &'a str,

@@ -588,6 +588,20 @@ pub fn format_subtask_section(subtasks: &[ThreadSubtask], thread_id: i64) -> Opt
         steps.push_str(&format!("  {}. {} {}{}\n", i + 1, emoji, subtask.name, current_marker));
     }
 
+    // Build the subtask management instruction block
+    let management_instruction = if subtasks.iter().any(|s| s.status == SubtaskStatus::Pending) {
+        "\n\n## Subtask Tracking Rules\n\
+         You MUST call `manage_subtasks(thread_id, action=\"update\", subtask_id=N, status=\"completed\")` \
+         each time you finish a subtask.\n\
+         If a subtask becomes irrelevant, call `manage_subtasks(thread_id, action=\"update\", subtask_id=N, status=\"cancelled\")`.\n\
+         Use `manage_subtasks(thread_id, action=\"list\")` to refresh the current state at any point.\n\
+         Before delivering your final answer, ALL subtasks must be either `completed` or `cancelled` — \
+         never leave any subtask in `pending` status."
+            .to_string()
+    } else {
+        String::new()
+    };
+
     // Assemble the section
     let section = if let Some(ref cur) = current_name {
         format!(
@@ -595,19 +609,21 @@ pub fn format_subtask_section(subtasks: &[ThreadSubtask], thread_id: i64) -> Opt
              Thread: {}\n\
              🔴 {} \n\
              \n\
-             {}",
+             {}{}",
             thread_id,
             cur,
             steps.trim_end(),
+            management_instruction,
         )
     } else {
         format!(
             "## Current Task Progress\n\
              Thread: {}\n\
              \n\
-             {}",
+             {}{}",
             thread_id,
             steps.trim_end(),
+            management_instruction,
         )
     };
 

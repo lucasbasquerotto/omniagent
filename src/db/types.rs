@@ -485,18 +485,6 @@ pub fn max_iterations_for_planning_mode(config: &AgentConfig, planning_mode: &st
     }
 }
 
-#[allow(dead_code)]
-/// Set a thread's status to 'pending' so the executor picks it up.
-pub async fn set_thread_pending(pool: &PgPool, thread_id: i64) -> anyhow::Result<()> {
-    sql_forge!(
-        "UPDATE threads SET status = 'pending' WHERE id = :id AND NOT terminal",
-        ( :id = thread_id )
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Create the seq-0 (cause) message and set the thread to pending in a single transaction.
 pub async fn create_cause_and_set_pending(pool: &PgPool, msg: &MessageNew) -> anyhow::Result<Message> {
     let mut tx = pool.begin().await?;

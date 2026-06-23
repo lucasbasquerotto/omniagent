@@ -894,12 +894,6 @@ async fn get_next_sequence(pool: &PgPool, channel_id: i64, thread_id: i64) -> Re
     Ok(row.max_seq.unwrap_or(0) + 1)
 }
 
-/// Get the maximum thread_sequence in a thread.
-#[allow(dead_code)]
-async fn get_max_sequence(pool: &PgPool, channel_id: i64, thread_id: i64) -> Result<i32> {
-    get_next_sequence(pool, channel_id, thread_id).await.map(|n| n - 1)
-}
-
 /// Get the maximum message id for a given channel.
 /// Used to initialize the polling cursor so the first poll skips existing messages.
 async fn get_max_message_id(pool: &PgPool, channel_id: i64) -> Result<i64> {

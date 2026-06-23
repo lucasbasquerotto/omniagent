@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -92,11 +91,5 @@ impl Config {
             wiki_vectorization_api_key,
             wiki_vectorization_api_model,
         })
-    }
-
-    #[expect(dead_code)]
-    pub fn socket_addr(&self) -> Result<SocketAddr> {
-        let addr = format!("{}:{}", self.host, self.port);
-        addr.parse().context("Invalid socket address")
     }
 }

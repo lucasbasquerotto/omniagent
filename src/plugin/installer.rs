@@ -120,11 +120,14 @@ fn install_from_url_inner(url: &str, bytes: &[u8], temp_path: &std::path::Path, 
     }
 
     // Create parent directories
-    std::fs::create_dir_all(install_path.parent().unwrap())
+    let parent = install_path.parent()
+        .with_context(|| format!("Install path has no parent: {}", install_dir))?;
+    std::fs::create_dir_all(parent)
         .with_context(|| format!("Failed to create parent directories for: {}", install_dir))?;
 
     // Copy the extracted plugin directory to the install location
-    let extracted_dir = Path::new(&plugin_json).parent().unwrap();
+    let extracted_dir = Path::new(&plugin_json).parent()
+        .with_context(|| format!("Plugin JSON path has no parent: {}", plugin_json))?;
     let copy_result = copy_dir_recursive(extracted_dir, install_path);
     if let Err(e) = copy_result {
         // Clean up on failure

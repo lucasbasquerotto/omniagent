@@ -350,7 +350,6 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
         "",
         "message",
         &std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string()),
-        "",
     );
     let mut thread_id = get_or_create_thread(&pool, current_channel_id, &profile_name, &resolved_provider, &resolved_model, &planning_mode).await?;
     // Mark the /start thread as a system thread (terminal, never processed by executor)
@@ -632,7 +631,7 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
 
         // Insert user message as pending (it will be picked up by the executor)
         // For the CLI, we create a new thread for each user message
-        let thread = db::types::create_thread(
+        db::types::create_thread_with_cause(
             &pool,
             "user",
             current_channel_id,
@@ -641,31 +640,13 @@ async fn run_cli(channel_name: String, profile_name: String, model: Option<Strin
             Some(&resolved_model),
             None,
             None,
-            &db::types::resolve_thread_planning_mode(
-                channel.metadata.get("planning_mode").and_then(|v| v.as_str()).unwrap_or(""),
-                "",
-                "message",
-                &std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string()),
-                &input,
-            ),
+            &input,
+            None,
+            serde_json::json!({}),
+            "message",
+            None,
+            "",
         ).await?;
-
-        let msg = models::MessageNew {
-            thread_id: thread.id,
-            role: "cause".to_string(),
-            content: input.clone(),
-            thread_sequence: 0,
-            external_id: None,
-            metadata: serde_json::json!({}),
-            embedding: None,
-            summary_text: None,
-            is_summary: false,
-            msg_type: "message".to_string(),
-            msg_subtype: None,
-            processing_time_ms: None,
-            token_usage: None,
-        };
-        db::types::create_cause_and_set_pending(&pool, &msg).await?;
 
         // Poll for agent responses using cursor-based polling
         (last_seen_id, last_seen_summary_id) = poll_for_response(

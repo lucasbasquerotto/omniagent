@@ -433,7 +433,7 @@ impl Platform for ExternalPlatformClient {
                                                             continue;
                                                         }
 
-                                                        if let Ok(thread) = crate::db::types::create_thread(
+                                                        if let Ok((_thread, _msg)) = crate::db::types::create_thread_with_cause(
                                                             &pool,
                                                             "user",
                                                             channel.id,
@@ -442,36 +442,14 @@ impl Platform for ExternalPlatformClient {
                                                             channel.current_model.as_deref(),
                                                             None,
                                                             None,
-                                                            &crate::db::types::resolve_thread_planning_mode(
-                                                                channel.metadata.get("planning_mode").and_then(|v| v.as_str()).unwrap_or(""),
-                                                                "",
-                                                                "message",
-                                                                &std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string()),
-                                                                &inbound.text,
-                                                            ),
+                                                            &inbound.text,
+                                                            Some(inbound.external_id),
+                                                            inbound.metadata,
+                                                            "message",
+                                                            None,
+                                                            "",
                                                         ).await {
-                                                            let msg = crate::models::MessageNew {
-                                                                thread_id: thread.id,
-                                                                role: "cause".to_string(),
-                                                                content: inbound.text,
-                                                                thread_sequence: 0,
-                                                                external_id: Some(inbound.external_id),
-                                                                metadata: inbound.metadata,
-                                                                embedding: None,
-                                                                summary_text: None,
-                                                                is_summary: false,
-                                                                msg_type: "message".to_string(),
-                                                                msg_subtype: None,
-                                                                processing_time_ms: None,
-                                                                token_usage: None,
-                                                            };
-                                                            if let Err(e) = crate::db::types::create_cause_and_set_pending(&pool, &msg).await {
-                                                                tracing::error!(
-                                                                    "Failed to insert inbound message from '{}': {:?}",
-                                                                    plugin_name,
-                                                                    e
-                                                                );
-                                                            }
+                                                            // success — message and thread created
                                                         } else {
                                                             tracing::error!("Failed to create thread for inbound message from '{}'", plugin_name);
                                                         }

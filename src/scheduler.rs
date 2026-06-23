@@ -253,15 +253,10 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
             None => (None, None),
         };
 
-        // ── Create a thread with cause='cron' ──
-        let planning_mode = queries::resolve_thread_planning_mode(
-            channel.metadata.get("planning_mode").and_then(|v| v.as_str()).unwrap_or(""),
-            &job.planning_mode,
-            "cron",
-            &std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string()),
-            &job.prompt.clone().unwrap_or_default(),
-        );
-        let thread = match queries::create_thread(
+        // ── Create a thread with cause='cron' (resolves planning mode internally) ──
+        let subtype = job.name.clone().unwrap_or_default();
+        let prompt_content = job.prompt.clone().unwrap_or_default();
+        match queries::create_thread_with_cause(
             pool,
             "cron",
             channel.id,
@@ -270,31 +265,9 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
             model.as_deref(),
             None,
             Some(&job.id),
-            &planning_mode,
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                error!(
-                    "[cron-scheduler] Failed to create thread for job '{}': {:?}",
-                    display_name, e
-                );
-                let new_next = calculate_next_run(&job.schedule, &now);
-                release_job(pool, &job.id, &now, &new_next).await?;
-                continue;
-            }
-        };
-
-        // ── Add a cause message with the prompt content ──
-        let subtype = job.name.clone().unwrap_or_default();
-        let cause_msg = MessageNew {
-            thread_id: thread.id,
-            role: "cause".to_string(),
-            content: job.prompt.clone().unwrap_or_default(),
-            thread_sequence: 0,
-            external_id: Some(format!("cron:{}:{}", job.id, now.timestamp())),
-            metadata: serde_json::json!({
+            &prompt_content,
+            Some(format!("cron:{}:{}", job.id, now.timestamp())),
+            serde_json::json!({
                 "cron_job_id": job.id,
                 "cron_job_name": job.name,
                 "cron_display_name": display_name,
@@ -303,25 +276,21 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
                 "profile": profile_name,
                 "instruction_file": job.instruction_file.as_deref().unwrap_or(""),
             }),
-            embedding: None,
-            summary_text: None,
-            is_summary: false,
-            msg_type: "cron".to_string(),
-            msg_subtype: Some(subtype),
-            processing_time_ms: None,
-            token_usage: None,
-        };
-
-        match queries::create_cause_and_set_pending(pool, &cause_msg).await {
-            Ok(created) => {
+            "cron",
+            Some(subtype),
+            &job.planning_mode,
+        )
+        .await
+        {
+            Ok((thread, created)) => {
                 info!(
-                    "[cron-scheduler] Created cause message {} and set thread {} pending for job '{}'",
-                    created.id, thread.id, display_name
+                    "[cron-scheduler] Created thread {} / cause message {} for job '{}'",
+                    thread.id, created.id, display_name
                 );
             }
             Err(e) => {
                 error!(
-                    "[cron-scheduler] Failed to create cause message for job '{}': {:?}",
+                    "[cron-scheduler] Failed to create thread for job '{}': {:?}",
                     display_name, e
                 );
                 let new_next = calculate_next_run(&job.schedule, &now);
@@ -648,15 +617,14 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
             }
         };
 
-        // Create thread with resolved profile, provider, and model
-        let planning_mode = queries::resolve_thread_planning_mode(
-            channel.metadata.get("planning_mode").and_then(|v| v.as_str()).unwrap_or(""),
-            "",
-            "kanban",
-            &std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string()),
-            "",
-        );
-        let thread = match queries::create_thread(
+        // Create thread with cause message (resolves planning mode internally)
+        let task_content = t.body.as_deref().unwrap_or(&t.title);
+        let kanban_content = if task_content.is_empty() {
+            format!("Execute kanban task: {}", t.title)
+        } else {
+            task_content.to_string()
+        };
+        let thread_id = match queries::create_thread_with_cause(
             pool,
             "kanban",
             task_channel_id,
@@ -665,54 +633,26 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
             Some(&model),
             Some(&t.id),
             None,
-            &planning_mode,
-        )
-        .await
-        {
-            Ok(th) => th,
-            Err(e) => {
-                warn!(
-                    "[kanban-dispatcher] Failed to create thread for task '{}': {:?}",
-                    t.id, e
-                );
-                continue;
-            }
-        };
-
-        // Create cause message
-        let content = t.body.as_deref().unwrap_or(&t.title);
-        let content = if content.is_empty() {
-            format!("Execute kanban task: {}", t.title)
-        } else {
-            content.to_string()
-        };
-
-        let cause_msg = crate::models::MessageNew {
-            thread_id: thread.id,
-            role: "cause".to_string(),
-            content,
-            thread_sequence: 0,
-            external_id: Some(format!("kanban:{}", t.id)),
-            metadata: serde_json::json!({
+            &kanban_content,
+            Some(format!("kanban:{}", t.id)),
+            serde_json::json!({
                 "kanban_task_id": t.id,
                 "kanban_task_title": t.title,
                 "template": t.template.as_deref().unwrap_or(""),
             }),
-            embedding: None,
-            summary_text: None,
-            is_summary: false,
-            msg_type: "kanban".to_string(),
-            msg_subtype: Some(t.id.clone()),
-            processing_time_ms: None,
-            token_usage: None,
-        };
-
-        match queries::create_cause_and_set_pending(pool, &cause_msg).await {
-            Ok(created) => {
+            "kanban",
+            Some(t.id.clone()),
+            "",
+        )
+        .await
+        {
+            Ok((thread, created)) => {
+                let tid = thread.id;
                 info!(
                     "[kanban-dispatcher] Created cause message {} / thread {} for task '{}'",
-                    created.id, thread.id, t.id
+                    created.id, tid, t.id
                 );
+                tid
             }
             Err(e) => {
                 warn!(
@@ -721,7 +661,7 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
                 );
                 continue;
             }
-        }
+        };
 
         // Advance to ready
         sql_forge!(
@@ -733,7 +673,7 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
 
         info!(
             "[kanban-dispatcher] Task '{}' advanced to ready (thread {})",
-            t.id, thread.id
+            t.id, thread_id
         );
         dispatched += 1;
     }

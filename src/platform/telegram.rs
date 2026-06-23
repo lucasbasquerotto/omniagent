@@ -584,8 +584,8 @@ async fn insert_inbound_message(
         std::env::var("LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())
     });
 
-    // Create a new thread
-    let thread = crate::db::types::create_thread(
+    // Create a new thread with cause message (resolves planning mode internally)
+    let (_thread, _msg) = crate::db::types::create_thread_with_cause(
         pool,
         "user",
         channel_id,
@@ -594,43 +594,17 @@ async fn insert_inbound_message(
         Some(&model),
         None,
         None,
-        &crate::db::types::resolve_thread_planning_mode(
-            channel.metadata.get("planning_mode").and_then(|v| v.as_str()).unwrap_or(""),
-            "",
-            "message",
-            &std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string()),
-            text,
-        ),
-    )
-    .await?;
-
-    // Insert the seq-0 user/cause message
-    let msg = crate::models::MessageNew {
-        thread_id: thread.id,
-        role: "cause".to_string(),
-        content: text.to_string(),
-        thread_sequence: 0,
-        external_id: Some(telegram_msg_id.to_string()),
-        metadata: serde_json::json!({
+        text,
+        Some(telegram_msg_id.to_string()),
+        serde_json::json!({
             "telegram_chat_id": channel.external_id,
             "telegram_msg_id": telegram_msg_id,
         }),
-        embedding: None,
-        summary_text: None,
-        is_summary: false,
-        msg_type: "message".to_string(),
-        msg_subtype: None,
-        processing_time_ms: None,
-        token_usage: None,
-    };
-
-    crate::db::types::create_cause_and_set_pending(pool, &msg).await?;
-
-    tracing::info!(
-        "Created thread {} for inbound Telegram msg_id={}",
-        thread.id,
-        telegram_msg_id
-    );
+        "message",
+        None,
+        "",
+    )
+    .await?;
 
     Ok(())
 }

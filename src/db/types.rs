@@ -320,12 +320,45 @@ pub async fn set_thread_failed(pool: &PgPool, thread_id: i64) -> anyhow::Result<
 /// 2. Task-level planning_mode (for cron tasks: "no_plan" -> "prompt_only",
 ///    "max_plan" -> max of global mode)
 /// 3. Kanban tasks always get the max plan mode currently enabled
-/// 4. User/cron default (no task mode) — classify by prompt complexity
+/// 4. Default: "prompt_only"
 ///
-/// The resolved value is stored on the thread at creation time and is the
-/// single source of truth during thread execution. All threads have exactly
-/// one of: "prompt_only", "auto_plan", "auto_subtasks".
+/// External callers use this directly only when building a thread manually.
+/// For normal use, call [`create_thread_with_cause`] which resolves the mode
+/// and creates the thread + cause message in one step.
 pub fn resolve_thread_planning_mode(
+    channel_planning_mode: &str,
+    task_planning_mode: &str,
+    msg_type: &str,
+    global_planning_mode: &str,
+) -> String {
+    // 1. Channel override (absolute — overrides everything)
+    if !channel_planning_mode.is_empty() {
+        return normalize_task_planning_mode(channel_planning_mode);
+    }
+
+    // 2. Cron task with explicit mode
+    if msg_type == "cron" && !task_planning_mode.is_empty() {
+        match task_planning_mode {
+            "no_plan" => return "prompt_only".to_string(),
+            "max_plan" => return resolve_max_plan(global_planning_mode),
+            other => return normalize_task_planning_mode(other),
+        }
+    }
+
+    // 3. Kanban — always use max plan mode currently enabled
+    if msg_type == "kanban" {
+        return resolve_max_plan(global_planning_mode);
+    }
+
+    // 4. Default: no plan
+    "prompt_only".to_string()
+}
+
+/// Internal version of [`resolve_thread_planning_mode`] that also accepts the
+/// prompt content for complexity-based classification (user/cron default).
+/// Used internally by [`create_thread_with_cause`] — callers should not need
+/// to pass content directly.
+fn resolve_thread_planning_mode_with_content(
     channel_planning_mode: &str,
     task_planning_mode: &str,
     msg_type: &str,
@@ -530,6 +563,88 @@ pub async fn create_cause_and_set_pending(pool: &PgPool, msg: &MessageNew) -> an
 
     tx.commit().await?;
     saved.try_into()
+}
+
+/// Create a thread and its seq-0 cause message in a single operation.
+///
+/// Resolves the planning mode internally using the prompt content for
+/// complexity-based classification (user/cron default). Callers don't
+/// need to pass planning_mode or resolve it separately.
+///
+/// Returns the (Thread, Message) pair.
+pub async fn create_thread_with_cause(
+    pool: &PgPool,
+    cause: &str,
+    channel_id: i64,
+    profile: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    task_id: Option<&str>,
+    schedule_task_id: Option<&str>,
+    content: &str,
+    external_id: Option<String>,
+    metadata: serde_json::Value,
+    msg_type: &str,
+    msg_subtype: Option<String>,
+    task_planning_mode: &str,
+) -> anyhow::Result<(Thread, Message)> {
+    // 1. Get channel for its planning_mode override and current_* fields
+    let channel = get_channel_by_id(pool, channel_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Channel {} not found", channel_id))?;
+
+    // 2. Get global PLANNING_MODE
+    let global_mode =
+        std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string());
+
+    // 3. Resolve planning mode (internal — uses content for complexity classification)
+    let channel_pm = channel
+        .metadata
+        .get("planning_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let planning_mode = resolve_thread_planning_mode_with_content(
+        channel_pm,
+        task_planning_mode,
+        msg_type,
+        &global_mode,
+        content,
+    );
+
+    // 4. Create the thread
+    let thread = create_thread(
+        pool,
+        cause,
+        channel_id,
+        profile,
+        provider,
+        model,
+        task_id,
+        schedule_task_id,
+        &planning_mode,
+    )
+    .await?;
+
+    // 5. Create the cause (seq-0) message and set thread status
+    let msg = MessageNew {
+        thread_id: thread.id,
+        role: "cause".to_string(),
+        content: content.to_string(),
+        thread_sequence: 0,
+        external_id,
+        metadata,
+        embedding: None,
+        summary_text: None,
+        is_summary: false,
+        msg_type: msg_type.to_string(),
+        msg_subtype,
+        processing_time_ms: None,
+        token_usage: None,
+    };
+
+    let saved = create_cause_and_set_pending(pool, &msg).await?;
+
+    Ok((thread, saved))
 }
 
 /// Find pending threads for a channel.

@@ -1646,6 +1646,21 @@ async fn process_thread(
     // Define final status before potential early return
     let final_status = if limit_reached { "interrupted" } else { "completed" };
 
+    // Auto-complete any remaining pending subtasks when the thread completes
+    if final_status == "completed" {
+        if let Ok(subtasks) = crate::subtask::list_subtasks(pool, thread.id).await {
+            for st in &subtasks {
+                if st.status == "pending" || st.status == "in_progress" {
+                    let _ = crate::subtask::update_subtask_status(pool, st.id, "completed").await;
+                    info!(
+                        "[subtask] Auto-completed subtask {} ('{}') for completed thread {}",
+                        st.id, st.description, thread.id
+                    );
+                }
+            }
+        }
+    }
+
     queries::complete_thread(pool, thread.id, final_status, 0, 0, 0, 0).await?;
 
     // If this thread is linked to a kanban task, update its status

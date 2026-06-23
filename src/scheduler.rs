@@ -835,6 +835,7 @@ fn extract_error_code(err_msg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
 
     // ─── Profile resolution ───
 
@@ -1045,5 +1046,190 @@ mod tests {
         // The strings should come from env var fallbacks (not None/empty)
         assert!(!c.provider.is_empty(), "provider must not be empty even after full fallback");
         assert!(!c.model.is_empty(), "model must not be empty even after full fallback");
+    }
+
+    // ─── calculate_next_run ───────────────────────────────────────────────
+
+    #[test]
+    fn test_calculate_next_run_valid() {
+        let now = Utc::now();
+        // 6-field cron: sec min hour day-of-month month day-of-week
+        let next = calculate_next_run("0 */5 * * * *", &now);
+        assert!(next > now, "next run must be after now");
+        // Must produce a value different from the invalid-fallback (now + 1h)
+        let fallback = now + chrono::Duration::hours(1);
+        assert!(
+            next < fallback,
+            "next run for */5 should be within the hour, not fallback"
+        );
+        let diff = next - now;
+        assert!(
+            diff.num_seconds() > 0 && diff.num_seconds() <= 300,
+            "next run for */5 should be within 5 minutes, got {}s",
+            diff.num_seconds()
+        );
+    }
+
+    #[test]
+    fn test_calculate_next_run_invalid() {
+        let now = Utc::now();
+        let next = calculate_next_run("not-a-cron", &now);
+        let diff = next - now;
+        assert!(
+            (diff.num_seconds() - 3600).abs() < 5,
+            "invalid cron should fall back to now + 1h, got {}s",
+            diff.num_seconds()
+        );
+    }
+
+    #[test]
+    fn test_calculate_next_run_empty_string() {
+        let now = Utc::now();
+        let next = calculate_next_run("", &now);
+        let diff = next - now;
+        assert!(
+            (diff.num_seconds() - 3600).abs() < 5,
+            "empty cron should fall back to now + 1h, got {}s",
+            diff.num_seconds()
+        );
+    }
+
+    #[test]
+    fn test_calculate_next_run_daily() {
+        let now = Utc::now();
+        // 7-field quartz: 0 0 9 * * * *
+        let next = calculate_next_run("0 0 9 * * * *", &now);
+        assert!(next > now, "daily cron must produce a future timestamp");
+        let diff = next - now;
+        assert!(
+            diff.num_hours() <= 24,
+            "daily cron should be within 24h, got {}h",
+            diff.num_hours()
+        );
+    }
+
+    #[test]
+    fn test_calculate_next_run_hourly() {
+        let now = Utc::now();
+        // 6-field: fire at minute 0 of every hour
+        let next = calculate_next_run("0 0 * * * *", &now);
+        assert!(next > now);
+        let diff = next - now;
+        assert!(
+            diff.num_minutes() <= 60,
+            "hourly cron should be within 60m, got {}m",
+            diff.num_minutes()
+        );
+        assert_eq!(next.minute(), 0, "hourly cron should fire at minute 0");
+    }
+
+    #[test]
+    fn test_calculate_next_run_weekly() {
+        let now = Utc::now();
+        // Sunday at midnight
+        let next = calculate_next_run("0 0 * * 0 *", &now);
+        assert!(next > now);
+        let diff = next - now;
+        assert!(
+            diff.num_days() <= 8,
+            "weekly cron should be within 8 days, got {}d",
+            diff.num_days()
+        );
+    }
+
+    #[test]
+    fn test_calculate_next_run_every_30min() {
+        let now = Utc::now();
+        let next = calculate_next_run("0 */30 * * * *", &now);
+        assert!(next > now);
+        let diff = next - now;
+        assert!(
+            diff.num_minutes() <= 30,
+            "*/30 cron should fire within 30m, got {}m",
+            diff.num_minutes()
+        );
+    }
+
+    #[test]
+    fn test_calculate_next_run_six_field_with_seconds_step() {
+        let now = Utc::now();
+        // Every 10 seconds
+        let next = calculate_next_run("*/10 * * * * *", &now);
+        assert!(next > now);
+        let diff = next - now;
+        assert!(
+            diff.num_seconds() > 0 && diff.num_seconds() <= 10,
+            "*/10s cron should fire within 10s, got {}s",
+            diff.num_seconds()
+        );
+    }
+
+    // ─── extract_error_code ───────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_error_code_mcp_tool_error() {
+        let code = extract_error_code("MCP tool call error (-32603): Internal error");
+        assert_eq!(code, Some("-32603".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_code_mcp_init_error() {
+        let code = extract_error_code("MCP initialize error (0): something went wrong");
+        assert_eq!(code, Some("0".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_code_plugin_error() {
+        let code = extract_error_code("Plugin 'name' initialize error (-1): Failed");
+        assert_eq!(code, Some("-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_code_negative_four_digits() {
+        let code = extract_error_code("error (-1234): some error");
+        assert_eq!(code, Some("-1234".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_code_positive_code() {
+        let code = extract_error_code("error (42): answer found");
+        assert_eq!(code, Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_code_no_code() {
+        let code = extract_error_code("General error without code");
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn test_extract_error_code_empty_string() {
+        let code = extract_error_code("");
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn test_extract_error_code_error_without_parentheses() {
+        let code = extract_error_code("error occurred");
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn test_extract_error_code_error_at_start() {
+        let code = extract_error_code("error (5): something happened");
+        assert_eq!(code, Some("5".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_code_multiple_errors() {
+        // Should match the first "error ("
+        let code = extract_error_code("error (1): first error and then error (2)");
+        assert_eq!(code, Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_error_code_code_within_text_no_parens() {
+        let code = extract_error_code("error_code_5");
+        assert_eq!(code, None);
     }
 }

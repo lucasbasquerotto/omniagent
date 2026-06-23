@@ -831,3 +831,167 @@ async fn context_preview_handler(
 
     (StatusCode::OK, Json(serde_json::json!({ "context": context_text })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── default_params ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_params_returns_empty_object() {
+        let params = default_params();
+        assert_eq!(params, serde_json::json!({}));
+    }
+
+    // ─── CreateActionRequest serde ───────────────────────────────────────
+
+    #[test]
+    fn test_create_action_request_full() {
+        let json = serde_json::json!({
+            "name": "test-action",
+            "tool_name": "test_tool",
+            "params": { "key": "value" }
+        });
+        let req: CreateActionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.name, "test-action");
+        assert_eq!(req.tool_name, "test_tool");
+        assert_eq!(req.params, serde_json::json!({ "key": "value" }));
+    }
+
+    #[test]
+    fn test_create_action_request_default_params() {
+        let json = serde_json::json!({
+            "name": "test-action",
+            "tool_name": "test_tool"
+        });
+        let req: CreateActionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.name, "test-action");
+        assert_eq!(req.tool_name, "test_tool");
+        // params should default to {}
+        assert_eq!(req.params, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_create_action_request_null_params() {
+        let json = serde_json::json!({
+            "name": "test-action",
+            "tool_name": "test_tool",
+            "params": null
+        });
+        let req: CreateActionRequest = serde_json::from_value(json).unwrap();
+        // #[serde(default)] only applies when field is absent, not when null
+        assert_eq!(req.params, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_create_action_request_missing_name() {
+        let json = serde_json::json!({
+            "tool_name": "test_tool"
+        });
+        let result: Result<CreateActionRequest, _> = serde_json::from_value(json);
+        assert!(result.is_err(), "missing 'name' should fail deserialization");
+    }
+
+    // ─── UpdateActionRequest serde ───────────────────────────────────────
+
+    #[test]
+    fn test_update_action_request_full() {
+        let json = serde_json::json!({
+            "name": "updated-action",
+            "tool_name": "updated_tool",
+            "params": { "new_key": "new_value" }
+        });
+        let req: UpdateActionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.name, "updated-action");
+        assert_eq!(req.tool_name, "updated_tool");
+        assert_eq!(req.params, serde_json::json!({ "new_key": "new_value" }));
+    }
+
+    #[test]
+    fn test_update_action_request_default_params() {
+        let json = serde_json::json!({
+            "name": "updated-action",
+            "tool_name": "updated_tool"
+        });
+        let req: UpdateActionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.params, serde_json::json!({}));
+    }
+
+    // ─── PromptPreviewRequest serde ─────────────────────────────────────
+
+    #[test]
+    fn test_prompt_preview_request() {
+        let json = serde_json::json!({
+            "prompt": "Hello world",
+            "plan": true
+        });
+        let req: PromptPreviewRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.prompt, "Hello world");
+        assert!(req.plan);
+    }
+
+    #[test]
+    fn test_prompt_preview_request_no_plan() {
+        let json = serde_json::json!({
+            "prompt": "Hello world",
+            "plan": false
+        });
+        let req: PromptPreviewRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.prompt, "Hello world");
+        assert!(!req.plan);
+    }
+
+    // ─── AppState ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_app_state_impl_clone() {
+        // Compile-time check: AppState derives Clone
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<AppState>();
+    }
+
+    // ─── ServerConfig ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_server_config_impl_clone() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<ServerConfig>();
+    }
+
+    // ─── Health handler ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_handler_returns_ok() {
+        let response = health_handler().await;
+        assert_eq!(response, "ok");
+    }
+
+    // ─── PromptPreviewResponse ──────────────────────────────────────────
+
+    #[test]
+    fn test_prompt_preview_response_serialize() {
+        let resp = PromptPreviewResponse {
+            system_prompt: "test system".to_string(),
+            messages: vec![
+                serde_json::json!({ "role": "system", "content": "test" }),
+            ],
+            plan: Some("my plan".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["system_prompt"], "test system");
+        assert_eq!(json["messages"][0]["role"], "system");
+        assert_eq!(json["plan"], "my plan");
+    }
+
+    #[test]
+    fn test_prompt_preview_response_no_plan() {
+        let resp = PromptPreviewResponse {
+            system_prompt: "test".to_string(),
+            messages: vec![],
+            plan: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["plan"].is_null());
+    }
+}

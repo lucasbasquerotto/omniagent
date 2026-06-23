@@ -35,8 +35,7 @@ use crate::platform::enqueue_notification;
 const TOOL_RESULT_HISTORY_BUDGET: usize = 120_000;
 /// Maximum number of times the LLM can try to end without completing all subtasks
 /// before the thread is marked as failed.
-use crate::context_builder::{BlockPriority, ContextAssemblyMeta, ContextBlock, ContextBuilder};
-use crate::vectorizer::Vectorizer;
+use crate::context_builder::ContextAssemblyMeta;
 use crate::mcp::{
     truncate_content, AppContext, McpRegistry, McpToolCall, DEFAULT_MAX_TOOL_OUTPUT_CHARS,
 };

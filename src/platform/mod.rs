@@ -80,7 +80,7 @@ impl PlatformRegistry {
     ///
     /// Consumes the registry; each platform is moved into its own task
     /// with its dedicated receiver.
-    pub fn start_all(mut self, pool: PgPool) -> Vec<tokio::task::JoinHandle<()>> {
+    pub fn start_all(self, pool: PgPool) -> Vec<tokio::task::JoinHandle<()>> {
         let mut handles = Vec::new();
 
         for (platform, receiver) in self.platforms.into_iter().zip(self.receivers.into_iter()) {

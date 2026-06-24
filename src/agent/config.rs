@@ -141,9 +141,9 @@ impl AgentConfig {
                 .parse()
                 .unwrap_or(10),
             summary_tokens: std::env::var("SUMMARY_TOKENS")
-                .unwrap_or_else(|_| "4096".to_string())
+                .unwrap_or_else(|_| "2048".to_string())
                 .parse()
-                .unwrap_or(4096),
+                .unwrap_or(2048),
             delete_after_days: std::env::var("DELETE_AFTER_DAYS")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()

@@ -1166,7 +1166,7 @@ pub async fn process_thread(
 
         let summary_request = CompletionRequest {
             messages: summary_msgs,
-            max_tokens: 2048,
+            max_tokens: cfg.config.summary_tokens,
             temperature: 0.3,
             stream: false,
             tools: None,

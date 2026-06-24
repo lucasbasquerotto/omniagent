@@ -608,8 +608,10 @@ This will:
 | `MAX_ITERATIONS_COMPLEX_PLAN` | `25` | Max agent turns for `auto_subtasks` mode |
 | `HOST` | `0.0.0.0` | HTTP bind address |
 | `PORT` | `8080` | HTTP port |
-| `DELETE_AFTER_DAYS` | `30` | Message retention period |
-| `MCP_SERVERS_CONFIG` | — | External MCP servers config file path |
+|| `DELETE_AFTER_DAYS` | `30` | Message retention period |
+|| `SUMMARY_WINDOW` | `10` | Half-window size for channel summarization |
+|| `SUMMARY_TOKENS` | `2048` | Max tokens for summary/interrupted LLM responses |
+|| `MCP_SERVERS_CONFIG` | — | External MCP servers config file path |
 | `VECTORIZE_MESSAGES` | `false` | Enable message embedding generation |
 | `VECTORIZE_WIKI` | `false` | Enable wiki embedding generation |
 | `MEMORY_MAX_CHARS` | `5000` | Max characters in MEMORY.md |

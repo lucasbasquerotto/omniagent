@@ -710,7 +710,6 @@ pub async fn build_thread_context(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_format_channel_name() {

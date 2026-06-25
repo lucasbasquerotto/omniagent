@@ -5,7 +5,7 @@ edition = "2021"
 description = "Filesystem MCP server — read, write, list, search, info tools"
 
 [dependencies]
-mcp-server-util = { path = "../mcp-server-util" }
+mcp-server-util = { path = "../util" }
 anyhow = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

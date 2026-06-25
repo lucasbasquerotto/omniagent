@@ -1,11 +1,11 @@
 [package]
-name = "mcp-server-skills"
+name = "mcp-server-docker-compose"
 version = "0.1.0"
 edition = "2021"
-description = "Skills MCP server — create_skill tool for reusable task procedures"
+description = "Docker Compose MCP server — run docker compose commands"
 
 [dependencies]
-mcp-server-util = { path = "../mcp-server-util" }
+mcp-server-util = { path = "../util" }
 anyhow = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

@@ -14,6 +14,5 @@ plugins/mcp/*/target/
 # Moved to nexuslbs/omni-stack repo
 /plugins/providers/
 /plugins/platforms/
-/plugins/mcp/
 /backup/
 /scripts/

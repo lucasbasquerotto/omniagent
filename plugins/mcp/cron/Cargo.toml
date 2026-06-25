@@ -1,12 +1,12 @@
 [package]
-name = "mcp-server-metrics"
+name = "mcp-server-cron"
 version = "0.1.0"
 edition = "2021"
-description = "Metrics MCP server — agent metrics (token usage, latency, groundedness, retrieval, corrections)"
+description = "Cron job MCP server — create, list, delete, update cron jobs"
 
 [dependencies]
-mcp-server-util = { path = "../mcp-server-util" }
-omniagent = { path = "../.." }
+mcp-server-util = { path = "../util" }
+omniagent = { path = "../../../" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,3 +16,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "chrono"] }
 sql-forge = "0.5.0"
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.13"

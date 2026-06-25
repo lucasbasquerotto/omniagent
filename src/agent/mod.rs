@@ -241,12 +241,50 @@ async fn channel_handler(
                         Ok(Some(msg)) => msg,
                         Ok(None) => {
                             error!("Thread {} has no cause message, skipping", thread.id);
-                            // Mark thread as interrupted
-                            let _ = queries::complete_thread(&cfg.pool, thread.id, "interrupted", CompleteThreadStats { input_tokens: 0, cached_tokens: 0, output_tokens: 0, duration_ms: 0 }).await;
+                            // Insert an error message so the user sees what happened
+                            let next_seq = queries::get_max_thread_sequence(&cfg.pool, thread.id).await.unwrap_or(0) + 1;
+                            let err_msg = queries::MessageNew {
+                                thread_id: thread.id,
+                                role: "agent".to_string(),
+                                content: "The thread has no cause message and was marked as failed.".to_string(),
+                                thread_sequence: next_seq,
+                                external_id: None,
+                                metadata: serde_json::json!({}),
+                                embedding: None,
+                                summary_text: None,
+                                is_summary: false,
+                                msg_type: "error".to_string(),
+                                msg_subtype: Some("no_cause".to_string()),
+                                processing_time_ms: None,
+                                token_usage: None,
+                                iteration_number: 0,
+                            };
+                            let _ = queries::create_message(&cfg.pool, &err_msg).await;
+                            // Mark thread as failed (not interrupted — interrupted is only for max iterations)
+                            let _ = queries::complete_thread(&cfg.pool, thread.id, "failed", CompleteThreadStats { input_tokens: 0, cached_tokens: 0, output_tokens: 0, duration_ms: 0 }).await;
                             continue;
                         }
                         Err(e) => {
                             error!("Failed to get cause message for thread {}: {:?}", thread.id, e);
+                            let next_seq = queries::get_max_thread_sequence(&cfg.pool, thread.id).await.unwrap_or(0) + 1;
+                            let err_msg = queries::MessageNew {
+                                thread_id: thread.id,
+                                role: "agent".to_string(),
+                                content: format!("Failed to look up the thread's cause message: {}", e),
+                                thread_sequence: next_seq,
+                                external_id: None,
+                                metadata: serde_json::json!({}),
+                                embedding: None,
+                                summary_text: None,
+                                is_summary: false,
+                                msg_type: "error".to_string(),
+                                msg_subtype: Some("unknown_error".to_string()),
+                                processing_time_ms: None,
+                                token_usage: None,
+                                iteration_number: 0,
+                            };
+                            let _ = queries::create_message(&cfg.pool, &err_msg).await;
+                            let _ = queries::complete_thread(&cfg.pool, thread.id, "failed", CompleteThreadStats { input_tokens: 0, cached_tokens: 0, output_tokens: 0, duration_ms: 0 }).await;
                             continue;
                         }
                     };
@@ -286,6 +324,25 @@ async fn channel_handler(
 
                     if let Err(e) = process_thread(&cfg, thread, &cause_msg).await {
                         error!("Failed to process thread {}: {:?}", thread.id, e);
+                        // Insert an error message with details
+                        let next_seq = queries::get_max_thread_sequence(&cfg.pool, thread.id).await.unwrap_or(0) + 1;
+                        let err_msg = queries::MessageNew {
+                            thread_id: thread.id,
+                            role: "agent".to_string(),
+                            content: format!("Thread processing failed: {}", e),
+                            thread_sequence: next_seq,
+                            external_id: None,
+                            metadata: serde_json::json!({}),
+                            embedding: None,
+                            summary_text: None,
+                            is_summary: false,
+                            msg_type: "error".to_string(),
+                            msg_subtype: Some("unknown_error".to_string()),
+                            processing_time_ms: None,
+                            token_usage: None,
+                            iteration_number: 0,
+                        };
+                        let _ = queries::create_message(&cfg.pool, &err_msg).await;
                         // Mark thread as failed
                         let _ = queries::complete_thread(&cfg.pool, thread.id, "failed", CompleteThreadStats { input_tokens: 0, cached_tokens: 0, output_tokens: 0, duration_ms: 0 }).await;
                         // If this thread is linked to a kanban task, mark it as blocked

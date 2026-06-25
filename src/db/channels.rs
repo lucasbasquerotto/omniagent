@@ -51,7 +51,8 @@ pub async fn get_channel_by_name(pool: &PgPool, name: &str) -> anyhow::Result<Op
             COALESCE(closed, false) as "closed",
             '{}'::text AS "metadata",
             COALESCE(template, '') AS "template",
-            COALESCE(TO_CHAR(created_at
+            COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
+            COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
         FROM channels
         WHERE name = :name
         "#,

@@ -19,4 +19,4 @@ WORKDIR /app
 
 # Build and run — builds inside the container on the compose network,
 # where postgres is reachable at postgres:5432 for sql_forge compile-time checks.
-CMD ["bash", "-c", "cargo build --release && exec ./target/release/omniagent"]
+CMD ["bash", "-c", "SQLX_OFFLINE=true cargo build --release && exec ./target/release/omniagent"]

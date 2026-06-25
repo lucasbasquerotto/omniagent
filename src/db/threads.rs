@@ -449,6 +449,20 @@ pub async fn count_thread_messages(pool: &PgPool, thread_id: i64) -> anyhow::Res
     Ok(count.unwrap_or(0) as i32)
 }
 
+/// Get the maximum thread_sequence in a thread (for computing the next sequence).
+/// Returns 0 if the thread has no messages.
+pub async fn get_max_thread_sequence(pool: &PgPool, thread_id: i64) -> anyhow::Result<i32> {
+    let max_seq: Option<i32> = sql_forge!(
+        scalar Option<i32>,
+        "SELECT MAX(thread_sequence) FROM messages WHERE thread_id = :thread_id",
+        ( :thread_id = thread_id )
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(max_seq.unwrap_or(0))
+}
+
 /// Skip all pending/processing threads on startup.
 pub async fn skip_all_pending_threads(pool: &PgPool) -> anyhow::Result<u64> {
     let result = sql_forge!(

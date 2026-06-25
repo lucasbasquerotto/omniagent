@@ -38,7 +38,9 @@ pub async fn process_thread(
         .unwrap_or(0);
 
     // Track per-message sequence number within the thread
-    let next_seq = cause_msg.thread_sequence + 1;
+    // Query the max sequence so each new message gets a unique incrementing value.
+    let max_seq = queries::get_max_thread_sequence(&cfg.pool, thread.id).await.unwrap_or(0);
+    let mut next_seq = max_seq + 1;
 
     // 3. Read profile, provider, model from the thread (not from messages)
     let profile_name = thread.profile.clone();
@@ -389,7 +391,7 @@ pub async fn process_thread(
                         thread_id: thread.id,
                         role: "agent".to_string(),
                         content: content.clone(),
-                        thread_sequence: { let v = next_seq; v },
+                        thread_sequence: { let v = next_seq; next_seq += 1; v },
                         external_id: None,
                         metadata: serde_json::json!({
                             "plan_iteration": iter,
@@ -869,7 +871,7 @@ pub async fn process_thread(
                 thread_id: thread.id,
                 role: "agent".to_string(),
                 content: multi_content,
-                thread_sequence: { let v = next_seq; v },
+                thread_sequence: { let v = next_seq; next_seq += 1; v },
                 external_id: None,
                 metadata: serde_json::json!({}),
                 embedding: None,
@@ -912,7 +914,7 @@ pub async fn process_thread(
                 thread_id: thread.id,
                 role: "agent".to_string(),
                 content: tool_args,
-                thread_sequence: { let v = next_seq; v },
+                thread_sequence: { let v = next_seq; next_seq += 1; v },
                 external_id: None,
                 metadata: serde_json::json!({}),
                 embedding: None,
@@ -959,7 +961,7 @@ pub async fn process_thread(
                         thread_id: thread.id,
                         role: "agent".to_string(),
                         content: content.clone(),
-                        thread_sequence: { let v = next_seq; v },
+                        thread_sequence: { let v = next_seq; next_seq += 1; v },
                         external_id: None,
                         metadata: serde_json::json!({}),
                         embedding: None,
@@ -991,7 +993,7 @@ pub async fn process_thread(
                         thread_id: thread.id,
                         role: "agent".to_string(),
                         content: err_msg.clone(),
-                        thread_sequence: { let v = next_seq; v },
+                        thread_sequence: { let v = next_seq; next_seq += 1; v },
                         external_id: None,
                         metadata: serde_json::json!({}),
                         embedding: None,
@@ -1104,7 +1106,7 @@ pub async fn process_thread(
                 thread_id: thread.id,
                 role: "agent".to_string(),
                 content: reasoning_text.clone(),
-                thread_sequence: { let v = next_seq; v },
+                thread_sequence: { let v = next_seq; next_seq += 1; v },
                 external_id: None,
                 metadata: serde_json::json!({
                     "context": evidence_metadata["context"],
@@ -1213,7 +1215,7 @@ pub async fn process_thread(
             thread_id: thread.id,
             role: "agent".to_string(),
             content: summary_text,
-            thread_sequence: { let v = next_seq; v },
+            thread_sequence: { let v = next_seq; next_seq += 1; v },
             external_id: None,
             metadata: serde_json::json!({}),
             embedding: None,
@@ -1251,7 +1253,7 @@ pub async fn process_thread(
             thread_id: thread.id,
             role: "agent".to_string(),
             content: agent_content,
-            thread_sequence: { let v = next_seq; v },
+            thread_sequence: { let v = next_seq; next_seq += 1; v },
             external_id: None,
             metadata: serde_json::json!({
                 "context": evidence_metadata["context"],
@@ -1281,7 +1283,7 @@ pub async fn process_thread(
             thread_id: thread.id,
             role: "agent".to_string(),
             content: final_content.clone(),
-            thread_sequence: { let v = next_seq; v },
+            thread_sequence: { let v = next_seq; next_seq += 1; v },
             external_id: None,
             metadata: serde_json::json!({
                 "context": evidence_metadata["context"],

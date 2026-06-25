@@ -294,11 +294,11 @@ Messages are organized into **threads** — a thread represents a single user re
 -- Insert threads with different causes in the same channel
 INSERT INTO threads (status, cause, channel_id, profile, provider, model)
 VALUES ('created', 'user', <ch_id>, 'default', 'opencode-go', 'deepseek-v4-flash');
--- repeat for 'cron' and 'kanban' causes
+-- repeat for 'system' cause (used for cron/kanban tasks)
 
 -- Add cause messages
 INSERT INTO messages (thread_id, role, content, thread_sequence, msg_type)
-VALUES (<thread_id>, 'cause', 'your prompt', 0, 'message');  -- or 'cron', 'kanban'
+VALUES (<thread_id>, 'cause', 'your prompt', 0, 'message');  -- or if cron/kanban
 
 -- Set pending
 UPDATE threads SET status = 'pending' WHERE channel_id = <ch_id> AND status = 'created';
@@ -310,8 +310,8 @@ UPDATE threads SET status = 'pending' WHERE channel_id = <ch_id> AND status = 'c
 ```sql
 -- Insert threads in DIFFERENT channels
 INSERT INTO threads (...) VALUES ('created', 'user',  <ch_a>, ...);
-INSERT INTO threads (...) VALUES ('created', 'cron',  <ch_b>, ...);
-INSERT INTO threads (...) VALUES ('created', 'kanban', <ch_c>, ...);
+INSERT INTO threads (...) VALUES ('created', 'system', <ch_b>, ...);
+INSERT INTO threads (...) VALUES ('created', 'system', <ch_c>, ...);
 UPDATE threads SET status = 'pending' WHERE channel_id IN (<ch_a>, <ch_b>, <ch_c>);
 ```
 

@@ -81,7 +81,7 @@ pub async fn run_hindsight_populator(pool: &PgPool, data_dir: &str) -> Result<St
             let tags = build_tags(msg);
             let context = format!(
                 "message from {} in conversation",
-                if msg.msg_type == "tool" || msg.msg_type == "tool_result" {
+                if msg.msg_type == "tool" || msg.msg_type == "tool-result" {
                     format!("tool ({})", msg.msg_subtype.as_deref().unwrap_or("unknown"))
                 } else {
                     msg.role.clone()
@@ -169,7 +169,7 @@ pub async fn run_hindsight_populator(pool: &PgPool, data_dir: &str) -> Result<St
 /// Format message content for hindsight retention.
 fn format_hindsight_content(msg: &MessageRow) -> String {
     match msg.msg_type.as_str() {
-        "tool" | "tool_result" | "multi-tool" => {
+        "tool" | "tool-result" | "multi-tool" => {
             let tool_name = msg.msg_subtype.as_deref().unwrap_or("unknown");
             let preview = msg.content.chars().take(MAX_CONTENT_CHARS).collect::<String>();
             format!("[Tool: {}] {}", tool_name, preview)
@@ -193,7 +193,7 @@ fn build_tags(msg: &MessageRow) -> Vec<String> {
 
     // Add role-based tag
     match msg.role.as_str() {
-        "user" => tags.push("from_user".to_string()),
+        "cause" => tags.push("from_user".to_string()),
         "agent" => tags.push("from_agent".to_string()),
         "system" => tags.push("system".to_string()),
         "tool" => tags.push("tool_call".to_string()),
@@ -208,14 +208,14 @@ async fn query_new_messages(pool: &PgPool, last_id: i64) -> Result<Vec<MessageRo
     // We query with msg_type filtering — exclude low-signal types:
     // - 'cron' (cron job metadata)
     // - 'tool_call' (the LLM's tool call instructions, not results)
-    // But include: 'message', 'reasoning', 'plan', 'error', 'cause', 'tool', 'tool_result', 'summary', 'system'
+    // But include: 'message', 'reasoning', 'plan', 'error', 'cause', 'tool', 'tool-result', 'summary', 'system'
     let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>, Option<String>)>(
         r#"
         SELECT m.id, m.role, m.content, m.msg_type, m.msg_subtype,
                COALESCE(TO_CHAR(m.created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS created_at
         FROM messages m
         WHERE m.id > $1
-          AND m.msg_type IN ('message', 'reasoning', 'plan', 'error', 'cause', 'tool', 'tool_result', 'summary', 'system')
+          AND m.msg_type IN ('message', 'reasoning', 'plan', 'error', 'cause', 'tool', 'tool-result', 'summary', 'system')
           AND COALESCE(m.content, '') != ''
         ORDER BY m.id ASC
         LIMIT $2

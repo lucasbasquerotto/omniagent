@@ -274,9 +274,9 @@ pub fn build_message_metadata_block(messages: &[ChatMessage], offset: usize) -> 
             "assistant" => {
                 if msg.tool_calls.is_some() { "tool_call" } else { "assistant" }
             }
-            "tool" => "tool_result",
+            "tool" => "tool-result",
             "system" => "system",
-            "user" => "user",
+            "cause" => "cause",
             other => other,
         };
         let meta = if msg.tool_calls.is_some() {
@@ -503,13 +503,13 @@ pub async fn check_and_generate_summary(
                 ));
                 for m in &thread_msgs {
                     let role_display = match m.role.as_str() {
-                        "user" => "User",
+                        "cause" => "User",
                         "agent" => "Assistant",
                         "system" => "System",
                         _ => &m.role,
                     };
                     // Skip tool results to keep context manageable
-                    if m.msg_type == "tool_result" || m.msg_type == "tool" {
+                    if m.msg_type == "tool-result" || m.msg_type == "tool" {
                         continue;
                     }
                     all_thread_content.push_str(&format!(
@@ -648,7 +648,7 @@ pub async fn enqueue_delivery(
     }
 
     // Never deliver tool results directly
-    if saved.msg_type == "tool_result" {
+    if saved.msg_type == "tool-result" {
         return;
     }
 

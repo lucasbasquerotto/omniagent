@@ -320,7 +320,7 @@ async fn prompt_handler(
     let system_prompt = build_system_prompt(&memory_store, platform, None, profile_name);
 
     let result = format!(
-        "System Prompt:\n{}\n\n---\n\nMessages sent to LLM:\n\n{{\n  \"role\": \"system\",\n  \"content\": \"\"\"\n{}\n  \"\"\"\n}},\n{{\n  \"role\": \"user\",\n  \"content\": \"<<<prompt>>>\"\n}}",
+        "System Prompt:\n{}\n\n---\n\nMessages sent to LLM:\n\n{{\n  \"role\": \"system\",\n  \"content\": \"\"\"\n{}\n  \"\"\"\n}},\n{{\n  \"role\": \"cause\",\n  \"content\": \"<<<prompt>>>\"\n}}",
         system_prompt, system_prompt
     );
 
@@ -417,7 +417,7 @@ async fn prompt_preview_handler(
     }
 
     // Add user prompt
-    messages.push(serde_json::json!({ "role": "user", "content": body.prompt }));
+    messages.push(serde_json::json!({ "role": "cause", "content": body.prompt }));
 
     let plan = if body.plan {
         // Resolve provider/model: channel > profile > env

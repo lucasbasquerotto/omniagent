@@ -303,12 +303,12 @@ async fn tick(pool: &PgPool, data_dir: &str, mcp_registry: &McpRegistry, app_con
             None => (None, None),
         };
 
-        // ── Create a thread with cause='cron' (resolves planning mode internally) ──
+        // ── Create a thread with cause='system' (resolves planning mode internally) ──
         let subtype = job.name.clone().unwrap_or_default();
         let prompt_content = job.prompt.clone().unwrap_or_default();
         match queries::create_thread_with_cause(
             pool,
-            "cron",
+            "system",
             channel.id,
             &profile_name,
             queries::ThreadCauseParams {
@@ -681,7 +681,7 @@ pub async fn run_kanban_dispatcher(pool: &PgPool, data_dir: &str) -> Result<()> 
         };
         let thread_id = match queries::create_thread_with_cause(
             pool,
-            "kanban",
+            "system",
             task_channel_id,
             &profile_name,
             queries::ThreadCauseParams {
@@ -761,6 +761,18 @@ fn calculate_next_run(expression: &str, now: &DateTime<Utc>) -> DateTime<Utc> {
             *now + chrono::Duration::hours(1)
         }
     }
+}
+
+/// Validate that a cron schedule expression has exactly 5 whitespace-separated fields
+/// (Linux crontab format: minute hour day-of-month month day-of-week).
+/// Returns `true` if valid, `false` otherwise.
+pub fn validate_cron_schedule_5field(schedule: &str) -> bool {
+    let trimmed = schedule.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    fields.len() == 5
 }
 
 // ─── Resolved thread config ───
@@ -1009,7 +1021,7 @@ pub async fn fire_cron_job_by_id(
     let prompt_content = job.prompt.clone().unwrap_or_default();
     let (thread, _created) = queries::create_thread_with_cause(
         pool,
-        "cron",
+        "system",
         channel.id,
         &profile_name,
         queries::ThreadCauseParams {
@@ -1059,6 +1071,14 @@ pub async fn setup_knowledge_pipeline(
 
     // Defaults
     let schedule = schedule.unwrap_or_else(|| "0 */6 * * *".to_string());
+
+    // Validate schedule is 5-field format
+    if !validate_cron_schedule_5field(&schedule) {
+        return Err(format!(
+            "Invalid cron schedule '{}': must have exactly 5 whitespace-separated fields (minute hour day month weekday)",
+            schedule
+        ));
+    }
 
     // Read prompt from template file, with fallback
     let prompt = prompt.or_else(|| {

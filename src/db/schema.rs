@@ -27,7 +27,7 @@
 //
 //  id               BIGSERIAL PRIMARY KEY           -- auto-incrementing
 //  channel_id       BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE
-//  role             TEXT NOT NULL                   -- 'user', 'agent', 'system', 'tool'
+//  role             TEXT NOT NULL                   -- 'cause', 'agent', 'system', 'tool'
 //  content          TEXT NOT NULL                   -- message body
 //  status           TEXT NOT NULL DEFAULT 'pending'
 //                                                   -- 'pending', 'processing', 'completed',
@@ -41,7 +41,7 @@
 //                                                   -- pgvector extension is available
 //  summary_text     TEXT                            -- cached summary of the message
 //  is_summary       BOOL NOT NULL DEFAULT false
-//  msg_type         TEXT NOT NULL DEFAULT 'message' -- 'message', 'reasoning', 'tool_call', 'tool_result'
+//  msg_type         TEXT NOT NULL DEFAULT 'message' -- 'message', 'reasoning', 'tool_call', 'tool-result'
 //  msg_subtype      TEXT                            -- optional subtype (tool name, etc.)
 //  iteration_count  INT NOT NULL DEFAULT 0          -- which agent turn in the thread
 //  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()

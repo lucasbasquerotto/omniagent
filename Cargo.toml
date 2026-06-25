@@ -11,6 +11,10 @@ members = [
     "crates/mcp-server-query",
     "crates/mcp-server-plugin-manager",
     "crates/mcp-server-subtasks",
+    "crates/mcp-server-fetch",
+    "crates/mcp-server-filesystem",
+    "crates/mcp-server-docker-compose",
+    "crates/mcp-server-skills",
 ]
 resolver = "2"
 

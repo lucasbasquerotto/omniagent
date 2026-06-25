@@ -956,7 +956,7 @@ pub async fn process_thread(
                     // Layer 2: truncate first — DB stores what the LLM will see
                     let content = truncate_content(&res.content, DEFAULT_MAX_TOOL_OUTPUT_CHARS);
 
-                    // Persist the tool result as an agent message with msg_type="tool_result"
+                    // Persist the tool result as an agent message with msg_type="tool-result"
                     let tool_result_msg = MessageNew {
                         thread_id: thread.id,
                         role: "agent".to_string(),
@@ -967,7 +967,7 @@ pub async fn process_thread(
                         embedding: None,
                         summary_text: None,
                         is_summary: false,
-                        msg_type: "tool_result".to_string(),
+                        msg_type: "tool-result".to_string(),
                         msg_subtype: Some(tool_name.clone()),
                         processing_time_ms: Some(tool_elapsed_ms),
                         token_usage: None,
@@ -999,7 +999,7 @@ pub async fn process_thread(
                         embedding: None,
                         summary_text: None,
                         is_summary: false,
-                        msg_type: "tool_result".to_string(),
+                        msg_type: "tool-result".to_string(),
                         msg_subtype: Some(tool_name.clone()),
                         processing_time_ms: Some(tool_elapsed_ms),
                         token_usage: None,

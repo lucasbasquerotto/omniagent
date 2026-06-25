@@ -500,7 +500,7 @@ pub async fn build_thread_context(
                 let retrieved: String = fused_msgs
                     .iter()
                     .map(|m| {
-                        let content = if m.msg_type == "tool" || m.msg_type == "tool_result" || m.msg_type == "multi-tool" {
+                        let content = if m.msg_type == "tool" || m.msg_type == "tool-result" || m.msg_type == "multi-tool" {
                             let tool_name = m.msg_subtype.as_deref().unwrap_or("unknown");
                             let preview = m.content.chars().take(100).collect::<String>();
                             format!("[Tool: {}] {}", tool_name, preview)

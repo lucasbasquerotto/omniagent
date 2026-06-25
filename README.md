@@ -882,7 +882,7 @@ docker compose exec postgres psql -U omniagent -d omniagent
 
 | Test | Setup | Expected |
 |------|-------|----------|
-| **Single channel, all causes** | 3 threads (user/cron/kanban) → same channel → set pending | Processed **sequentially** (one after another). All complete |
+| **Single channel, all causes** | 3 threads (user/system for cron/kanban) → same channel → set pending | Processed **sequentially** (one after another). All complete |
 | **Different channels (parallelism)** | 3 threads in 3 different channels → set pending | Processed at the **same second** — each channel handler runs independently |
 | **Stop/Resume** | Start a thread → `curl stop/<id>` → verify `skipped` → `resume` → new message | Stopped thread = `skipped`. New thread after resume picks up immediately |
 | **Empty provider** | Thread with `provider=''` | **failed** with clear error: "provider is not set" |

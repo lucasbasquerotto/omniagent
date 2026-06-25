@@ -11,6 +11,9 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     phase_7_seed_actions(pool).await?;
     phase_8_iteration_number(pool).await?;
     phase_9_cron_schedule_5_field(pool).await?;
+    phase_10_fix_thread_causes(pool).await?;
+    phase_11_rename_tool_result_msg_type(pool).await?;
+    phase_12_migrate_user_role(pool).await?;
     Ok(())
 }
 
@@ -1027,6 +1030,65 @@ async fn phase_9_cron_schedule_5_field(pool: &PgPool) -> Result<()> {
         SET schedule = SUBSTRING(schedule FROM POSITION(' ' IN schedule) + 1),
             updated_at = NOW()
         WHERE schedule ~ '^[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+$'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Phase 10: Fix invalid thread causes and add CHECK constraint.
+/// Valid causes are 'user' (user-initiated threads) and 'system' (cron/kanban tasks).
+async fn phase_10_fix_thread_causes(pool: &PgPool) -> Result<()> {
+    // 1. Fix existing invalid causes — 'user-request' -> 'user', 'test' -> 'user', old 'cron'/'kanban' -> 'system'
+    sqlx::query(
+        r#"
+        UPDATE threads SET cause = 'user'
+        WHERE cause NOT IN ('user', 'system')
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // 2. Add CHECK constraint (idempotent via DO block)
+    sqlx::query(
+        r#"
+        DO $$ BEGIN
+            ALTER TABLE threads ADD CONSTRAINT chk_thread_cause
+                CHECK (cause IN ('user', 'system'));
+        EXCEPTION
+            WHEN duplicate_object THEN NULL;
+        END $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Phase 11: Rename msg_type 'tool_result' to 'tool-result' for consistency.
+async fn phase_11_rename_tool_result_msg_type(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE messages SET msg_type = 'tool-result'
+        WHERE msg_type = 'tool_result'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Phase 12: Migrate message role 'user' to 'cause'.
+/// The only message roles should be 'cause' (initiating message) and 'agent' (response).
+async fn phase_12_migrate_user_role(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE messages SET role = 'cause'
+        WHERE role = 'user'
         "#,
     )
     .execute(pool)

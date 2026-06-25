@@ -54,7 +54,7 @@ pub async fn get_recent_thread_messages(
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at"
         FROM messages
         WHERE thread_id = :thread_id
-          AND role IN ('user', 'agent')
+          AND role IN ('cause', 'agent')
           AND msg_type IN ('message', 'reasoning')
         ORDER BY created_at DESC
         LIMIT :limit
@@ -88,7 +88,7 @@ pub async fn search_messages_text(
         JOIN threads t ON t.id = m.thread_id
         WHERE t.channel_id = :channel_id
           AND m.content ILIKE :pattern
-          AND m.msg_type IN ('cause', 'summary', 'plan', 'message', 'reasoning', 'error', 'tool', 'tool_result')
+          AND m.msg_type IN ('cause', 'summary', 'plan', 'message', 'reasoning', 'error', 'tool', 'tool-result')
         ORDER BY m.created_at DESC
         LIMIT :limit
         "#,
@@ -176,7 +176,7 @@ pub async fn search_messages_semantic(
             JOIN threads t ON t.id = m.thread_id
             WHERE t.channel_id = $1
               AND m.embedding_vec IS NOT NULL
-              AND m.msg_type IN ('cause', 'summary', 'plan', 'message', 'reasoning', 'error', 'tool', 'tool_result')
+              AND m.msg_type IN ('cause', 'summary', 'plan', 'message', 'reasoning', 'error', 'tool', 'tool-result')
             ORDER BY m.embedding_vec <=> $2::vector(1536)
             LIMIT 100
         )

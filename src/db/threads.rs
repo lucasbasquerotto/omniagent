@@ -19,6 +19,10 @@ pub async fn create_thread(
     profile: &str,
     p: CreateThreadParams,
 ) -> anyhow::Result<Thread> {
+    // Validate cause — must be 'user' or 'system'
+    if cause != "user" && cause != "system" {
+        anyhow::bail!("Invalid thread cause '{}': must be 'user' or 'system'", cause);
+    }
     let row: ThreadDb = sql_forge!(
         ThreadDb,
         r#"
@@ -249,6 +253,10 @@ pub async fn create_thread_with_cause(
     profile: &str,
     p: ThreadCauseParams,
 ) -> anyhow::Result<(Thread, Message)> {
+    // Validate cause — must be 'user' or 'system'
+    if cause != "user" && cause != "system" {
+        anyhow::bail!("Invalid thread cause '{}': must be 'user' or 'system'", cause);
+    }
     // 1. Get channel for its planning_mode override and current_* fields
     let channel = crate::db::channels::get_channel_by_id(pool, channel_id)
         .await?

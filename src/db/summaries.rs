@@ -32,7 +32,7 @@ pub async fn get_latest_summary(
 }
 
 /// Get the last N summaries for a channel (newest first).
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub async fn get_recent_summaries(
     pool: &PgPool,
     channel_id: i64,

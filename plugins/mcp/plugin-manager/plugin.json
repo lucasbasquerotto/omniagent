@@ -1,0 +1,7 @@
+{
+  "name": "plugin-manager",
+  "version": "0.1.0",
+  "type": "mcp",
+  "description": "Plugin management tools — list, install, uninstall, enable, disable, configure plugins",
+  "config_schema": []
+}

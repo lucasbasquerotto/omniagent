@@ -1,0 +1,7 @@
+{
+  "name": "query",
+  "version": "0.1.0",
+  "type": "mcp",
+  "description": "Read-only database query tools — search messages, threads, prompts, and run custom SELECT queries",
+  "config_schema": []
+}

@@ -1,0 +1,7 @@
+{
+  "name": "cron",
+  "version": "0.1.0",
+  "type": "mcp",
+  "description": "Cron job management tools — create, list, delete, update cron jobs",
+  "config_schema": []
+}

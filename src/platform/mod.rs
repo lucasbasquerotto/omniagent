@@ -29,7 +29,7 @@ pub trait Platform: Send + Sync {
     /// `receiver` is the platform's dedicated outbound delivery queue.
     async fn start(&self, pool: PgPool, receiver: OutboundReceiver) -> Result<()>;
 
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     async fn send_response(&self, pool: &PgPool, message_id: i64) -> Result<()>;
 }
 
@@ -66,7 +66,7 @@ impl PlatformRegistry {
     /// Get a clone of the outbound sender for a given platform.
     ///
     /// Returns `None` if the platform is not registered.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub fn sender_for(&self, platform_name: &str) -> Option<OutboundSender> {
         self.senders.get(platform_name).cloned()
     }

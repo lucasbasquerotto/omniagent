@@ -159,7 +159,7 @@ pub fn format_model_status(
 #[derive(Debug, Clone)]
 pub struct NewCommand;
 
-#[expect(dead_code)]
+#[allow(dead_code)]
 /// Parse a `/new` command text. Valid form: `/new` (no arguments).
 pub fn parse_new_command(input: &str) -> Result<NewCommand> {
     let trimmed = input.trim();

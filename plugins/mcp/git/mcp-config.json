@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "name": "git",
+      "transport": "stdio",
+      "command": "./target/release/mcp-server-git",
+      "args": [],
+      "timeout_secs": 120,
+      "max_retries": 2,
+      "allowed_tools": ["*"]
+    }
+  ]
+}

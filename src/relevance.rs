@@ -50,7 +50,7 @@ struct WikiFile {
     /// Relative path like "Architecture.md" or "Reference/Docker.md"
     rel_path: String,
     /// Absolute path on disk.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     abs_path: PathBuf,
     /// Mtime as Unix timestamp.
     mtime_secs: u64,
@@ -174,7 +174,7 @@ struct CollectWikiFilesCtx<'a> {
     root: &'a Path,
     files: &'a mut Vec<WikiFile>,
     cache: &'a mut HashMap<String, CacheEntry>,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     cache_path: &'a Path,
 }
 

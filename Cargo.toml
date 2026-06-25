@@ -1,8 +1,32 @@
+[workspace]
+members = [
+    ".",
+    "crates/mcp-server-util",
+    "crates/mcp-server-cron",
+    "crates/mcp-server-kanban",
+    "crates/mcp-server-search",
+    "crates/mcp-server-memory",
+    "crates/mcp-server-metrics",
+    "crates/mcp-server-git",
+    "crates/mcp-server-query",
+    "crates/mcp-server-plugin-manager",
+    "crates/mcp-server-subtasks",
+]
+resolver = "2"
+
 [package]
 name = "omniagent"
 version = "0.1.0"
 edition = "2021"
 description = "OmniAgent — Next-generation agent system with Rust, Postgres + pgvector, Telegram support"
+
+[lib]
+name = "omniagent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omniagent"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

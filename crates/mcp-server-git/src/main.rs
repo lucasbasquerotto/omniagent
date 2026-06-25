@@ -1,20 +1,17 @@
-//! Native Git/GitHub MCP tools.
+//! mcp-server-git — standalone MCP server for Git/GitHub operations.
+//! Communicates via stdio JSON-RPC (MCP protocol).
 //!
-//! Provides git and GitHub operations as native MCP tools:
-//!   - `create_github_repo`: Create a repository under nexuslbs org on GitHub
-//!   - `clone_repo`: Clone a git repository to local filesystem
-//!   - `commit_and_push`: Stage, commit, and push changes to GitHub
-//!   - `status`: Get git status of a repository
+//! Tools: create_github_repo, clone_repo, commit_and_push, status
 //!
-//! GitHub App authentication uses the private key and .env credentials.
+//! GitHub App authentication uses JWT tokens from a private key file,
+//! exchanged for installation access tokens via the GitHub API.
 
-use crate::mcp::{truncate_content, AppContext, McpTool, McpToolResult};
 use anyhow::{Context, Result};
+use mcp_server_util::*;
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +21,7 @@ const PRIVATE_KEY_PATH: &str = "/opt/data/credentials/nexuslbs-app.2026-06-04.pr
 const DOT_ENV_PATH: &str = "/opt/data/.env";
 const GITHUB_ORG: &str = "nexuslbs";
 const GITHUB_API: &str = "https://api.github.com";
-const USER_AGENT: &str = "omniagent-git-mcp";
+const USER_AGENT: &str = "mcp-server-git";
 
 // ── Token Cache ─────────────────────────────────────────────────────────────
 
@@ -35,7 +32,10 @@ struct TokenCacheInner {
 impl TokenCacheInner {
     fn get_cached(&self) -> Option<String> {
         let (token, expiry) = self.token.as_ref()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if now < *expiry - 60 {
             Some(token.clone())
         } else {
@@ -44,14 +44,16 @@ impl TokenCacheInner {
     }
 
     fn set(&mut self, token: String) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         self.token = Some((token, now + 570));
     }
 }
 
-static TOKEN_CACHE: Lazy<Mutex<TokenCacheInner>> = Lazy::new(|| {
-    Mutex::new(TokenCacheInner { token: None })
-});
+static TOKEN_CACHE: Lazy<Mutex<TokenCacheInner>> =
+    Lazy::new(|| Mutex::new(TokenCacheInner { token: None }));
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -94,7 +96,10 @@ fn load_github_creds() -> Result<(String, String)> {
 
     match (found_app_id, found_inst_id) {
         (Some(a), Some(i)) => Ok((a, i)),
-        _ => anyhow::bail!("GITHUB_APP_ID and GITHUB_INSTALLATION_ID must be set in environment or {}", DOT_ENV_PATH),
+        _ => anyhow::bail!(
+            "GITHUB_APP_ID and GITHUB_INSTALLATION_ID must be set in environment or {}",
+            DOT_ENV_PATH
+        ),
     }
 }
 
@@ -126,14 +131,16 @@ fn create_jwt(app_id: &str) -> Result<String> {
 
     {
         use std::io::Write;
-        let stdin = child.stdin.as_mut()
+        let stdin = child
+            .stdin
+            .as_mut()
             .context("Failed to open openssl stdin")?;
-        stdin.write_all(signing_input.as_bytes())
-            .context("Failed to write to openssl stdin")?;
+        stdin.write_all(signing_input.as_bytes())?;
         stdin.flush()?;
-    } // Drop stdin to close it
+    }
 
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .context("Failed to wait for openssl")?;
 
     if !output.status.success() {
@@ -149,7 +156,9 @@ fn create_jwt(app_id: &str) -> Result<String> {
 fn get_installation_token(app_id: &str, inst_id: &str) -> Result<String> {
     // Check cache first
     {
-        let cache = TOKEN_CACHE.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let cache = TOKEN_CACHE
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
         if let Some(cached) = cache.get_cached() {
             return Ok(cached);
         }
@@ -178,35 +187,42 @@ fn get_installation_token(app_id: &str, inst_id: &str) -> Result<String> {
         anyhow::bail!("GitHub API error {}: {}", status, body);
     }
 
-    let data: Value = response.json().context("Failed to parse GitHub API response")?;
+    let data: Value = response
+        .json()
+        .context("Failed to parse GitHub API response")?;
     let token = data["token"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("No token in GitHub API response"))?
         .to_string();
 
     {
-        let mut cache = TOKEN_CACHE.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        let mut cache = TOKEN_CACHE
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
         cache.set(token.clone());
     }
     Ok(token)
 }
 
+/// Get a GitHub installation access token.
+fn get_github_token() -> Result<String> {
+    let (app_id, inst_id) = load_github_creds()?;
+    get_installation_token(&app_id, &inst_id)
+}
+
 /// Run a git command and return (stdout, stderr, exit_code).
 fn run_git(args: &[&str], cwd: Option<&str>, timeout_secs: u64) -> (String, String, i32) {
     let mut cmd = Command::new("git");
-    cmd.args(args)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
 
-    // Spawn the child process
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (String::new(), format!("Failed to spawn git: {}", e), -1),
     };
 
-    // Wait for completion in a thread, send result back via channel
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = child.wait_with_output();
@@ -221,24 +237,18 @@ fn run_git(args: &[&str], cwd: Option<&str>, timeout_secs: u64) -> (String, Stri
             output.status.code().unwrap_or(-1),
         ),
         Ok(Err(e)) => (String::new(), format!("git output error: {}", e), -1),
-        Err(_) => (String::new(), format!("git command timed out after {}s", timeout_secs), -1),
+        Err(_) => (
+            String::new(),
+            format!("git command timed out after {}s", timeout_secs),
+            -1,
+        ),
     }
 }
 
-// ── Repo result from GitHub API.
-#[derive(serde::Serialize)]
-struct CreateRepoResult {
-    success: bool,
-    repo_name: String,
-    clone_url: String,
-    html_url: String,
-    note: String,
-}
-
-// ── Tool Implementations ────────────────────────────────────────────────────
+// ── Tool Handlers ───────────────────────────────────────────────────────────
 
 /// `create_github_repo` — create a repository under nexuslbs org.
-fn handle_create_github_repo(args: &Value) -> Result<McpToolResult> {
+fn handle_create_github_repo(args: &Value) -> Result<(String, bool)> {
     let repo_name = args["name"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing required parameter: name"))?
@@ -250,8 +260,7 @@ fn handle_create_github_repo(args: &Value) -> Result<McpToolResult> {
 
     let description = args["description"].as_str().unwrap_or("");
     let private = args["private"].as_bool().unwrap_or(false);
-
-    let (_, token) = get_github_client()?;
+    let token = get_github_token()?;
 
     let url = format!("{}/orgs/{}/repos", GITHUB_API, GITHUB_ORG);
     let payload = serde_json::json!({
@@ -292,43 +301,30 @@ fn handle_create_github_repo(args: &Value) -> Result<McpToolResult> {
             "Repository created"
         };
 
-        let result = CreateRepoResult {
-            success: true,
-            repo_name: repo_name.clone(),
-            clone_url: clone_url.to_string(),
-            html_url: html_url.to_string(),
-            note: note.to_string(),
-        };
-
-        return Ok(McpToolResult {
-            call_id: String::new(),
-            content: serde_json::to_string_pretty(&result)?,
-            is_error: false,
+        let result = serde_json::json!({
+            "success": true,
+            "repo_name": repo_name,
+            "clone_url": clone_url,
+            "html_url": html_url,
+            "note": note,
         });
+
+        return Ok((serde_json::to_string_pretty(&result)?, false));
     }
 
     let err_msg = body["message"].as_str().unwrap_or("Unknown error");
-    Ok(McpToolResult {
-        call_id: String::new(),
-        content: format!("GitHub API error ({}): {}", status.as_u16(), err_msg),
-        is_error: true,
-    })
-}
-
-/// Get a GitHub token (helper).
-fn get_github_token() -> Result<String> {
-    let (app_id, inst_id) = load_github_creds()?;
-    get_installation_token(&app_id, &inst_id)
-}
-
-/// Get a GitHub API token (old name kept for minimal diff).
-fn get_github_client() -> Result<(String, String)> {
-    let token = get_github_token()?;
-    Ok((token.clone(), token))
+    Ok((
+        format!(
+            "GitHub API error ({}): {}",
+            status.as_u16(),
+            err_msg
+        ),
+        true,
+    ))
 }
 
 /// `clone_repo` — clone a git repository to local filesystem.
-fn handle_clone_repo(args: &Value) -> Result<McpToolResult> {
+fn handle_clone_repo(args: &Value) -> Result<(String, bool)> {
     let url = args["url"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing required parameter: url"))?
@@ -341,7 +337,9 @@ fn handle_clone_repo(args: &Value) -> Result<McpToolResult> {
     let target_dir = args["dir"].as_str().unwrap_or("").to_string();
 
     let actual_dir = if target_dir.is_empty() {
-        url.trim_end_matches('/').split('/').next_back()
+        url.trim_end_matches('/')
+            .split('/')
+            .next_back()
             .unwrap_or("repo")
             .trim_end_matches(".git")
             .to_string()
@@ -354,43 +352,41 @@ fn handle_clone_repo(args: &Value) -> Result<McpToolResult> {
     if rc != 0 {
         let git_dir = format!("{}/.git", actual_dir);
         if Path::new(&git_dir).is_dir() {
-            let abs_path = Path::new(&actual_dir).canonicalize()
+            let abs_path = Path::new(&actual_dir)
+                .canonicalize()
                 .map(|p| p.display().to_string())
                 .unwrap_or(actual_dir);
-            return Ok(McpToolResult {
-                call_id: String::new(),
-                content: serde_json::json!({
+            return Ok((
+                serde_json::json!({
                     "success": true,
                     "path": abs_path,
                     "note": "Repository already exists locally"
-                }).to_string(),
-                is_error: false,
-            });
+                })
+                .to_string(),
+                false,
+            ));
         }
-        return Ok(McpToolResult {
-            call_id: String::new(),
-            content: format!("Clone failed: {}", stderr),
-            is_error: true,
-        });
+        return Ok((format!("Clone failed: {}", stderr), true));
     }
 
-    let abs_path = Path::new(&actual_dir).canonicalize()
+    let abs_path = Path::new(&actual_dir)
+        .canonicalize()
         .map(|p| p.display().to_string())
         .unwrap_or(actual_dir);
 
-    Ok(McpToolResult {
-        call_id: String::new(),
-        content: serde_json::json!({
+    Ok((
+        serde_json::json!({
             "success": true,
             "path": abs_path,
             "note": "Repository cloned successfully"
-        }).to_string(),
-        is_error: false,
-    })
+        })
+        .to_string(),
+        false,
+    ))
 }
 
 /// `commit_and_push` — stage, commit, and push changes.
-fn handle_commit_and_push(args: &Value) -> Result<McpToolResult> {
+fn handle_commit_and_push(args: &Value) -> Result<(String, bool)> {
     let repo_dir = args["repo_dir"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing required parameter: repo_dir"))?
@@ -417,9 +413,7 @@ fn handle_commit_and_push(args: &Value) -> Result<McpToolResult> {
     // Stage files
     let files = args["files"].as_array();
     let (_stdout, stderr, rc) = if let Some(files_arr) = files {
-        let file_strs: Vec<&str> = files_arr.iter()
-            .filter_map(|v| v.as_str())
-            .collect();
+        let file_strs: Vec<&str> = files_arr.iter().filter_map(|v| v.as_str()).collect();
         if file_strs.is_empty() {
             run_git(&["add", "-A"], Some(&repo_dir), 30)
         } else {
@@ -432,11 +426,7 @@ fn handle_commit_and_push(args: &Value) -> Result<McpToolResult> {
     };
 
     if rc != 0 {
-        return Ok(McpToolResult {
-            call_id: String::new(),
-            content: format!("git add failed: {}", stderr),
-            is_error: true,
-        });
+        return Ok((format!("git add failed: {}", stderr), true));
     }
 
     // Commit
@@ -444,31 +434,23 @@ fn handle_commit_and_push(args: &Value) -> Result<McpToolResult> {
 
     if rc != 0 {
         if stderr.contains("nothing to commit") || out.contains("nothing to commit") {
-            return Ok(McpToolResult {
-                call_id: String::new(),
-                content: serde_json::json!({
+            return Ok((
+                serde_json::json!({
                     "success": true,
                     "note": "Nothing to commit — working tree clean"
-                }).to_string(),
-                is_error: false,
-            });
+                })
+                .to_string(),
+                false,
+            ));
         }
-        return Ok(McpToolResult {
-            call_id: String::new(),
-            content: format!("git commit failed: {}", stderr),
-            is_error: true,
-        });
+        return Ok((format!("git commit failed: {}", stderr), true));
     }
 
     // Push
     let token = match get_github_token() {
         Ok(t) => t,
         Err(e) => {
-            return Ok(McpToolResult {
-                call_id: String::new(),
-                content: format!("Cannot push: {}", e),
-                is_error: true,
-            });
+            return Ok((format!("Cannot push: {}", e), true));
         }
     };
 
@@ -482,48 +464,55 @@ fn handle_commit_and_push(args: &Value) -> Result<McpToolResult> {
 
     // Get current branch
     let (branch_out, _, _) = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], Some(&repo_dir), 15);
-    let branch = if branch_out.trim().is_empty() { "main" } else { branch_out.trim() };
+    let branch = if branch_out.trim().is_empty() {
+        "main"
+    } else {
+        branch_out.trim()
+    };
 
     // Build push URL with token
     let push_url = if remote_url.starts_with("https://") {
-        let rest = remote_url.split_once("://").map(|(_, r)| r).unwrap_or(&remote_url);
+        let rest = remote_url
+            .split_once("://")
+            .map(|(_, r)| r)
+            .unwrap_or(&remote_url);
         format!("https://x-access-token:{}@{}", token, rest)
     } else {
         remote_url.clone()
     };
 
-    let (_push_stdout, push_stderr, push_rc) = run_git(
-        &["push", &push_url, &format!("HEAD:{}", branch)],
-        Some(&repo_dir),
-        120,
-    );
+    let (_push_stdout, push_stderr, push_rc) =
+        run_git(&["push", &push_url, &format!("HEAD:{}", branch)], Some(&repo_dir), 120);
 
     if push_rc != 0 {
-        return Ok(McpToolResult {
-            call_id: String::new(),
-            content: format!("Push failed: {}", truncate_content(&push_stderr, 500)),
-            is_error: true,
-        });
+        // Truncate stderr for display
+        let truncated = if push_stderr.len() > 500 {
+            format!("{}... [truncated]", &push_stderr[..500])
+        } else {
+            push_stderr.clone()
+        };
+        return Ok((format!("Push failed: {}", truncated), true));
     }
 
     // Update local tracking refs
     run_git(&["fetch", "origin", "--quiet"], Some(&repo_dir), 30);
 
-    Ok(McpToolResult {
-        call_id: String::new(),
-        content: serde_json::json!({
+    Ok((
+        serde_json::json!({
             "success": true,
-            "repo_dir": Path::new(&repo_dir).canonicalize()
+            "repo_dir": Path::new(&repo_dir)
+                .canonicalize()
                 .map(|p| p.display().to_string())
                 .unwrap_or(repo_dir),
             "note": "Committed and pushed"
-        }).to_string(),
-        is_error: false,
-    })
+        })
+        .to_string(),
+        false,
+    ))
 }
 
 /// `status` — get git status of a repository.
-fn handle_status(args: &Value) -> Result<McpToolResult> {
+fn handle_status(args: &Value) -> Result<(String, bool)> {
     let repo_dir = args["repo_dir"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing required parameter: repo_dir"))?
@@ -541,126 +530,135 @@ fn handle_status(args: &Value) -> Result<McpToolResult> {
     let (status_out, _, _) = run_git(&["status"], Some(&repo_dir), 30);
     let (branch_out, _, _) = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], Some(&repo_dir), 15);
 
-    Ok(McpToolResult {
-        call_id: String::new(),
-        content: serde_json::json!({
+    Ok((
+        serde_json::json!({
             "success": true,
-            "repo_dir": Path::new(&repo_dir).canonicalize()
+            "repo_dir": Path::new(&repo_dir)
+                .canonicalize()
                 .map(|p| p.display().to_string())
                 .unwrap_or(repo_dir),
             "branch": branch_out.trim(),
             "status": status_out,
-        }).to_string(),
-        is_error: false,
-    })
+        })
+        .to_string(),
+        false,
+    ))
 }
 
-// ── Tool Factory ────────────────────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────────────────
 
-pub fn create_github_repo_tool() -> McpTool {
-    McpTool {
-        name: "create_github_repo".to_string(),
-        description: "CREATE a new repository under the nexuslbs organization on GitHub. \
-            The repository is created with no auto-init — it will be empty until pushed to. \
-            If the repository already exists, returns its URL with a note.".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Repository name (e.g. 'my-new-project')"
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Repository description (optional)"
-                },
-                "private": {
-                    "type": "boolean",
-                    "description": "Whether the repository should be private (default: false)"
-                }
+#[tokio::main]
+async fn main() -> Result<()> {
+    let tools: Vec<McpToolEntry> = vec![
+        McpToolEntry {
+            def: McpToolDef {
+                name: "create_github_repo".to_string(),
+                description:
+                    "CREATE a new repository under the nexuslbs organization on GitHub. \
+                    The repository is created with no auto-init — it will be empty until pushed to. \
+                    If the repository already exists, returns its URL with a note."
+                        .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Repository name (e.g. 'my-new-project')"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Repository description (optional)"
+                        },
+                        "private": {
+                            "type": "boolean",
+                            "description": "Whether the repository should be private (default: false)"
+                        }
+                    },
+                    "required": ["name"]
+                }),
             },
-            "required": ["name"]
-        }),
-        handler: Arc::new(|args: Value, _ctx: AppContext| -> Result<McpToolResult> {
-            handle_create_github_repo(&args)
-        }),
-    }
-}
+            handler: Box::new(handle_create_github_repo),
+        },
+        McpToolEntry {
+            def: McpToolDef {
+                name: "clone_repo".to_string(),
+                description:
+                    "CLONE a git repository to the local filesystem. \
+                    If no target directory is specified, it defaults to the repository name. \
+                    If the directory already exists with a .git folder, returns success with a note."
+                        .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "Git clone URL (HTTPS or SSH)"
+                        },
+                        "dir": {
+                            "type": "string",
+                            "description": "Target directory for the clone (optional, defaults to repo name)"
+                        }
+                    },
+                    "required": ["url"]
+                }),
+            },
+            handler: Box::new(handle_clone_repo),
+        },
+        McpToolEntry {
+            def: McpToolDef {
+                name: "commit_and_push".to_string(),
+                description:
+                    "STAGE, COMMIT, and PUSH changes to GitHub. \
+                    Stages all changes by default, or specific files if 'files' is provided. \
+                    If there's nothing to commit, returns success with a note. \
+                    Authentication is handled internally via GitHub App installation token."
+                        .to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repo_dir": {
+                            "type": "string",
+                            "description": "Path to the git repository"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Commit message"
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Specific files to stage (optional, defaults to all changes)"
+                        }
+                    },
+                    "required": ["repo_dir", "message"]
+                }),
+            },
+            handler: Box::new(handle_commit_and_push),
+        },
+        McpToolEntry {
+            def: McpToolDef {
+                name: "status".to_string(),
+                description:
+                    "GET the git status of a repository (branch, changes, etc.)".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repo_dir": {
+                            "type": "string",
+                            "description": "Path to the git repository"
+                        }
+                    },
+                    "required": ["repo_dir"]
+                }),
+            },
+            handler: Box::new(handle_status),
+        },
+    ];
 
-pub fn clone_repo_tool() -> McpTool {
-    McpTool {
-        name: "clone_repo".to_string(),
-        description: "CLONE a git repository to the local filesystem. \
-            If no target directory is specified, it defaults to the repository name. \
-            If the directory already exists with a .git folder, returns success with a note.".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Git clone URL (HTTPS or SSH)"
-                },
-                "dir": {
-                    "type": "string",
-                    "description": "Target directory for the clone (optional, defaults to repo name)"
-                }
-            },
-            "required": ["url"]
-        }),
-        handler: Arc::new(|args: Value, _ctx: AppContext| -> Result<McpToolResult> {
-            handle_clone_repo(&args)
-        }),
-    }
-}
+    let server_info = ServerInfo {
+        name: "mcp-server-git".to_string(),
+        version: "0.1.0".to_string(),
+    };
 
-pub fn commit_and_push_tool() -> McpTool {
-    McpTool {
-        name: "commit_and_push".to_string(),
-        description: "STAGE, COMMIT, and PUSH changes to GitHub. \
-            Stages all changes by default, or specific files if 'files' is provided. \
-            If there's nothing to commit, returns success with a note. \
-            Authentication is handled internally via GitHub App installation token.".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "repo_dir": {
-                    "type": "string",
-                    "description": "Path to the git repository"
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Commit message"
-                },
-                "files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Specific files to stage (optional, defaults to all changes)"
-                }
-            },
-            "required": ["repo_dir", "message"]
-        }),
-        handler: Arc::new(|args: Value, _ctx: AppContext| -> Result<McpToolResult> {
-            handle_commit_and_push(&args)
-        }),
-    }
-}
-
-pub fn status_tool() -> McpTool {
-    McpTool {
-        name: "status".to_string(),
-        description: "GET the git status of a repository (branch, changes, etc.)".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "repo_dir": {
-                    "type": "string",
-                    "description": "Path to the git repository"
-                }
-            },
-            "required": ["repo_dir"]
-        }),
-        handler: Arc::new(|args: Value, _ctx: AppContext| -> Result<McpToolResult> {
-            handle_status(&args)
-        }),
-    }
+    run_server(server_info, tools).await
 }

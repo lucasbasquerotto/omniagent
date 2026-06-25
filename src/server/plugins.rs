@@ -39,7 +39,7 @@ struct ApiResponse<T: Serialize> {
 }
 
 impl<T: Serialize> ApiResponse<T> {
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     fn ok(data: T) -> Json<Self> {
         Json(Self {
             success: true,
@@ -50,7 +50,7 @@ impl<T: Serialize> ApiResponse<T> {
 }
 
 /// Helper to create an error response for list/detail endpoints.
-#[expect(dead_code)]
+#[allow(dead_code)]
 fn err_response(msg: impl Into<String>) -> Json<ApiResponse<serde_json::Value>> {
     Json(ApiResponse {
         success: false,
@@ -60,8 +60,8 @@ fn err_response(msg: impl Into<String>) -> Json<ApiResponse<serde_json::Value>> 
 }
 
 /// Build the plugin management router, reusing the main server's state.
-#[expect(dead_code)]
-pub fn plugin_router() -> Router<Arc<AppState>> {
+#[allow(dead_code)]
+pub(crate) fn plugin_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/plugins", get(list_plugins_handler))
         .route("/api/plugins/{name}", get(get_plugin_handler))
@@ -79,7 +79,7 @@ pub fn plugin_router() -> Router<Arc<AppState>> {
 // ---------------------------------------------------------------------------
 
 /// GET /api/plugins — list all plugins (with health/enriched data).
-pub async fn list_plugins_handler(
+pub(crate) async fn list_plugins_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     match plugin::list_plugins(&state.pool).await {
@@ -102,7 +102,7 @@ pub async fn list_plugins_handler(
 }
 
 /// GET /api/plugins/:name — get single plugin detail.
-pub async fn get_plugin_handler(
+pub(crate) async fn get_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -131,7 +131,7 @@ pub async fn get_plugin_handler(
 }
 
 /// POST /api/plugins/:name/config — update plugin config.
-pub async fn update_config_handler(
+pub(crate) async fn update_config_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateConfigRequest>,
@@ -207,7 +207,7 @@ pub async fn update_config_handler(
 }
 
 /// POST /api/plugins/:name/enable — set status to 'enabled'.
-pub async fn enable_plugin_handler(
+pub(crate) async fn enable_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -238,7 +238,7 @@ pub async fn enable_plugin_handler(
 }
 
 /// POST /api/plugins/:name/disable — set status to 'disabled'.
-pub async fn disable_plugin_handler(
+pub(crate) async fn disable_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -269,7 +269,7 @@ pub async fn disable_plugin_handler(
 }
 
 /// POST /api/plugins/:name/reinstall — re-scan from disk and reload.
-pub async fn reinstall_plugin_handler(
+pub(crate) async fn reinstall_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -310,7 +310,7 @@ pub async fn reinstall_plugin_handler(
 }
 
 /// POST /api/plugins/:name/refresh-models — refresh dynamic model list from external API.
-pub async fn refresh_models_handler(
+pub(crate) async fn refresh_models_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -347,7 +347,7 @@ pub async fn refresh_models_handler(
 }
 
 /// DELETE /api/plugins/:name — remove from registry and files.
-pub async fn delete_plugin_handler(
+pub(crate) async fn delete_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -378,7 +378,7 @@ pub async fn delete_plugin_handler(
 }
 
 /// POST /api/plugins/install-url — install a plugin from a URL.
-pub async fn install_url_handler(
+pub(crate) async fn install_url_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<InstallUrlRequest>,
 ) -> impl IntoResponse {

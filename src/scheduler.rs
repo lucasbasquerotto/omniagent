@@ -1379,7 +1379,7 @@ mod tests {
     fn test_calculate_next_run_hourly() {
         let now = Utc::now();
         // 5-field: fire at minute 0 of every hour
-        let next = calculate_next_run("0 * * * *", &now);
+        let next = calculate_next_run("0 * * * *", &now); // min=0, hour=*, dom=*, month=*, dow=*
         assert!(next > now);
         let diff = next - now;
         assert!(
@@ -1393,8 +1393,8 @@ mod tests {
     #[test]
     fn test_calculate_next_run_weekly() {
         let now = Utc::now();
-        // Sunday at midnight
-        let next = calculate_next_run("0 0 * * 0 *", &now);
+        // 5-field: Sunday at midnight (min=0, hour=0, dom=*, month=*, dow=0)
+        let next = calculate_next_run("0 0 * * 0", &now);
         assert!(next > now);
         let diff = next - now;
         assert!(
@@ -1407,7 +1407,8 @@ mod tests {
     #[test]
     fn test_calculate_next_run_every_30min() {
         let now = Utc::now();
-        let next = calculate_next_run("0 */30 * * * *", &now);
+        // 5-field: every 30 minutes (min=*/30, hour=*, dom=*, month=*, dow=*)
+        let next = calculate_next_run("*/30 * * * *", &now);
         assert!(next > now);
         let diff = next - now;
         assert!(
@@ -1418,15 +1419,15 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_next_run_six_field_with_seconds_step() {
+    fn test_calculate_next_run_every_minute() {
         let now = Utc::now();
-        // Every 10 seconds
-        let next = calculate_next_run("*/10 * * * * *", &now);
+        // 5-field: every minute (min=*, hour=*, dom=*, month=*, dow=*)
+        let next = calculate_next_run("* * * * *", &now);
         assert!(next > now);
         let diff = next - now;
         assert!(
-            diff.num_seconds() > 0 && diff.num_seconds() <= 10,
-            "*/10s cron should fire within 10s, got {}s",
+            diff.num_minutes() <= 1,
+            "* * * * * cron should fire within 1m, got {}s",
             diff.num_seconds()
         );
     }

@@ -1,7 +1,0 @@
-{
-  "command": "/app/target/release/mcp-server-kanban",
-  "env": {
-    "DATABASE_URL": "${DATABASE_URL}",
-    "RUST_LOG": "info"
-  }
-}

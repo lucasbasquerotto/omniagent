@@ -1,8 +1,0 @@
-{
-  "command": "/app/target/release/mcp-server-memory",
-  "env": {
-    "DATABASE_URL": "${DATABASE_URL}",
-    "DATA_DIR": "${DATA_DIR}",
-    "RUST_LOG": "info"
-  }
-}

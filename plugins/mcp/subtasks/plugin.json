@@ -1,7 +1,0 @@
-{
-  "name": "subtasks",
-  "version": "0.1.0",
-  "type": "mcp",
-  "description": "Subtask management tools — add, list, update, delete, count thread subtasks",
-  "config_schema": []
-}

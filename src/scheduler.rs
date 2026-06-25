@@ -1051,7 +1051,7 @@ pub async fn fire_cron_job_by_id(
 /// - `prompt`: Optional prompt override (default: "Execute the Knowledge Pipeline according to the task template above.")
 pub async fn setup_knowledge_pipeline(
     pool: &PgPool,
-    _data_dir: &str,
+    data_dir: &str,
     schedule: Option<String>,
     prompt: Option<String>,
 ) -> Result<(), String> {
@@ -1059,8 +1059,30 @@ pub async fn setup_knowledge_pipeline(
 
     // Defaults
     let schedule = schedule.unwrap_or_else(|| "0 */6 * * *".to_string());
-    let default_prompt = "# Knowledge Pipeline\n\nYou have only 10 iterations. Follow exactly in order.\n\n## Step 1 (iteration 1)\nquery_database({\"operation\": \"query\", \"sql\": \"SELECT id, name FROM channels WHERE closed = false;\"})\n\n## Step 2 (iteration 2)\nquery_database({\"operation\": \"query\", \"sql\": \"SELECT channel_id, COUNT(*)::int as cnt FROM summaries GROUP BY channel_id;\"})\n\n## Step 3 (iteration 3)\nquery_database({\"operation\": \"query\", \"sql\": \"SELECT id, profile FROM threads WHERE status='completed' AND created_at > NOW() - INTERVAL '7 days';\"})\n\n## Step 4 (iteration 4)\nactions_relevance_indexer — call directly, no inputs needed.\n\n## Step 5 (iteration 5)\nactions_hindsight_populator — call directly, no inputs needed. If it fails, continue to Step 6.\n\n## Step 6 (iterations 6-10)\nProduce a brief summary of the 3 query results + the 2 actions called.\n\n## CRITICAL RULES\n- Do NOT use: search_thread_messages, search_channel_prompts, search_messages, filesystem_list, search_wiki, manage_subtasks\n- Only 10 iterations total. Budget them tightly.\n- If a query fails, retry ONCE. If still fails, skip and continue.\n- After all steps, output the final summary. That is your last action.".to_string();
-    let prompt = prompt.unwrap_or(default_prompt);
+
+    // Read prompt from template file, with fallback
+    let prompt = prompt.or_else(|| {
+        let path = format!("{}/profiles/default/templates/knowledge-pipeline.md", data_dir);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    tracing::info!("[knowledge-pipeline] Loaded template from {}", path);
+                    Some(trimmed)
+                } else {
+                    tracing::warn!("[knowledge-pipeline] Template file {} is empty, using fallback", path);
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[knowledge-pipeline] Could not read template {}: {}, using fallback", path, e);
+                None
+            }
+        }
+    }).unwrap_or_else(|| {
+        // Fallback prompt — keep the agent functional even without the template file
+        "# Knowledge Pipeline\n\nYou have only 10 iterations. Follow exactly in order.\n\n## Step 1 (iteration 1)\nquery_database({\"operation\": \"query\", \"sql\": \"SELECT id, name FROM channels WHERE closed = false;\"})\n\n## Step 2 (iteration 2)\nquery_database({\"operation\": \"query\", \"sql\": \"SELECT channel_id, COUNT(*)::int as cnt FROM summaries GROUP BY channel_id;\"})\n\n## Step 3 (iteration 3)\nquery_database({\"operation\": \"query\", \"sql\": \"SELECT id, profile FROM threads WHERE status='completed' AND created_at > NOW() - INTERVAL '7 days';\"})\n\n## Step 4 (iteration 4)\nactions_relevance_indexer — call directly, no inputs needed.\n\n## Step 5 (iteration 5)\nactions_hindsight_populator — call directly, no inputs needed. If it fails, continue to Step 6.\n\n## Step 6 (iterations 6-10)\nProduce a brief summary of the 3 query results + the 2 actions called.\n\n## CRITICAL RULES\n- Do NOT use: search_thread_messages, search_channel_prompts, search_messages, filesystem_list, search_wiki, manage_subtasks\n- Only 10 iterations total. Budget them tightly.\n- If a query fails, retry ONCE. If still fails, skip and continue.\n- After all steps, output the final summary. That is your last action.".to_string()
+    });
 
     let existing = sqlx::query_scalar::<_, String>(
         r#"SELECT id FROM cron_jobs WHERE name = 'knowledge-pipeline' LIMIT 1"#,
@@ -1096,8 +1118,6 @@ pub async fn setup_knowledge_pipeline(
     tracing::info!("[knowledge-pipeline] Created cron job with id={}", id);
     Ok(())
 }
-
-/// Ensure the knowledge-pipeline.md template file exists on disk.
 
 #[cfg(test)]
 mod tests {

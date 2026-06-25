@@ -554,11 +554,11 @@ fn default_params() -> serde_json::Value {
 
 // ── Action handlers ──
 
-/// GET /actions — list all saved actions.
+/// GET /actions — list all saved actions (from YAML).
 async fn list_actions_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    match queries::list_actions(&state.pool).await {
+    match crate::actions::load_actions(&state.data_dir) {
         Ok(actions) => Json(serde_json::json!(actions)),
         Err(e) => {
             error!("Failed to list actions: {:?}", e);
@@ -567,12 +567,12 @@ async fn list_actions_handler(
     }
 }
 
-/// POST /actions — create a new action.
+/// POST /actions — create a new action (writes to YAML).
 async fn create_action_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateActionRequest>,
 ) -> impl IntoResponse {
-    match queries::create_action(&state.pool, &body.name, &body.tool_name, &body.params).await {
+    match crate::actions::add_action(&state.data_dir, &body.name, &body.tool_name, &body.params) {
         Ok(action) => (StatusCode::CREATED, Json(serde_json::json!(action))).into_response(),
         Err(e) => {
             error!("Failed to create action: {:?}", e);
@@ -585,17 +585,17 @@ async fn create_action_handler(
     }
 }
 
-/// PUT /actions/:id — update an action.
+/// PUT /actions/:id — update an action (writes to YAML).
 async fn update_action_handler(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateActionRequest>,
 ) -> impl IntoResponse {
-    match queries::update_action(&state.pool, &id, &body.name, &body.tool_name, &body.params).await {
+    match crate::actions::update_action(&state.data_dir, &id, &body.tool_name, &body.params) {
         Ok(action) => Json(serde_json::json!(action)).into_response(),
         Err(e) => {
             error!("Failed to update action {}: {:?}", id, e);
-            if e.to_string().contains("no rows") {
+            if e.to_string().contains("not found") {
                 (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({ "error": format!("Action '{}' not found", id) })),
@@ -612,13 +612,13 @@ async fn update_action_handler(
     }
 }
 
-/// DELETE /actions/:id — delete an action.
+/// DELETE /actions/:id — delete an action (removes from YAML).
 async fn delete_action_handler(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     // First check if the action exists and is builtin
-    match queries::get_action(&state.pool, &id).await {
+    match crate::actions::get_action(&state.data_dir, &id) {
         Ok(Some(action)) => {
             if action.is_builtin {
                 return (
@@ -646,9 +646,9 @@ async fn delete_action_handler(
     }
 
     // Proceed with deletion
-    match queries::delete_action(&state.pool, &id).await {
-        Ok(count) if count > 0 => (StatusCode::NO_CONTENT, "".to_string()).into_response(),
-        Ok(_) => (
+    match crate::actions::delete_action(&state.data_dir, &id) {
+        Ok(true) => (StatusCode::NO_CONTENT, "".to_string()).into_response(),
+        Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("Action '{}' not found", id) })),
         )
@@ -664,13 +664,13 @@ async fn delete_action_handler(
     }
 }
 
-/// POST /actions/:id/run — execute an action by calling its MCP tool.
+/// POST /actions/:id/run — execute an action by calling its MCP tool (reads from YAML).
 async fn run_action_handler(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    // 1. Look up the action
-    let action = match queries::get_action(&state.pool, &id).await {
+    // 1. Look up the action from YAML
+    let action = match crate::actions::get_action(&state.data_dir, &id) {
         Ok(Some(a)) => a,
         Ok(None) => {
             return Json(serde_json::json!({

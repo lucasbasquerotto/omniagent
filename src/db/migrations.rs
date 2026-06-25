@@ -14,6 +14,7 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     phase_10_fix_thread_causes(pool).await?;
     phase_11_rename_tool_result_msg_type(pool).await?;
     phase_12_migrate_user_role(pool).await?;
+    phase_13_migrate_actions_to_yaml(pool).await?;
     Ok(())
 }
 
@@ -1094,5 +1095,47 @@ async fn phase_12_migrate_user_role(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+/// Phase 13: Migrate actions from DB to YAML file.
+/// Drops FK on cron_jobs.action_id and drops the actions table.
+async fn phase_13_migrate_actions_to_yaml(pool: &PgPool) -> Result<()> {
+    // 1. Check if the actions table still exists
+    let table_exists: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'actions')"#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(());
+    }
+
+    // 2. Drop the FK constraint on cron_jobs.action_id first
+    sqlx::query(
+        r#"
+        DO $$ BEGIN
+            IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cron_jobs_action_id_fkey') THEN
+                ALTER TABLE cron_jobs DROP CONSTRAINT cron_jobs_action_id_fkey;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // 3. Drop the actions table
+    sqlx::query(r#"DROP TABLE IF EXISTS actions;"#)
+        .execute(pool)
+        .await?;
+
+    // 4. Drop the actions_id_seq sequence
+    sqlx::query(r#"DROP SEQUENCE IF EXISTS actions_id_seq;"#)
+        .execute(pool)
+        .await?;
+
+    tracing::info!("[migration] Phase 13 complete: actions table dropped, FK removed");
     Ok(())
 }

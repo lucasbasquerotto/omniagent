@@ -459,7 +459,8 @@ async fn resolve_and_execute_action(
             (name, r)
         }
         other => {
-            match queries::get_action(ctx.pool, other).await {
+            // Read from YAML instead of DB
+            match crate::actions::get_action(ctx.data_dir, other) {
                 Ok(Some(action)) => {
                     let call = McpToolCall {
                         id: String::new(),
@@ -475,7 +476,7 @@ async fn resolve_and_execute_action(
                     (action.name, r)
                 }
                 Ok(None) => (other.to_string(), Err(format!("Action '{}' not found", other))),
-                Err(e) => (other.to_string(), Err(format!("DB lookup failed: {:#}", e))),
+                Err(e) => (other.to_string(), Err(format!("YAML lookup failed: {:#}", e))),
             }
         }
     }

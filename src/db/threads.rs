@@ -55,7 +55,7 @@ pub async fn set_thread_system(pool: &PgPool, thread_id: i64) -> anyhow::Result<
 
 /// Set a thread's status to 'failed' (terminal — action execution failure).
 /// These threads should never be picked up by the executor.
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub async fn set_thread_failed(pool: &PgPool, thread_id: i64) -> anyhow::Result<()> {
     sql_forge!(
         "UPDATE threads SET status = 'failed', terminal = true WHERE id = :id",

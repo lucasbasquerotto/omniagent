@@ -10,6 +10,7 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     phase_6_vector_and_secrets(pool).await?;
     phase_7_seed_actions(pool).await?;
     phase_8_iteration_number(pool).await?;
+    phase_9_cron_schedule_5_field(pool).await?;
     Ok(())
 }
 
@@ -990,5 +991,32 @@ async fn phase_8_iteration_number(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Phase 9: Migrate cron schedules to 5-field Linux format (min hour dom month dow).
+/// Deactivates all existing schedules and strips the seconds field from any
+/// old 6-field expressions (old format: sec min hour dom month dow).
+async fn phase_9_cron_schedule_5_field(pool: &PgPool) -> Result<()> {
+    // 1. Deactivate all existing cron jobs — users must explicitly re-enable
+    sqlx::query(r#"UPDATE cron_jobs SET active = false, updated_at = NOW() WHERE active = true;"#)
+        .execute(pool)
+        .await?;
+
+    // 2. Strip the first field (seconds) from any 6-field cron expressions.
+    //    Old 6-field format: "sec min hour dom month dow" → 5-field: "min hour dom month dow"
+    //    Uses string manipulation: find schedule values with exactly 5 spaces (6 fields)
+    //    and remove everything before the first space.
+    sqlx::query(
+        r#"
+        UPDATE cron_jobs
+        SET schedule = SUBSTRING(schedule FROM POSITION(' ' IN schedule) + 1),
+            updated_at = NOW()
+        WHERE schedule ~ '^[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+$'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

@@ -10,7 +10,7 @@ pub struct AgentConfig {
     pub llm_provider: String,
     pub max_tokens: u32,
     pub temperature: f32,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub summarize_after_days: u32,
     /// Max iterations for threads with no planning mode (complexity-based).
     pub max_iterations_no_plan: u32,
@@ -34,7 +34,7 @@ pub struct AgentConfig {
     /// Soft char budget for the prompt. When exceeded, condense every STATE_BLOCK_UPDATE_INTERVAL turns.
     pub prompt_char_budget_soft: usize,
     /// Hard char budget for the prompt. When exceeded, condense before ANY LLM call to bring below soft.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub prompt_char_budget_hard: usize,
     /// Max chars for old messages after condensation (metadata block stays).
     pub old_message_char_budget: usize,

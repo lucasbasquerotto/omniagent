@@ -273,7 +273,7 @@ pub struct DeliverParams {
 
 /// Result of a deliver operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub struct DeliverResult {
     pub delivered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,7 +294,7 @@ pub struct EditParams {
 
 /// Result of an edit_message operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub struct EditResult {
     pub edited: bool,
 }
@@ -312,7 +312,7 @@ pub struct DeleteParams {
 
 /// Result of a delete_message operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub struct DeleteResult {
     pub deleted: bool,
 }
@@ -363,7 +363,7 @@ pub fn build_deliver_request(id: u64, params: &DeliverParams) -> String {
 }
 
 /// Build an edit_message request JSON string.
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub fn build_edit_request(id: u64, params: &EditParams) -> String {
     let req = PluginRequest {
         id: Some(id),
@@ -374,7 +374,7 @@ pub fn build_edit_request(id: u64, params: &EditParams) -> String {
 }
 
 /// Build a delete_message request JSON string.
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub fn build_delete_request(id: u64, params: &DeleteParams) -> String {
     let req = PluginRequest {
         id: Some(id),
@@ -406,7 +406,7 @@ pub static PLATFORM_CLIENT_REGISTRY: Lazy<Mutex<HashMap<String, client::External
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Register an external platform client for health checks and diagnostics.
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub fn register_platform_client(name: &str, client: client::ExternalPlatformClient) {
     if let Ok(mut registry) = PLATFORM_CLIENT_REGISTRY.lock() {
         registry.insert(name.to_string(), client);

@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "name": "metrics",
+      "transport": "stdio",
+      "command": "./target/release/mcp-server-metrics",
+      "args": [],
+      "timeout_secs": 60,
+      "max_retries": 2,
+      "allowed_tools": ["*"]
+    }
+  ]
+}

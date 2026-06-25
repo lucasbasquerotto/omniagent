@@ -52,7 +52,7 @@ impl fmt::Display for ProviderId {
 /// Provider defaults loaded from plugin manifests (plugins/providers/*/plugin.json).
 #[derive(Debug, Clone)]
 pub struct ProviderMetadata {
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub name: String,
     pub default_base_url: String,
     pub api_mode: String,
@@ -260,9 +260,9 @@ pub struct LLMConfig {
     pub api_key: String,
     pub base_url: String,
     pub model: String,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub max_tokens: u32,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub temperature: f32,
 }
 
@@ -430,7 +430,7 @@ pub struct CompletionResponse {
 /// streaming-chunk and non-streaming formats.
 #[derive(Debug, Deserialize)]
 struct OpenAiResponse {
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     id: Option<String>,
     /// `"chat.completion"` (non-streaming) or `"chat.completion.chunk"` (streaming).
     object: Option<String>,
@@ -499,7 +499,7 @@ struct AnthropicContentBlock {
     #[serde(default)]
     thinking: Option<String>,
     #[serde(default)]
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     signature: Option<String>,
 }
 

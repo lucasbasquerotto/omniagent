@@ -34,7 +34,7 @@ pub mod tools;
 /// A tool call requested by the LLM.
 #[derive(Debug, Clone)]
 pub struct McpToolCall {
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub id: String,
     pub name: String,
     pub arguments: Value,
@@ -43,7 +43,7 @@ pub struct McpToolCall {
 /// A tool execution result to send back to the LLM.
 #[derive(Debug, Clone)]
 pub struct McpToolResult {
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub call_id: String,
     pub content: String,
     pub is_error: bool,
@@ -58,7 +58,7 @@ pub struct AppContext {
     pub readonly_pool: PgPool,
     pub data_dir: String,
     /// Workspace directory for path validation (used by external MCP servers).
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub workspace_dir: String,
     pub qdrant_url: Option<String>,
     /// Read-only memory store (MEMORY.md + USER.md) for system prompt injection.
@@ -174,7 +174,7 @@ impl McpRegistry {
     }
 
     /// Build all tools for OpenAI format.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub fn to_openai_tools_all(&self) -> Vec<Value> {
         self.all()
             .iter()
@@ -197,52 +197,11 @@ pub fn default_registry(ctx: &AppContext) -> McpRegistry {
     let mut registry = McpRegistry::new();
 
     // ── Built-in tools are loaded from external MCP servers via plugins/mcp/ ──
-    // The following tools have been externalized to subprocess MCP servers:
-    //   fetch, filesystem, docker-compose, skills
+    // All DB-dependent tools have been externalized to subprocess MCP servers:
+    //   fetch, filesystem, docker-compose, skills (Python stdio)
+    //   cron, kanban, search, memory, git, query, metrics, subtasks, plugin-manager (Rust stdio)
     // External servers are auto-discovered via load_servers_config() below.
-
-    // Search tools (DB-dependent — stay as built-in until externalized)
-    registry.register(tools::search::search_messages_tool(ctx));
-    registry.register(tools::search::search_wiki_tool(ctx));
-
-    // Kanban tools (DB-dependent)
-    registry.register(tools::kanban::create_kanban_task_tool());
-    registry.register(tools::kanban::list_kanban_tasks_tool());
-    registry.register(tools::kanban::update_kanban_task_tool());
-    registry.register(tools::kanban::delete_kanban_task_tool());
-    registry.register(tools::kanban::add_kanban_dependency_tool());
-    registry.register(tools::kanban::remove_kanban_dependency_tool());
-
-    // Cron tools (DB-dependent)
-    registry.register(tools::cron::create_cron_job_tool());
-    registry.register(tools::cron::list_cron_jobs_tool());
-    registry.register(tools::cron::delete_cron_job_tool());
-    registry.register(tools::cron::update_cron_job_tool());
-
-    // Memory tools (DB-dependent)
-    registry.register(tools::memory::promote_to_memory_tool());
-    registry.register(tools::memory::list_memories_tool());
-    registry.register(tools::memory::review_memories_tool());
-    registry.register(tools::memory::manage_memory_tool());
-
-    // Metrics tool (DB-dependent)
-    registry.register(tools::metrics::get_metrics_tool());
-
-    // Database query tool (DB-dependent)
-    registry.register(tools::query::query_database_tool(ctx));
-
-    // Git/GitHub tools
-    registry.register(tools::git::create_github_repo_tool());
-    registry.register(tools::git::clone_repo_tool());
-    registry.register(tools::git::commit_and_push_tool());
-    registry.register(tools::git::status_tool());
-
-    // Plugin management tool
-    registry.register(tools::plugin_manager::plugin_manager_tool());
-
-    // Thread subtask management tool
-    registry.register(tools::subtasks::manage_subtasks_tool());
-
+    // The only remaining built-in tools are system actions that call internal Rust functions.
     // Actions tools (built-in system actions)
     for action_tool in crate::mcp::tools::actions::tools() {
         registry.register(action_tool);

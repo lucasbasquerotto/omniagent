@@ -1,0 +1,22 @@
+{
+  "id": "mcp-server-search",
+  "name": "Search MCP Server",
+  "version": "0.1.0",
+  "description": "Search messages and wiki content",
+  "type": "mcp",
+  "entrypoint": "mcp-server-search",
+  "config_schema": [
+    {
+      "key": "DATABASE_URL",
+      "label": "Database URL",
+      "type": "secret",
+      "required": true
+    },
+    {
+      "key": "DATA_DIR",
+      "label": "Data directory",
+      "type": "string",
+      "required": true
+    }
+  ]
+}

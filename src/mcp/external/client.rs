@@ -30,7 +30,7 @@ pub enum CircuitState {
     /// Too many failures — requests are blocked.
     Open,
     /// Healing period — one test request is allowed.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     HalfOpen,
 }
 
@@ -97,7 +97,7 @@ impl CircuitBreaker {
 
 /// Health status of an external MCP server.
 #[derive(Debug, Clone)]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub struct ServerHealth {
     pub connected: bool,
     pub tool_count: usize,
@@ -120,7 +120,7 @@ pub trait McpServerClient: Send + Sync {
     /// Get the server's display name.
     fn name(&self) -> &str;
     /// Check server health.
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     fn health(&self) -> ServerHealth;
     /// Convert external tools to McpTool instances with a circuit-breaking wrapper.
     fn to_mcp_tools(&mut self) -> Vec<McpTool> {
@@ -137,7 +137,7 @@ pub trait McpServerClient: Send + Sync {
         let mut result = Vec::with_capacity(tools.len());
 
         for t in tools {
-            let name = format!("{}_{}", server_name, t.name);
+            let name = t.name.clone();
             let schema = convert_input_schema(&t.input_schema);
             let description = format!("[external:{}] {}", server_name, t.description);
             let circuit = circuit.clone();

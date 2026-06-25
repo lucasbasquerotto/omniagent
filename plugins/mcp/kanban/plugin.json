@@ -1,0 +1,16 @@
+{
+  "id": "mcp-server-kanban",
+  "name": "Kanban MCP Server",
+  "version": "0.1.0",
+  "description": "Kanban task management — create, list, update, delete tasks and dependencies",
+  "type": "mcp",
+  "entrypoint": "mcp-server-kanban",
+  "config_schema": [
+    {
+      "key": "DATABASE_URL",
+      "label": "Database URL",
+      "type": "secret",
+      "required": true
+    }
+  ]
+}

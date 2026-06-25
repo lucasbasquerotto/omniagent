@@ -200,11 +200,11 @@ impl TryFrom<ChannelDb> for Channel {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SummaryDb {
     pub id: i64,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub channel_id: i64,
     pub next_thread_id: i64,
     pub content: String,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub created_at: Option<String>,
 }
 
@@ -214,13 +214,13 @@ pub struct SummaryDb {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SubscriptionDb {
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub id: i64,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub channel_id: i64,
     pub subscriber_platform: String,
     pub subscriber_resource: String,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub created_at: Option<String>,
 }
 
@@ -242,13 +242,13 @@ pub struct CreateThreadParams {
 /// Stats for completing a thread.
 #[derive(Debug, Clone)]
 pub struct CompleteThreadStats {
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub input_tokens: i32,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub cached_tokens: i32,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub output_tokens: i32,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub duration_ms: i32,
 }
 
@@ -283,7 +283,7 @@ pub struct CreateChannelParams {
 
 /// Old channel info returned by `update_channel_platform`.
 #[derive(Debug, Clone)]
-#[expect(dead_code)]
+#[allow(dead_code)]
 pub struct OldChannelInfo {
     pub old_platform: Option<String>,
     pub old_resource_identifier: Option<String>,
@@ -307,9 +307,9 @@ pub struct ChannelStatus {
 pub struct ChannelSeq0Message {
     pub id: i64,
     pub content: String,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub role: String,
-    #[expect(dead_code)]
+    #[allow(dead_code)]
     pub msg_type: String,
 }
 
@@ -468,7 +468,7 @@ pub struct Thread {
     pub planning_mode: String,
 }
 
-#[expect(dead_code)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadNew {
     pub cause: String,

@@ -5,23 +5,9 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-mod agent;
-mod commands;
-mod complexity;
-mod context_builder;
-mod db;
-mod llm;
-mod mcp;
-mod platform;
-mod plugin;
-mod profile;
-mod prompt_builder;
-mod relevance;
-mod hindsight_populator;
-mod scheduler;
-mod server;
-mod subtask;
-mod vectorizer;
+use omniagent::{
+    agent, db, mcp, platform, plugin, server, scheduler, vectorizer,
+};
 
 /// OmniAgent — autonomous agent system with Postgres, pgvector, MCP tools.
 

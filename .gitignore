@@ -10,3 +10,10 @@ scripts/__pycache__/
 
 # Plugin build artifacts (Rust MCP tools)
 plugins/mcp/*/target/
+
+# Moved to nexuslbs/omni-stack repo
+/plugins/providers/
+/plugins/platforms/
+/plugins/mcp/
+/backup/
+/scripts/

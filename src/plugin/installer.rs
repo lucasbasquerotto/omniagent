@@ -311,6 +311,46 @@ pub fn discover_plugins(
         }
     }
 
+    // C. Scan data_dir plugins (mounted from omni-stack): <data_dir>/plugins/<type>/<name>/plugin.json
+    // This covers providers, platforms, and MCP tools that live in omni-stack's plugins/ directory.
+    let data_plugins_base = format!("{}/plugins", data_dir);
+    if let Ok(data_plugin_entries) = std::fs::read_dir(&data_plugins_base) {
+        for entry in data_plugin_entries.flatten() {
+            let type_path = entry.path();
+            if !type_path.is_dir() {
+                continue;
+            }
+            // Skip the 'installed' subdirectory — handled by section A
+            if type_path.file_name().and_then(|n| n.to_str()) == Some("installed") {
+                continue;
+            }
+            // type_path is like plugins/providers, plugins/platforms, plugins/mcp
+            if let Ok(plugin_entries) = std::fs::read_dir(&type_path) {
+                for plugin_entry in plugin_entries.flatten() {
+                    let plugin_path = plugin_entry.path();
+                    if !plugin_path.is_dir() {
+                        continue;
+                    }
+                    let manifest_path = plugin_path.join("plugin.json");
+                    if manifest_path.exists() {
+                        let path_str = manifest_path.to_string_lossy().to_string();
+                        // Dedup against already-discovered plugins (by name)
+                        let manifest = match load_manifest(&path_str) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::warn!("Failed to load data_dir plugin manifest at {}: {:?}", path_str, e);
+                                continue;
+                            }
+                        };
+                        if !results.iter().any(|(m, _, _)| m.name == manifest.name) {
+                            results.push((manifest, "bundled".to_string(), path_str));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // After all discovery, also scan mcp-config.json files for MCP server entries
     // that aren't covered by bundled/installed plugin.json files.
     // These get synthetic manifests but won't have config_schema unless

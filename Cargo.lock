@@ -1263,6 +1263,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-server-docker-compose"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mcp-server-util",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mcp-server-fetch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mcp-server-util",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mcp-server-filesystem"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "glob",
+ "mcp-server-util",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mcp-server-git"
 version = "0.1.0"
 dependencies = [
@@ -1377,6 +1416,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+]
+
+[[package]]
+name = "mcp-server-skills"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mcp-server-util",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

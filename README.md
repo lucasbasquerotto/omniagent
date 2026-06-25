@@ -133,6 +133,7 @@ Channels represent communication endpoints. Each channel has its own state, prof
 | `current_model` | Model override (overrides profile) |
 | `closed` | Boolean (default `false`). A closed channel retains history but **won't process new messages** |
 | `readonly` | Boolean (default `false`). Protects the channel from deletion |
+| `template` | Optional template name; loaded from `profiles/<name>/templates/` and injected into **every user message** seq-0 prompt. Also acts as **default template** for Cron/Kanban tasks in this channel (task-level templates take priority) |
 
 ### Creating a Channel
 
@@ -262,8 +263,9 @@ Prompt marked as completed, processing_time_ms and token_usage set
 | `msg_type` | Description |
 |------------|-------------|
 | `message` | Standard user or assistant message |
-| `cron` | Cron-triggered message |
-| `kanban` | Kanban-triggered message |
+| `user` | User-initiated seq-0 message (cause thread root). `msg_subtype` = platform name (e.g., `telegram`) |
+| `cron` | Cron-triggered seq-0 message. `msg_subtype` = cron job name |
+| `kanban` | Kanban-triggered seq-0 message. `msg_subtype` = kanban task ID |
 | `tool` | Tool invocation |
 | `tool_result` | Tool execution result |
 | `reasoning` | LLM reasoning/thinking content |
@@ -361,6 +363,7 @@ VALUES ('cron_abc123', 'hourly-report', 'Hourly Report', '0 * * * *', 'Generate 
 | `mode` | Execution mode: `agentic` (default), `direct`, or `action` |
 | `direct_task_type` | Task type for `direct` mode (e.g., `kanban_dispatcher`) |
 | `action_id` | Action ID for `action` mode — references the `actions` table |
+| `template` | Optional template name; loaded from `profiles/<name>/templates/`. Falls back to channel's `template` if not set |
 | `enabled` | Whether the job is active |
 | `active` | Whether the job is currently claimed by a scheduler |
 

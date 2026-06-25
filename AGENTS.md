@@ -256,6 +256,31 @@ Examples:
 - `*/15 * * * *` — every 15 minutes
 - `0 9 * * 1-5` — weekdays at 9am
 
+### Channel Templates
+
+Channels can have a `template` field (TEXT, stored in `channels.template`). When set:
+
+1. **User messages**: The template name is injected into the seq-0 message metadata under `"template"`. The agent executor loads the template content from `profiles/<name>/templates/<name>.md` and injects it as a `=== Task Template ===` block into the system prompt.
+
+2. **Cron jobs**: If the cron job has no `template` set, the channel's `template` is used as fallback.
+
+3. **Kanban tasks**: If the kanban task has no `template` set, the channel's `template` is used as fallback.
+
+**Priority order**: Task-level template → channel template → no template.
+
+### Seq-0 Message Types
+
+Every thread starts with a seq-0 (cause) message. The `msg_type` and `msg_subtype` fields identify the origin:
+
+| Source | `msg_type` | `msg_subtype` | Thread `cause` |
+|--------|-----------|---------------|-----------------|
+| User message | `user` | Platform name (e.g., `telegram`) | `user` |
+| Cron job (scheduled) | `cron` | Cron job name | `system` |
+| Cron job (manual run) | `cron` | Cron job name | `user` |
+| Kanban task | `kanban` | Kanban task ID | `system` |
+
+The `msg_type` controls template loading in the executor (templates load for `user`, `cron`, and `kanban` types).
+
 ### Provider/Model Stamping and Validation
 
 **Stamping at creation time** — When any seq-0 message is created (user message, cron job, kanban ready-task), `provider` and `model` are resolved and stamped on the **thread** using this chain:

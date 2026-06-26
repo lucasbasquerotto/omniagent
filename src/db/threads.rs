@@ -264,7 +264,7 @@ pub async fn create_thread_with_cause(
 
     // 2. Get global PLANNING_MODE
     let global_mode =
-        std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_subtasks".to_string());
+        std::env::var("PLANNING_MODE").unwrap_or_else(|_| "auto_plan".to_string());
 
     // 3. Resolve planning mode (internal — uses content for complexity classification)
     let channel_pm = channel

@@ -196,7 +196,7 @@ fn get_all_setting_definitions() -> Vec<(String, String, SettingMeta)> {
         // ── Planning ──
         (
             "PLANNING_MODE".into(),
-            get_env_or_default("PLANNING_MODE", "auto_subtasks"),
+            get_env_or_default("PLANNING_MODE", "auto_plan"),
             SettingMeta {
                 field_type: "select".into(),
                 description: "How tasks are planned: Prompt Only (no plan), Auto-Plan (plan context only), or Auto-Plan + Subtasks (with step tracking and enforcement)".into(),
@@ -206,7 +206,7 @@ fn get_all_setting_definitions() -> Vec<(String, String, SettingMeta)> {
                     SettingOption { id: "auto_subtasks".into(), name: "Auto-Plan + Subtasks — enforce completion via subtasks".into() },
                 ]),
                 readonly: false,
-                default: Some("auto_subtasks".into()),
+                default: Some("auto_plan".into()),
             },
         ),
         (

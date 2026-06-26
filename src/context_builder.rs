@@ -639,7 +639,7 @@ pub async fn build_thread_context(
             });
 
             match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
                 .build()
             {
                 Ok(client) => {

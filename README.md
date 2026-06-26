@@ -495,7 +495,7 @@ $OMNI_DATA_DIR/profiles/<name>/memories/
 |----------|---------|-------------|
 | `MEMORY_MAX_CHARS` | `5000` | Maximum characters in MEMORY.md |
 | `USER_MAX_CHARS` | `1000` | Maximum characters for user-specific memory |
-| `PLANNING_MODE` | `auto_subtasks` | Global planning mode: `prompt_only`, `auto_plan`, `auto_subtasks`, or `always` |
+| `PLANNING_MODE` | `auto_plan` | Global planning mode: `prompt_only`, `auto_plan`, `auto_subtasks`, or `always` |
 | `PLANNING_COMPLEXITY_SIMPLE_MAX_CHARS` | `60` | Max chars for "simple" (greeting) classification |
 | `PLANNING_COMPLEXITY_STANDARD_MAX_CHARS` | `200` | Max chars for "standard" classification — above this triggers complex planning |
 | `PLANNING_COMPLEXITY_KEYWORDS` | (built-in list) | Comma-separated keywords that trigger complex planning |
@@ -536,7 +536,7 @@ otherwise                                                  →  auto_plan (via P
 
 **Complex messages** (action keywords: "implement", "refactor", "redesign", "migrate", "multi-step", "fix bug" OR character count > 200) → `auto_subtasks` — full decomposition.
 
-**Standard messages** (everything else) → uses the global `PLANNING_MODE` env var (default `auto_subtasks`), resolved to `auto_plan` for user-facing messages.
+**Standard messages** (everything else) → uses the global `PLANNING_MODE` env var (default `auto_plan`)
 
 ### Max Iterations Per Mode
 

@@ -18,6 +18,7 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     phase_14_channel_template_column(pool).await?;
     phase_15_drop_plugin_registry(pool).await?;
     phase_16_append_only_message_trigger(pool).await?;
+    phase_17_drop_message_provider_model(pool).await?;
     Ok(())
 }
 
@@ -1252,5 +1253,72 @@ async fn phase_16_append_only_message_trigger(pool: &PgPool) -> Result<()> {
     .await?;
 
     tracing::info!("[migration] Phase 16 complete: messages immutable — only embedding_vec is updatable");
+    Ok(())
+}
+
+/// Phase 17: Drop provider and model columns from the messages table.
+/// These fields were moved to the threads table (where they belong) in an earlier
+/// refactor — the Rust code (MessageNew, Message, MessageDb) no longer references
+/// them. The columns are now dead and can be safely removed.
+/// Provider and model are stamped on the thread at creation time and remain accessible
+/// via `threads.provider` and `threads.model`.
+/// Also updates the append-only trigger function to remove references to these columns.
+async fn phase_17_drop_message_provider_model(pool: &PgPool) -> Result<()> {
+    // Drop unused columns from the messages table
+    sqlx::query(
+        r#"
+        ALTER TABLE messages
+        DROP COLUMN IF EXISTS provider,
+        DROP COLUMN IF EXISTS model;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Update the append-only trigger function to remove provider/model checks
+    // since those columns no longer exist.
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION prevent_message_mutation()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                RAISE EXCEPTION 'messages is append-only. Deletion of messages is not permitted.';
+            END IF;
+
+            -- Allow UPDATE only if only embedding_vec changed
+            IF NEW.embedding_vec IS DISTINCT FROM OLD.embedding_vec THEN
+                IF NEW.id = OLD.id
+                   AND NEW.role IS NOT DISTINCT FROM OLD.role
+                   AND NEW.content IS NOT DISTINCT FROM OLD.content
+                   AND NEW.thread_id IS NOT DISTINCT FROM OLD.thread_id
+                   AND NEW.thread_sequence IS NOT DISTINCT FROM OLD.thread_sequence
+                   AND NEW.external_id IS NOT DISTINCT FROM OLD.external_id
+                   AND NEW.metadata IS NOT DISTINCT FROM OLD.metadata
+                   AND NEW.embedding IS NOT DISTINCT FROM OLD.embedding
+                   AND NEW.summary_text IS NOT DISTINCT FROM OLD.summary_text
+                   AND NEW.is_summary IS NOT DISTINCT FROM OLD.is_summary
+                   AND NEW.msg_type IS NOT DISTINCT FROM OLD.msg_type
+                   AND NEW.msg_subtype IS NOT DISTINCT FROM OLD.msg_subtype
+                   AND NEW.iteration_number IS NOT DISTINCT FROM OLD.iteration_number
+                   AND NEW.iteration_count IS NOT DISTINCT FROM OLD.iteration_count
+                   AND NEW.profile IS NOT DISTINCT FROM OLD.profile
+                   AND NEW.processing_time_ms IS NOT DISTINCT FROM OLD.processing_time_ms
+                   AND NEW.token_usage IS NOT DISTINCT FROM OLD.token_usage
+                   AND NEW.iterations IS NOT DISTINCT FROM OLD.iterations
+                THEN
+                    RETURN NEW;
+                END IF;
+            END IF;
+
+            RAISE EXCEPTION 'messages is immutable after insert. Only embedding_vec may be updated (by vectorizer). Other columns cannot change.';
+        END;
+        $$ LANGUAGE plpgsql;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    tracing::info!("[migration] Phase 17 complete: dropped provider/model from messages (now only on threads); trigger updated");
     Ok(())
 }

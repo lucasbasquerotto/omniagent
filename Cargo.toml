@@ -7,14 +7,9 @@ members = [
     "plugins/mcp/search",
     "plugins/mcp/memory",
     "plugins/mcp/metrics",
-    "plugins/mcp/git",
     "plugins/mcp/query",
     "plugins/mcp/plugin-manager",
     "plugins/mcp/subtasks",
-    "plugins/mcp/fetch",
-    "plugins/mcp/filesystem",
-    "plugins/mcp/docker-compose",
-    "plugins/mcp/skills",
 ]
 resolver = "2"
 

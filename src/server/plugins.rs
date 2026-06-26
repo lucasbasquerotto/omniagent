@@ -56,7 +56,13 @@ pub(crate) fn plugin_router() -> Router<Arc<AppState>> {
 pub(crate) async fn list_plugins_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match plugins_yaml::list_plugins(&state.data_dir) {
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        plugins_yaml::list_plugins(&data_dir)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task join error: {}", e)))
+    {
         Ok(details) => {
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
@@ -78,7 +84,14 @@ pub(crate) async fn get_plugin_handler(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match plugins_yaml::get_plugin(&state.data_dir, &name) {
+    let data_dir = state.data_dir.clone();
+    let name_clone = name.clone();
+    match tokio::task::spawn_blocking(move || {
+        plugins_yaml::get_plugin(&data_dir, &name_clone)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("Task join error: {}", e)))
+    {
         Ok(Some(detail)) => {
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,

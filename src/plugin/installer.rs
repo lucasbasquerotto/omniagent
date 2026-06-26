@@ -357,8 +357,25 @@ pub fn discover_plugins(
     // a plugin.json is also present under the installed/bundled paths.
     let mcp_plugin_servers = crate::mcp::external::config::discover_plugin_servers(data_dir);
     for srv in &mcp_plugin_servers {
-        // Only add if not already in results (dedup by name)
-        if !results.iter().any(|(m, _, _)| m.name == srv.name) {
+        // Dedup: check if a plugin with the same name OR from the same source directory
+        // (matching plugin.json directory name) already exists in results.
+        let already_exists = results.iter().any(|(m, _, base_path)| {
+            if m.name == srv.name {
+                return true;
+            }
+            // The mcp-config.json server name typically matches the directory name
+            // (e.g. directory "filesystem" → server name "filesystem").
+            // Check if any existing plugin's base_path directory name matches.
+            if let Some(parent_dir) = std::path::Path::new(base_path).parent() {
+                if let Some(dir_name) = parent_dir.file_name().and_then(|n| n.to_str()) {
+                    if dir_name == srv.name {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+        if !already_exists {
             let transport_str = match srv.transport {
                 crate::mcp::external::config::McpTransport::Stdio => "stdio",
                 crate::mcp::external::config::McpTransport::Http => "http",

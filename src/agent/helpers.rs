@@ -670,10 +670,24 @@ pub async fn enqueue_delivery(
         saved.content.clone()
     };
 
+    // ── Secret leak detection: scan outgoing content before delivery ──
+    let outgoing_content = {
+        let secrets = crate::safety::scan_for_secrets(&envelope_content);
+        if !secrets.is_empty() {
+            tracing::warn!(
+                "⚠️ SECRET LEAK DETECTED in message {} ({}): {:?}",
+                saved.id, saved.msg_type, secrets.iter().map(|s| s.pattern).collect::<Vec<_>>()
+            );
+            crate::safety::redact_secrets(&envelope_content)
+        } else {
+            envelope_content
+        }
+    };
+
     let envelope = OutboundEnvelope {
         message_id: saved.id,
         resource_identifier,
-        content: envelope_content,
+        content: outgoing_content,
         msg_type: saved.msg_type.clone(),
         msg_subtype: saved.msg_subtype.clone(),
         thread_id: saved.thread_id,

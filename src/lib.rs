@@ -16,6 +16,7 @@ pub mod profile;
 pub mod prompt_builder;
 pub mod relevance;
 pub mod hindsight_populator;
+pub mod safety;
 pub mod scheduler;
 pub mod server;
 pub mod subtask;

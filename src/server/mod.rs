@@ -851,6 +851,7 @@ async fn context_preview_handler(
             prompt_budget: prof.prompt_budget.unwrap_or(crate::profile::PROMPT_BUDGET_DEFAULT),
             auto_retrieval_enabled: prof.auto_retrieval_enabled,
             retrieval_aggressiveness: prof.retrieval_aggressiveness,
+            task_context: false,
         },
     ).await;
 

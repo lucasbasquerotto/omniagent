@@ -75,6 +75,11 @@ fn actions_path(data_dir: &str) -> PathBuf {
 
 // ── Load ──
 
+/// Check if an action ID is a built-in action (prefixed with "builtin_").
+pub fn is_builtin_id(id: &str) -> bool {
+    id.starts_with("builtin_")
+}
+
 /// Load all actions from the YAML file. Returns an empty vec if file doesn't exist.
 pub fn load_actions(data_dir: &str) -> Result<Vec<ActionApi>> {
     let path = actions_path(data_dir);
@@ -92,6 +97,7 @@ pub fn load_actions(data_dir: &str) -> Result<Vec<ActionApi>> {
         .filter(|(_, entry)| entry.enabled)
         .map(|(id, entry)| {
             let id_str = id.clone();
+            let is_builtin = is_builtin_id(&id_str);
             ActionApi {
                 id: id_str.clone(),
                 name: id_str,
@@ -100,13 +106,14 @@ pub fn load_actions(data_dir: &str) -> Result<Vec<ActionApi>> {
                 created_at: String::new(),
                 updated_at: String::new(),
                 enabled: entry.enabled,
-                is_builtin: false,
+                is_builtin,
             }
         })
         .collect();
 
     // Sort by id for deterministic ordering
     result.sort_by(|a, b| a.id.cmp(&b.id));
+
     Ok(result)
 }
 
@@ -126,6 +133,7 @@ pub fn load_all_actions(data_dir: &str) -> Result<Vec<ActionApi>> {
         .into_iter()
         .map(|(id, entry)| {
             let id_str = id.clone();
+            let is_builtin = is_builtin_id(&id_str);
             ActionApi {
                 id: id_str.clone(),
                 name: id_str,
@@ -134,13 +142,13 @@ pub fn load_all_actions(data_dir: &str) -> Result<Vec<ActionApi>> {
                 created_at: String::new(),
                 updated_at: String::new(),
                 enabled: entry.enabled,
-                is_builtin: false,
+                is_builtin,
             }
         })
         .collect();
 
     result.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(result) 
+    Ok(result)
 }
 
 /// Get a single action by id (only enabled).

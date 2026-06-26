@@ -444,6 +444,18 @@ pub async fn skip_channel_threads(pool: &PgPool, channel_id: i64) -> anyhow::Res
     Ok(result.rows_affected())
 }
 
+/// Skip a single pending/processing thread by setting its status to 'skipped'.
+pub async fn skip_thread(pool: &PgPool, thread_id: i64) -> anyhow::Result<u64> {
+    let result = sql_forge!(
+        "UPDATE threads SET status = 'skipped', ended_at = NOW() WHERE id = :id AND status IN ('pending', 'processing')",
+        ( :id = thread_id )
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 /// Count messages in a thread.
 pub async fn count_thread_messages(pool: &PgPool, thread_id: i64) -> anyhow::Result<i32> {
     let count: Option<i64> = sql_forge!(

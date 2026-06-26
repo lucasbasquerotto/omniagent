@@ -82,6 +82,7 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .route("/health", get(health_handler))
         .route("/stop/{channel_id}", post(stop_handler))
         .route("/stop/{channel_id}", get(stop_handler))
+        .route("/stop-thread/{thread_id}", post(stop_thread_handler))
         .route("/close/{channel_id}", post(close_handler))
         .route("/close/{channel_id}", get(close_handler))
         .route("/open/{channel_id}", post(open_handler))
@@ -120,6 +121,8 @@ pub async fn start_server(config: ServerConfig) -> Result<()> {
         .merge(secrets::secrets_router())
         // ── Cron run endpoint ──
         .route("/run-cron/{schedule_id}", post(run_cron_handler))
+        // ── Kanban history endpoint ──
+        .route("/api/kanban/history", get(list_kanban_history_handler))
         .with_state(app_state);
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -166,6 +169,32 @@ async fn stop_handler(
         "action": "stop",
         "channel_id": channel_id,
         "skipped_threads": skipped,
+    }))
+}
+
+/// Stop-thread — mark a single pending/processing thread as skipped.
+async fn stop_thread_handler(
+    Path(thread_id): Path<i64>,
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let _skipped = match queries::skip_thread(&state.pool, thread_id).await {
+        Ok(count) => {
+            info!(
+                "Stop-thread: skipped thread {} ({} rows affected)",
+                thread_id, count
+            );
+            count
+        }
+        Err(e) => {
+            error!("Stop-thread: failed to skip thread {}: {:?}", thread_id, e);
+            0
+        }
+    };
+
+    Json(serde_json::json!({
+        "action": "stop-thread",
+        "thread_id": thread_id,
+        "status": "skipped",
     }))
 }
 
@@ -373,43 +402,47 @@ async fn prompt_preview_handler(
     let system_prompt = build_system_prompt(&memory_store, platform, None, profile_name);
 
     let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": system_prompt }),
+        serde_json::json!({ "role": "system", "content": &system_prompt }),
     ];
 
-    // Add recent seq-0 messages from the same channel (last 5), if channel exists
+    // ── Build the [3] Context section using the same logic as the agent ──
+    // Uses the latest thread in the channel (if any) with the preview prompt
+    // as the cause content, so the context reflects what would actually be
+    // assembled when a real message is processed.
     if let Some(ch) = &channel {
-        match queries::get_recent_channel_seq0_messages(&state.pool, ch.id, 5).await {
-            Ok(msgs) if !msgs.is_empty() => {
-                let recent_text: String = msgs.iter().rev().map(|msg| {
-                    format!("[msg {}] {}", msg.id, msg.content.chars().take(200).collect::<String>())
-                }).collect::<Vec<_>>().join("\n");
-                messages.push(serde_json::json!({ "role": "system", "content": format!("Recent conversations in this channel:\n{}", recent_text) }));
-            }
-            _ => {}
-        }
-    }
+        if let Ok(Some(latest)) = queries::get_latest_seq0_message(&state.pool, ch.id).await {
+            if let Ok(Some(tid)) = queries::get_message_thread(&state.pool, latest.id).await {
+                let profile_registry = crate::profile::ProfileRegistry::new(&state.data_dir);
+                let prof = profile_registry.get(profile_name).cloned()
+                    .unwrap_or_else(|| crate::profile::Profile::default(profile_name));
+                let qdrant_url = std::env::var("QDRANT_URL").ok();
 
-    // Add skills from profile
-    let skills_dir = format!("{}/profiles/{}/skills", state.data_dir, profile_name);
-    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-        let mut skills = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
-                    let first_line = content.lines().next().unwrap_or("").trim();
-                    let desc = if first_line.starts_with('#') {
-                        first_line.trim_start_matches('#').trim()
-                    } else {
-                        first_line
-                    };
-                    skills.push(format!("- {}: {}", name, desc));
+                let (context_text, _meta) = crate::context_builder::build_thread_context(
+                    &state.pool,
+                    &crate::context_builder::ThreadContextIdentifiers {
+                        thread_id: tid,
+                        channel_id: ch.id,
+                        cause_msg_id: latest.id,
+                    },
+                    &crate::context_builder::ThreadContextConfig {
+                        cause_content: &body.prompt,
+                        profile_name,
+                        data_dir: &state.data_dir,
+                        qdrant_url: qdrant_url.as_deref(),
+                        prompt_budget: prof.prompt_budget.unwrap_or(crate::profile::PROMPT_BUDGET_DEFAULT),
+                        auto_retrieval_enabled: prof.auto_retrieval_enabled,
+                        retrieval_aggressiveness: prof.retrieval_aggressiveness,
+                        task_context: false,
+                    },
+                ).await;
+
+                if !context_text.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": format!("=== Additional Context ===\n{}", context_text)
+                    }));
                 }
             }
-        }
-        if !skills.is_empty() {
-            messages.push(serde_json::json!({ "role": "system", "content": format!("Available skills:\n{}", skills.join("\n")) }));
         }
     }
 
@@ -707,6 +740,7 @@ async fn list_mcp_tools_handler(
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.input_schema,
+                "server_name": tool.server_name,
             })
         })
         .collect();
@@ -856,6 +890,42 @@ async fn context_preview_handler(
     ).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "context": context_text, "timings": meta.step_timings_ms })))
+}
+
+// ── Kanban History handler ──
+
+/// GET /api/kanban/history — list kanban history with optional filters.
+async fn list_kanban_history_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<KanbanHistoryQuery>,
+) -> impl IntoResponse {
+    let db_params = crate::db::kanban::KanbanHistoryParams {
+        task_id: params.task_id.clone(),
+        action: params.action.clone(),
+        limit: params.limit,
+        offset: params.offset,
+    };
+    match crate::db::kanban::list_kanban_history(&state.pool, &db_params).await {
+        Ok(rows) => {
+            (StatusCode::OK, Json(serde_json::json!({ "success": true, "data": rows }))).into_response()
+        }
+        Err(e) => {
+            error!("Failed to list kanban history: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": format!("Failed to list kanban history: {}", e) })),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KanbanHistoryQuery {
+    task_id: Option<String>,
+    action: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[cfg(test)]

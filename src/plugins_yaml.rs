@@ -306,10 +306,10 @@ fn resolve_env_var(value: &str) -> String {
 fn builtin_mcp_manifests() -> Vec<PluginManifest> {
     vec![
         PluginManifest {
-            name: "actions_kanban_dispatcher".to_string(),
+            name: "kanban_dispatcher".to_string(),
             version: "1.0.0".to_string(),
             plugin_type: PluginType::Mcp,
-            description: Some("Trigger the kanban dispatcher — picks up pending kanban tasks and creates agent threads for them.".to_string()),
+            description: Some("Process pending kanban tasks: move 'todo' tasks to 'ready' by creating threads and messages.".to_string()),
             entrypoint: None,
             capabilities: None,
             config_schema: vec![],
@@ -318,10 +318,10 @@ fn builtin_mcp_manifests() -> Vec<PluginManifest> {
             api_mode: None,
         },
         PluginManifest {
-            name: "actions_relevance_indexer".to_string(),
+            name: "relevance_indexer".to_string(),
             version: "1.0.0".to_string(),
             plugin_type: PluginType::Mcp,
-            description: Some("Trigger the relevance indexer — scans wiki files and updates the relevant-index.md based on recency and reference count.".to_string()),
+            description: Some("Update the wiki relevance index. Scans wiki files and updates Qdrant vector index entries.".to_string()),
             entrypoint: None,
             capabilities: None,
             config_schema: vec![],
@@ -330,10 +330,10 @@ fn builtin_mcp_manifests() -> Vec<PluginManifest> {
             api_mode: None,
         },
         PluginManifest {
-            name: "actions_hindsight_populator".to_string(),
+            name: "hindsight_populator".to_string(),
             version: "1.0.0".to_string(),
             plugin_type: PluginType::Mcp,
-            description: Some("Trigger the hindsight populator — queries recent messages from the database and retains them into the omniagent-hindsight persistent memory store for future recall.".to_string()),
+            description: Some("Retain recent messages into Hindsight memory for long-term recall.".to_string()),
             entrypoint: None,
             capabilities: None,
             config_schema: vec![],
@@ -342,10 +342,10 @@ fn builtin_mcp_manifests() -> Vec<PluginManifest> {
             api_mode: None,
         },
         PluginManifest {
-            name: "actions_setup_knowledge_pipeline".to_string(),
+            name: "setup_knowledge_pipeline".to_string(),
             version: "1.0.0".to_string(),
             plugin_type: PluginType::Mcp,
-            description: Some("Create the Knowledge Pipeline cron job (idempotent). Sets up a periodic maintenance pipeline that summarizes channels, updates wiki/skills from thread messages, runs relevance indexing, and populates hindsight memory.".to_string()),
+            description: Some("Create or verify the periodic knowledge pipeline cron job.".to_string()),
             entrypoint: None,
             capabilities: None,
             config_schema: vec![],
@@ -360,18 +360,40 @@ fn builtin_mcp_manifests() -> Vec<PluginManifest> {
 pub fn is_builtin_mcp_tool(name: &str) -> bool {
     matches!(
         name,
-        "actions_kanban_dispatcher"
-            | "actions_relevance_indexer"
-            | "actions_hindsight_populator"
-            | "actions_setup_knowledge_pipeline"
+        "kanban_dispatcher"
+            | "relevance_indexer"
+            | "hindsight_populator"
+            | "setup_knowledge_pipeline"
     )
 }
 
 /// Build a `PluginDetail` from a disk manifest and YAML state.
+/// Extract the YAML key for a plugin from its discovery path.
+///
+/// For sourced plugins (installed/bundled), the key is the parent directory name
+/// of the plugin.json file. For mcp_config and built-in sources, the manifest name
+/// itself is the key.
+fn extract_plugin_key(manifest: &PluginManifest, source: &str, base_path: &str) -> String {
+    match source {
+        "mcp_config" | "built-in" => manifest.name.clone(),
+        _ => {
+            // Extract key from base_path parent directory name
+            // e.g., "/opt/data/plugins/mcp/docker-compose/plugin.json" → "docker_compose"
+            if let Some(parent) = std::path::Path::new(base_path).parent() {
+                if let Some(dir_name) = parent.file_name().and_then(|n| n.to_str()) {
+                    return dir_name.replace('-', "_");
+                }
+            }
+            manifest.name.clone()
+        }
+    }
+}
+
 fn build_plugin_detail(
     manifest: &PluginManifest,
     source: &str,
     yaml_entry: Option<&PluginYamlEntry>,
+    key: Option<&str>,
 ) -> PluginDetail {
     let enabled = yaml_entry
         .map(|e| e.enabled)
@@ -438,14 +460,25 @@ fn build_plugin_detail(
         PluginType::Provider => "provider",
     };
 
+    // Determine the display key: use the explicit key if provided, fall back to manifest name
+    let display_key = key.unwrap_or(&manifest.name).to_string();
+
+    // Inject the manifest's name as the label for subtitle display
+    let mut manifest_value = serde_json::to_value(manifest).unwrap_or_default();
+    if let Some(obj) = manifest_value.as_object_mut() {
+        if !obj.contains_key("label") {
+            obj.insert("label".to_string(), serde_json::json!(manifest.name));
+        }
+    }
+
     PluginDetail {
         id: 0,
-        name: manifest.name.clone(),
+        name: display_key,
         plugin_type: plugin_type_str.to_string(),
         version: manifest.version.clone(),
         source: Some(source.to_string()),
         status: if enabled { "enabled".to_string() } else { "disabled".to_string() },
-        manifest: serde_json::to_value(manifest).unwrap_or_default(),
+        manifest: manifest_value,
         config,
         config_schema,
         resolved_env: resolved,
@@ -471,7 +504,7 @@ pub fn list_plugins(data_dir: &str) -> Result<Vec<PluginDetail>> {
 
     let mut results: Vec<PluginDetail> = Vec::new();
 
-    for (manifest, source, _base_path) in &discovered {
+    for (manifest, source, base_path) in &discovered {
         let yaml_type = PluginYamlType::from_plugin_type(&manifest.plugin_type);
         let yaml_entry = match yaml_type {
             PluginYamlType::Platform => platform_entries.get(&manifest.name),
@@ -479,7 +512,8 @@ pub fn list_plugins(data_dir: &str) -> Result<Vec<PluginDetail>> {
             PluginYamlType::Provider => provider_entries.get(&manifest.name),
         };
 
-        results.push(build_plugin_detail(manifest, source, yaml_entry));
+        let key = extract_plugin_key(manifest, source, base_path);
+        results.push(build_plugin_detail(manifest, source, yaml_entry, Some(&key)));
     }
 
     // Inject built-in action tools (compiled into omniagent, no disk plugin.json)
@@ -490,6 +524,7 @@ pub fn list_plugins(data_dir: &str) -> Result<Vec<PluginDetail>> {
                 &manifest,
                 "built-in",
                 yaml_entry,
+                Some(&manifest.name),
             ));
         }
     }
@@ -510,7 +545,7 @@ pub fn get_plugin(data_dir: &str, name: &str) -> Result<Option<PluginDetail>> {
     let tool_entries = load_raw(data_dir, &PluginYamlType::Tool)?;
     let provider_entries = load_raw(data_dir, &PluginYamlType::Provider)?;
 
-    for (manifest, source, _base_path) in &discovered {
+    for (manifest, source, base_path) in &discovered {
         if manifest.name == name {
             let yaml_type = PluginYamlType::from_plugin_type(&manifest.plugin_type);
             let yaml_entry = match yaml_type {
@@ -518,7 +553,8 @@ pub fn get_plugin(data_dir: &str, name: &str) -> Result<Option<PluginDetail>> {
                 PluginYamlType::Tool => tool_entries.get(&manifest.name),
                 PluginYamlType::Provider => provider_entries.get(&manifest.name),
             };
-            return Ok(Some(build_plugin_detail(manifest, source, yaml_entry)));
+            let key = extract_plugin_key(manifest, source, base_path);
+            return Ok(Some(build_plugin_detail(manifest, source, yaml_entry, Some(&key))));
         }
     }
 
@@ -531,6 +567,7 @@ pub fn get_plugin(data_dir: &str, name: &str) -> Result<Option<PluginDetail>> {
                     &manifest,
                     "built-in",
                     yaml_entry,
+                    Some(&manifest.name),
                 )));
             }
         }

@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use mcp_server_util::*;
 use omniagent::db;
 use serde_json::Value;
+use unicode_normalization::UnicodeNormalization;
 use sql_forge::sql_forge;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
@@ -34,6 +35,35 @@ struct KanbanTaskRow {
     template: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+}
+
+// ---------------------------------------------------------------------------
+// Kanban history helper
+// ---------------------------------------------------------------------------
+
+/// Insert a history record via a direct sqlx query.
+async fn insert_history(
+    pool: &PgPool,
+    task_id: &str,
+    action: &str,
+    initial_board: Option<&str>,
+    final_board: Option<&str>,
+    previous_values: Option<serde_json::Value>,
+) -> Result<()> {
+    db::kanban::insert_kanban_history(pool, task_id, action, initial_board, final_board, previous_values)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to insert kanban history: {e}"))
+}
+
+/// Build a JSON with the current task fields for previous_values.
+fn task_to_json(task: &KanbanTaskRow) -> serde_json::Value {
+    serde_json::json!({
+        "title": task.title,
+        "body": task.body,
+        "status": task.status,
+        "priority": task.priority,
+        "assignee": task.assignee,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -66,12 +96,29 @@ async fn handle_create(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
         ));
     }
 
-    let id = format!("task_{:x}", {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    });
+    // Generate a human-readable id from the title: lowercase, strip diacritics,
+    // replace non-alphanumeric with "-", prefix "task_", suffix "_<unix_timestamp>"
+    // Use NFD decomposition so accented chars like "é" become "e" + combining mark,
+    // then we keep only ASCII lowercase letters and digits.
+    let slug_base: String = title
+        .chars()
+        .flat_map(|c| c.to_lowercase())
+        .collect::<String>()
+        .nfd()
+        .collect::<String>()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        .collect::<String>();
+    let slug = if slug_base.is_empty() {
+        "task".to_string()
+    } else {
+        slug_base
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let id = format!("task_{}_{}", slug, ts);
 
     // Resolve channel_id: if not provided, find the default cron channel
     let resolved_channel_id = if let Some(cid) = channel_id_arg {
@@ -96,6 +143,9 @@ async fn handle_create(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create kanban task: {}", e))?;
 
+    // ── Kanban history: record creation ──
+    insert_history(pool, &id, "created", None, Some(status), None).await?;
+
     Ok((format!("Kanban task '{}' created with id '{}' and status '{}'", title, id, status), false))
 }
 
@@ -104,37 +154,19 @@ async fn handle_create(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
 // ---------------------------------------------------------------------------
 
 async fn handle_list(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
-    let status_filter = args["status"].as_str().map(|s| s.to_string());
+    let _status_filter = args["status"].as_str().map(|s| s.to_string());
 
-    let result: Vec<KanbanTaskRow> = if let Some(ref status) = status_filter {
-        sql_forge!(
-            KanbanTaskRow,
-            r#"
-            SELECT id, display_id, title, body, status, priority, assignee, template, created_at, updated_at
-            FROM kanban_tasks
-            WHERE status = :status
-            ORDER BY priority DESC, created_at DESC
-            "#,
-            ( :status = status )
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to list kanban tasks: {}", e))?
-    } else {
-        sql_forge!(
-            KanbanTaskRow,
-            r#"
-            SELECT id, display_id, title, body, status, priority, assignee, template, created_at, updated_at
-            FROM kanban_tasks
-            WHERE 1 = :_one
-            ORDER BY status, priority DESC, created_at DESC
-            "#,
-            ( :_one = 1i32 )
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to list kanban tasks: {}", e))?
-    };
+    let result: Vec<KanbanTaskRow> = sql_forge!(
+        KanbanTaskRow,
+        r#"
+        SELECT id, display_id, title, body, status, priority, assignee, template, created_at, updated_at
+        FROM kanban_tasks
+        ORDER BY status, priority DESC, created_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to list kanban tasks: {e}"))?;
 
     if result.is_empty() {
         return Ok(("_No kanban tasks found._".to_string(), false));
@@ -195,26 +227,29 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
 
     let id_clone = id.to_string();
 
-    // Check task exists
-    let exists: bool = sql_forge!(
-        scalar i64,
-        "SELECT COUNT(*) FROM kanban_tasks WHERE id = :id",
-        ( :id = &id_clone )
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to check task existence: {e}"))?
-        > 0;
+    // Fetch the task before update to record previous_values
+    let before = db::kanban::get_kanban_task(pool, &id_clone).await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch task before update: {e}"))?;
 
-    if !exists {
-        anyhow::bail!("Kanban task '{id_clone}' not found");
-    }
+    let before_row = match before {
+        Some(t) => t,
+        None => anyhow::bail!("Kanban task '{id_clone}' not found"),
+    };
 
-    // Apply individual UPDATEs per provided field
+    let old_status = before_row.status.clone();
+    let old_title = before_row.title.clone();
+    let old_body = before_row.body.clone();
+    let old_priority = before_row.priority;
+    let old_assignee = before_row.assignee.clone();
+
+    // Build previous_values JSON from the fields that will be updated
+    let mut changed_fields = serde_json::Map::new();
+
     if let Some(title) = args["title"].as_str() {
         if title.is_empty() {
             anyhow::bail!("Task title must not be empty");
         }
+        changed_fields.insert("title".to_string(), serde_json::json!(&old_title));
         sql_forge!(
             "UPDATE kanban_tasks SET title = :val, updated_at = NOW() WHERE id = :id",
             ( :val = title, :id = &id_clone )
@@ -225,6 +260,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("body").is_some() {
         let body = args["body"].as_str().unwrap_or("");
+        changed_fields.insert("body".to_string(), serde_json::json!(&old_body));
         sql_forge!(
             "UPDATE kanban_tasks SET body = :val, updated_at = NOW() WHERE id = :id",
             ( :val = body, :id = &id_clone )
@@ -238,6 +274,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
         if !valid_statuses.contains(&status) {
             anyhow::bail!("Invalid status '{status}'");
         }
+        changed_fields.insert("status".to_string(), serde_json::json!(&old_status));
         sql_forge!(
             "UPDATE kanban_tasks SET status = :val, updated_at = NOW() WHERE id = :id",
             ( :val = status, :id = &id_clone )
@@ -248,6 +285,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("priority").is_some() {
         let priority = args["priority"].as_i64().unwrap_or(0) as i32;
+        changed_fields.insert("priority".to_string(), serde_json::json!(old_priority));
         sql_forge!(
             "UPDATE kanban_tasks SET priority = :val, updated_at = NOW() WHERE id = :id",
             ( :val = priority, :id = &id_clone )
@@ -258,6 +296,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("assignee").is_some() {
         let assignee = args["assignee"].as_str().unwrap_or("");
+        changed_fields.insert("assignee".to_string(), serde_json::json!(&old_assignee));
         sql_forge!(
             "UPDATE kanban_tasks SET assignee = :val, updated_at = NOW() WHERE id = :id",
             ( :val = assignee, :id = &id_clone )
@@ -286,6 +325,55 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to update profile: {e}"))?;
     }
+    // Handle archive/unarchive via the "archived" field
+    if let Some(archived) = args["archived"].as_bool() {
+        sql_forge!(
+            "UPDATE kanban_tasks SET archived = :val, updated_at = NOW() WHERE id = :id",
+            ( :val = archived, :id = &id_clone )
+        )
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to update archived: {e}"))?;
+    }
+
+    // ── Kanban history ──
+    let previous_json = if changed_fields.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(changed_fields))
+    };
+
+    // Determine the action type
+    let new_status = args["status"].as_str();
+    let archived = args["archived"].as_bool();
+
+    if let Some(arch) = archived {
+        if arch {
+            insert_history(pool, &id_clone, "archived", None, None, previous_json).await?;
+        } else {
+            insert_history(pool, &id_clone, "unarchived", None, None, previous_json).await?;
+        }
+    } else if let Some(new_st) = new_status {
+        if new_st != old_status {
+            insert_history(
+                pool,
+                &id_clone,
+                "moved",
+                Some(&old_status),
+                Some(new_st),
+                previous_json,
+            )
+            .await?;
+        } else {
+            // Same status, other fields changed — log as "edited"
+            if previous_json.is_some() {
+                insert_history(pool, &id_clone, "edited", None, None, previous_json).await?;
+            }
+        }
+    } else if previous_json.is_some() {
+        // Other field changes without status change
+        insert_history(pool, &id_clone, "edited", None, None, previous_json).await?;
+    }
 
     Ok((format!("Kanban task '{}' updated successfully", id), false))
 }
@@ -300,6 +388,9 @@ async fn handle_delete(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
         .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'id'"))?;
 
     let id_clone = id.to_string();
+
+    // ── Kanban history: record deletion before deleting ──
+    insert_history(pool, &id_clone, "deleted", None, None, None).await?;
 
     let deleted = sql_forge!(
         "DELETE FROM kanban_tasks WHERE id = :id",
@@ -413,24 +504,40 @@ async fn main() -> Result<()> {
 
     // Wrap each handler to capture a clone of the pool
     let p_create = pool.clone();
-    let create_handler: ToolHandler = Box::new(move |args: Value| Box::pin(async move { handle_create(&p_create, &args).await }));
+    let create_handler: ToolHandler = Box::new(move |args: Value| {
+        let p = p_create.clone();
+        Box::pin(async move { handle_create(&p, &args).await })
+    });
 
     let p_list = pool.clone();
-    let list_handler: ToolHandler = Box::new(move |args: Value| Box::pin(async move { handle_list(&p_list, &args).await }));
+    let list_handler: ToolHandler = Box::new(move |args: Value| {
+        let p = p_list.clone();
+        Box::pin(async move { handle_list(&p, &args).await })
+    });
 
     let p_update = pool.clone();
-    let update_handler: ToolHandler = Box::new(move |args: Value| Box::pin(async move { handle_update(&p_update, &args).await }));
+    let update_handler: ToolHandler = Box::new(move |args: Value| {
+        let p = p_update.clone();
+        Box::pin(async move { handle_update(&p, &args).await })
+    });
 
     let p_delete = pool.clone();
-    let delete_handler: ToolHandler = Box::new(move |args: Value| Box::pin(async move { handle_delete(&p_delete, &args).await }));
+    let delete_handler: ToolHandler = Box::new(move |args: Value| {
+        let p = p_delete.clone();
+        Box::pin(async move { handle_delete(&p, &args).await })
+    });
 
     let p_add_dep = pool.clone();
-    let add_dep_handler: ToolHandler =
-        Box::new(move |args: Value| Box::pin(async move { handle_add_dependency(&p_add_dep, &args).await }));
+    let add_dep_handler: ToolHandler = Box::new(move |args: Value| {
+        let p = p_add_dep.clone();
+        Box::pin(async move { handle_add_dependency(&p, &args).await })
+    });
 
     let p_rm_dep = pool.clone();
-    let rm_dep_handler: ToolHandler =
-        Box::new(move |args: Value| Box::pin(async move { handle_remove_dependency(&p_rm_dep, &args).await }));
+    let rm_dep_handler: ToolHandler = Box::new(move |args: Value| {
+        let p = p_rm_dep.clone();
+        Box::pin(async move { handle_remove_dependency(&p, &args).await })
+    });
 
     let tools = vec![
         McpToolEntry {
@@ -465,15 +572,15 @@ async fn main() -> Result<()> {
                         },
                         "channel_id": {
                             "type": "integer",
-                            "description": "Optional channel ID to execute this task in. If omitted, uses the default cron channel."
+                            "description": "Optional channel ID for thread/cause creation"
                         },
                         "profile": {
                             "type": "string",
-                            "description": "Optional profile name to use when executing this task. If omitted, uses the channel's current_profile."
+                            "description": "Optional profile name for the task"
                         },
                         "template": {
                             "type": "string",
-                            "description": "Optional template name to use for structured guidance when executing this task. Templates are .md files in profiles/<name>/templates/"
+                            "description": "Optional template file name (without .md) to use for execution context"
                         }
                     },
                     "required": ["title"]
@@ -484,9 +591,7 @@ async fn main() -> Result<()> {
         McpToolEntry {
             def: McpToolDef {
                 name: "list_kanban_tasks".to_string(),
-                description:
-                    "List all kanban tasks, optionally filtered by status. Returns tasks grouped by status column."
-                        .to_string(),
+                description: "List kanban tasks grouped by status.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -502,9 +607,7 @@ async fn main() -> Result<()> {
         McpToolEntry {
             def: McpToolDef {
                 name: "update_kanban_task".to_string(),
-                description:
-                    "Update a kanban task's fields (title, body, status, priority, assignee). Only provided fields are updated."
-                        .to_string(),
+                description: "Update an existing kanban task. Only provided fields are updated. Status changes are recorded in history.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -522,7 +625,8 @@ async fn main() -> Result<()> {
                         },
                         "status": {
                             "type": "string",
-                            "description": "New status. One of: backlog, todo, ready, running, review, done, blocked"
+                            "description": "New status. One of: backlog, todo, ready, running, review, done, blocked",
+                            "enum": ["backlog", "todo", "ready", "running", "review", "done", "blocked"]
                         },
                         "priority": {
                             "type": "integer",
@@ -534,11 +638,15 @@ async fn main() -> Result<()> {
                         },
                         "channel_id": {
                             "type": "integer",
-                            "description": "Optional channel ID to execute this task in. If omitted, keeps existing value."
+                            "description": "New channel ID"
                         },
                         "profile": {
                             "type": "string",
-                            "description": "Optional profile name to use when executing this task. If omitted, keeps existing value."
+                            "description": "New profile name"
+                        },
+                        "archived": {
+                            "type": "boolean",
+                            "description": "Set to true to archive, false to unarchive"
                         }
                     },
                     "required": ["id"]
@@ -549,7 +657,7 @@ async fn main() -> Result<()> {
         McpToolEntry {
             def: McpToolDef {
                 name: "delete_kanban_task".to_string(),
-                description: "Delete a kanban task by its ID.".to_string(),
+                description: "Delete a kanban task. The deletion is recorded in history.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -566,9 +674,7 @@ async fn main() -> Result<()> {
         McpToolEntry {
             def: McpToolDef {
                 name: "add_kanban_dependency".to_string(),
-                description:
-                    "Add a dependency from one kanban task to another. The dependent task will only proceed from todo to ready when the dependency is done or archived."
-                        .to_string(),
+                description: "Add a dependency between two kanban tasks.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -589,19 +695,17 @@ async fn main() -> Result<()> {
         McpToolEntry {
             def: McpToolDef {
                 name: "remove_kanban_dependency".to_string(),
-                description:
-                    "Remove a dependency between two kanban tasks."
-                        .to_string(),
+                description: "Remove a dependency between two kanban tasks.",
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "task_id": {
                             "type": "string",
-                            "description": "The dependent task"
+                            "description": "The task that depends on another"
                         },
                         "depends_on_id": {
                             "type": "string",
-                            "description": "The task it no longer depends on"
+                            "description": "The task that must be completed first"
                         }
                     },
                     "required": ["task_id", "depends_on_id"]
@@ -611,10 +715,6 @@ async fn main() -> Result<()> {
         },
     ];
 
-    let server_info = ServerInfo {
-        name: "mcp-server-kanban".to_string(),
-        version: "0.1.0".to_string(),
-    };
-
-    run_server(server_info, tools).await
+    // Start the MCP server
+    McpServer::new(tools).run().await
 }

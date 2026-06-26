@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "db-migrations",
     "plugins/mcp/util",
     "plugins/mcp/cron",
     "plugins/mcp/kanban",
@@ -10,6 +11,7 @@ members = [
     "plugins/mcp/query",
     "plugins/mcp/plugin-manager",
     "plugins/mcp/subtasks",
+    "plugins/mcp/hindsight",
 ]
 resolver = "2"
 
@@ -53,6 +55,7 @@ base64 = "0.22"
 serde_yaml = "0.9"
 tiktoken-rs = "0.5"
 regex = "1"
+db-migrations = { path = "db-migrations" }
 
 [dev-dependencies]
 tempfile = "3"

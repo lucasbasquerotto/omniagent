@@ -474,6 +474,7 @@ pub async fn get_channel_status(pool: &PgPool, channel_id: i64) -> anyhow::Resul
 // ---------------------------------------------------------------------------
 
 /// Get the most recent seq-0 (thread root) messages for a channel.
+/// Filters out cron and kanban system messages — only user-facing conversations.
 pub async fn get_recent_channel_seq0_messages(
     pool: &PgPool,
     channel_id: i64,
@@ -486,6 +487,7 @@ pub async fn get_recent_channel_seq0_messages(
         FROM messages
         WHERE thread_id IN (SELECT id FROM threads WHERE channel_id = :channel_id)
           AND thread_sequence = 0
+          AND (msg_type IS NULL OR msg_type NOT IN ('cron', 'kanban'))
         ORDER BY created_at DESC
         LIMIT :limit
         "#,

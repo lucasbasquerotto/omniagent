@@ -11,6 +11,7 @@
 //! prefix caches warm across turns within a single tool-calling loop.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -186,20 +187,68 @@ impl MemoryStore {
     }
 
     /// Load entries from MEMORY.md and USER.md, capturing the system prompt snapshot.
+    /// Also computes SHA-256 hash of MEMORY.md and compares against an expected hash
+    /// stored in MEMORY.md.sha256 (sidecar file) — a warning is logged on mismatch.
     pub fn load_from_disk(&mut self) {
         let _ = fs::create_dir_all(&self.memories_dir);
 
         let memory_entries = self.read_file(&self.memories_dir.join("MEMORY.md"));
         let user_entries = self.read_file(&self.memories_dir.join("USER.md"));
 
+        // Compute SHA-256 hash of the raw MEMORY.md content for integrity verification
+        let memory_path = self.memories_dir.join("MEMORY.md");
+        let (memory_hash, hash_valid) = if memory_path.exists() {
+            match fs::read_to_string(&memory_path) {
+                Ok(raw) => {
+                    let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
+                    // Compare against expected hash from sidecar file
+                    let expected = Self::read_expected_hash(&self.memories_dir.join("MEMORY.md.sha256"));
+                    let valid = expected.as_ref().map_or(true, |e| e == &hash);
+                    if !valid {
+                        tracing::warn!(
+                            "[memory] MEMORY.md hash MISMATCH: expected {}, got {}. File may have been modified externally.",
+                            expected.as_deref().unwrap_or("(none)"),
+                            hash
+                        );
+                    }
+                    (Some(hash), valid)
+                }
+                Err(e) => {
+                    tracing::warn!("[memory] Failed to read MEMORY.md for hash: {}", e);
+                    (None, true)
+                }
+            }
+        } else {
+            (None, true)
+        };
+
         self.snapshot.insert(
             "memory".to_string(),
-            self.render_block("memory", &memory_entries, memory_max_chars()),
+            self.render_block("memory", &memory_entries, memory_max_chars(), memory_hash.as_deref(), hash_valid),
         );
         self.snapshot.insert(
             "user".to_string(),
-            self.render_block("user", &user_entries, user_max_chars()),
+            self.render_block("user", &user_entries, user_max_chars(), None, true),
         );
+    }
+
+    /// Read the expected SHA-256 hash from a sidecar file.
+    fn read_expected_hash(path: &Path) -> Option<String> {
+        if !path.exists() {
+            return None;
+        }
+        fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    /// Write the current SHA-256 hash of MEMORY.md to the sidecar file.
+    /// Should be called whenever MEMORY.md is updated (via the update_memory tool).
+    pub fn write_expected_hash(&self) {
+        let path = self.memories_dir.join("MEMORY.md.sha256");
+        let memory_path = self.memories_dir.join("MEMORY.md");
+        if let Ok(raw) = fs::read_to_string(&memory_path) {
+            let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
+            let _ = fs::write(&path, &hash);
+        }
     }
 
     /// Return the frozen snapshot block for the given target ("memory" or "user").
@@ -266,7 +315,7 @@ impl MemoryStore {
         }
     }
 
-    fn render_block(&self, target: &str, entries: &[String], limit: usize) -> String {
+    fn render_block(&self, target: &str, entries: &[String], limit: usize, hash: Option<&str>, hash_valid: bool) -> String {
         if entries.is_empty() {
             return String::new();
         }
@@ -297,8 +346,14 @@ impl MemoryStore {
                 format_thousands(limit)
             )
         } else {
+            let hash_status = match hash {
+                Some(h) if !hash_valid => format!(" ⚠️ HASH MISMATCH ({})", &h[..12]),
+                Some(h) => format!(" [{}]", &h[..12]),
+                None => String::new(),
+            };
             format!(
-                "MEMORY (your personal notes) [{}% — {}/{} chars]",
+                "MEMORY (your personal notes){} [{}% — {}/{} chars]",
+                hash_status,
                 pct,
                 format_thousands(effective),
                 format_thousands(limit)

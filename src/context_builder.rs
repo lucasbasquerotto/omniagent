@@ -307,6 +307,10 @@ pub struct ThreadContextConfig<'a> {
     pub auto_retrieval_enabled: bool,
     /// How aggressively to perform retrieval (0 = disabled, 1 = text only, 2+ = text + semantic).
     pub retrieval_aggressiveness: u8,
+    /// If true, only include skill-related context blocks (no conversation history,
+    /// no summaries, no hindsight recall). Used for template-backed autonomous tasks
+    /// where the template IS the primary context.
+    pub task_context: bool,
 }
 
 /// Assemble the [3] Context section — all context blocks that would be injected
@@ -340,72 +344,76 @@ pub async fn build_thread_context(
     };
 
     // Add recent thread messages as a high-priority context block
-    let _start_recent = Instant::now();
-    match queries::get_recent_thread_messages(pool, ids.thread_id, 10).await {
-        Ok(recent_msgs) => {
-            if !recent_msgs.is_empty() {
-                let thread_content: String = recent_msgs
-                    .iter()
-                    .rev() // oldest first
-                    .filter(|m| m.id != ids.cause_msg_id) // exclude the current cause message
-                    .map(|m| format!("[{}]: {}", m.role, m.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !thread_content.is_empty() {
-                    builder.add_block(ContextBlock::new(
-                        "recent_thread_messages",
-                        BlockPriority::High,
-                        &format!("Recent conversation history (current thread):\n{}", thread_content),
-                        2_500,
-                    ));
+    // Skipped in task_context mode — template-backed tasks don't need conversation history
+    if !config.task_context {
+        let _start_recent = Instant::now();
+        match queries::get_recent_thread_messages(pool, ids.thread_id, 10).await {
+            Ok(recent_msgs) => {
+                if !recent_msgs.is_empty() {
+                    let thread_content: String = recent_msgs
+                        .iter()
+                        .rev() // oldest first
+                        .filter(|m| m.id != ids.cause_msg_id) // exclude the current cause message
+                        .map(|m| format!("[{}]: {}", m.role, m.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !thread_content.is_empty() {
+                        builder.add_block(ContextBlock::new(
+                            "recent_thread_messages",
+                            BlockPriority::High,
+                            &format!("Recent conversation history (current thread):\n{}", thread_content),
+                            2_500,
+                        ));
+                    }
                 }
             }
+            Err(e) => {
+                tracing::warn!("Failed to retrieve thread context: {:?}", e);
+            }
         }
-        Err(e) => {
-            tracing::warn!("Failed to retrieve thread context: {:?}", e);
-        }
+        timings.insert("recent_thread_messages".to_string(), _start_recent.elapsed().as_millis() as u64);
     }
 
-    timings.insert("recent_thread_messages".to_string(), _start_recent.elapsed().as_millis() as u64);
     let _start_summary = Instant::now();
     // Add last summary for this channel as high-priority context
-    match queries::get_latest_summary(pool, ids.channel_id).await {
-        Ok(Some(summary)) => {
-            builder.add_block(ContextBlock::new(
-                "last_summary",
-                BlockPriority::High,
-                &format!(
-                    "Previous channel summary (covers threads up to id={}):\n{}",
-                    summary.next_thread_id, summary.content
-                ),
-                4_000,
-            ));
+    // Skipped in task_context mode — autonomous tasks don't need channel summaries
+    if !config.task_context {
+        match queries::get_latest_summary(pool, ids.channel_id).await {
+            Ok(Some(summary)) => {
+                builder.add_block(ContextBlock::new(
+                    "last_summary",
+                    BlockPriority::High,
+                    &format!(
+                        "Previous channel summary (covers threads up to id={}):\n{}",
+                        summary.next_thread_id, summary.content
+                    ),
+                    4_000,
+                ));
 
-            // Also include threads completed after the last summary, if any
-            match queries::get_completed_seq0_threads_since(pool, ids.channel_id, summary.next_thread_id, 5).await {
-                Ok(roots) if !roots.is_empty() => {
-                    let roots_content: String = roots
-                        .iter()
-                        .map(|t| format!("[Thread #{} by {}]: cause message available", t.id, t.cause))
-                        .collect::<Vec<_>>()
-                        .join("\n---\n");
-                    builder.add_block(ContextBlock::new(
-                        "recent_thread_roots_since_summary",
-                        BlockPriority::Normal,
-                        &format!("Recent threads (after last summary):\n{}", roots_content),
-                        2_000,
-                    ));
+                // Also include threads completed after the last summary, if any
+                match queries::get_completed_seq0_threads_since(pool, ids.channel_id, summary.next_thread_id, 5).await {
+                    Ok(roots) if !roots.is_empty() => {
+                        let roots_content: String = roots
+                            .iter()
+                            .map(|t| format!("[Thread #{} by {}]: cause message available", t.id, t.cause))
+                            .collect::<Vec<_>>()
+                            .join("\n---\n");
+                        builder.add_block(ContextBlock::new(
+                            "recent_thread_roots_since_summary",
+                            BlockPriority::Normal,
+                            &format!("Recent threads (after last summary):\n{}", roots_content),
+                            2_000,
+                        ));
+                    }
+                    _ => {}
                 }
-                _ => {}
+            }
+            _ => {
+                // No summary yet for this channel — OK, just skip
             }
         }
-        _ => {
-            // No summary yet for this channel — OK, just skip
-        }
+        timings.insert("last_summary".to_string(), _start_summary.elapsed().as_millis() as u64);
     }
-
-    // Add profile skills as context
-    timings.insert("last_summary".to_string(), _start_summary.elapsed().as_millis() as u64);
     let _start_skills = Instant::now();
     let skills_dir = format!("{}/profiles/{}/skills", config.data_dir, config.profile_name);
     match tokio::task::spawn_blocking(move || -> Vec<String> {

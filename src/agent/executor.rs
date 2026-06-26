@@ -287,7 +287,8 @@ pub async fn process_thread(
                 qdrant_url: cfg.ctx.qdrant_url.as_deref(),
                 prompt_budget: prof.prompt_budget.unwrap_or(crate::profile::PROMPT_BUDGET_DEFAULT),
                 auto_retrieval_enabled: prof.auto_retrieval_enabled,
-                retrieval_aggressiveness: prof.retrieval_aggressiveness,
+                retrieval_aggressiveness: if template_section.is_some() { prof.retrieval_aggressiveness.min(1) } else { prof.retrieval_aggressiveness },
+                task_context: template_section.is_some(),
             },
         ).await;
         ctx_assembly_meta = Some(meta);
@@ -493,17 +494,21 @@ pub async fn process_thread(
         ChatMessage::system(&system_prompt),
     ];
 
+    // Inject task template FIRST (right after system prompt) — highest instruction priority
+    // for template-backed tasks (kanban/cron with template).
+    // Flush-left position ensures the template guides the model before any other context.
+    if let Some(ref template_section) = template_section {
+        messages.push(ChatMessage::system(template_section));
+    }
+
     // Inject subtask context section if the thread has active subtasks
     if let Some(ref subtask_section) = subtask_section {
         messages.push(ChatMessage::system(subtask_section));
     }
 
-    // Inject task template if the thread has a template from kanban/cron metadata
-    if let Some(ref template_section) = template_section {
-        messages.push(ChatMessage::system(template_section));
-    }
-
     // Add context blocks as system messages (before the user message)
+    // For template-backed tasks (kanban/cron with template), skip conversation context
+    // (recent messages, summaries, hindsight recall) — the template IS the context.
     if !context_messages.is_empty() {
         messages.push(ChatMessage::system(&format!(
             "=== Additional Context ===\n{}",

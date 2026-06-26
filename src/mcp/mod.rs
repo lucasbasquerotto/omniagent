@@ -137,12 +137,36 @@ impl McpRegistry {
         self.tools.values().collect()
     }
 
-    /// Get tools allowed for a given profile.
+    /// Priority ranking for tool ordering — execution tools first, management tools last.
+    fn tool_priority(name: &str) -> u8 {
+        if name.starts_with("filesystem") {
+            0
+        } else if name.starts_with("docker") {
+            1
+        } else if name.starts_with("query_") || name == "fetch" {
+            2
+        } else if name.starts_with("search_") || name.starts_with("manage_subtask") {
+            3
+        } else if name == "plugin_manager" || name == "list_plugins" || name == "get_plugin" {
+            5
+        } else if name.starts_with("kanban") || name.starts_with("cron") {
+            10
+        } else if name.starts_with("commit_and_push") || name.starts_with("create_github") || name.starts_with("clone_repo") {
+            0
+        } else {
+            4
+        }
+    }
+
+    /// Get tools allowed for a given profile, sorted by execution priority.
     pub fn allowed(&self, allowed_names: &[String]) -> Vec<&McpTool> {
-        self.tools
+        let mut tools: Vec<&McpTool> = self
+            .tools
             .values()
             .filter(|t| allowed_names.contains(&t.name))
-            .collect()
+            .collect();
+        tools.sort_by_key(|t| Self::tool_priority(&t.name));
+        tools
     }
 
     /// Get the qualified name for a tool: `server_name:name` if it has a server,

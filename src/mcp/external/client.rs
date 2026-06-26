@@ -45,6 +45,8 @@ struct CircuitStateInner {
     state: CircuitState,
     consecutive_failures: u32,
     max_retries: u32,
+    /// When the circuit was opened (std::time::Instant ticks). None when closed.
+    opened_at: Option<std::time::Instant>,
 }
 
 impl CircuitBreaker {
@@ -54,15 +56,33 @@ impl CircuitBreaker {
                 state: CircuitState::Closed,
                 consecutive_failures: 0,
                 max_retries,
+                opened_at: None,
             })),
         }
     }
 
     /// Check if a request is allowed. Returns true if the circuit is closed
     /// or half-open (allowing a test request).
+    /// Automatically transitions Open → HalfOpen after a 30-second cooldown.
     pub fn is_allowed(&self) -> bool {
-        let inner = self.state.lock().expect("circuit state lock poisoned");
-        matches!(inner.state, CircuitState::Closed | CircuitState::HalfOpen)
+        let mut inner = self.state.lock().expect("circuit state lock poisoned");
+        match inner.state {
+            CircuitState::Closed | CircuitState::HalfOpen => true,
+            CircuitState::Open => {
+                // Auto-recover after cooldown: transition to HalfOpen
+                if let Some(opened) = inner.opened_at {
+                    if opened.elapsed() >= std::time::Duration::from_secs(30) {
+                        inner.state = CircuitState::HalfOpen;
+                        tracing::info!(
+                            "Circuit breaker transitioning Open → HalfOpen after {}s cooldown",
+                            opened.elapsed().as_secs()
+                        );
+                        return true;
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// Record a successful request — resets failure count.
@@ -70,6 +90,7 @@ impl CircuitBreaker {
         let mut inner = self.state.lock().expect("circuit state lock poisoned");
         inner.consecutive_failures = 0;
         inner.state = CircuitState::Closed;
+        inner.opened_at = None;
     }
 
     /// Record a failed request. Opens the circuit if max retries exceeded.
@@ -78,8 +99,9 @@ impl CircuitBreaker {
         inner.consecutive_failures += 1;
         if inner.consecutive_failures >= inner.max_retries {
             inner.state = CircuitState::Open;
+            inner.opened_at = Some(std::time::Instant::now());
             tracing::warn!(
-                "Circuit breaker opened after {} consecutive failures",
+                "Circuit breaker opened after {} consecutive failures (will recover after 30s cooldown)",
                 inner.consecutive_failures
             );
         }

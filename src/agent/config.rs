@@ -171,9 +171,10 @@ impl AgentConfig {
                 .parse()
                 .unwrap_or(5),
             condense_keep_turns: std::env::var("CONDENSE_KEEP_TURNS")
-                .unwrap_or_else(|_| "2".to_string())
+                .unwrap_or_else(|_| "4".to_string())
                 .parse()
-                .unwrap_or(2),
+                .unwrap_or(4)
+                .max(1),
             
             // Token-based budgets (use tiktoken for accurate counting)
             prompt_token_budget_soft: std::env::var("PROMPT_TOKEN_BUDGET_SOFT")

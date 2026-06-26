@@ -133,7 +133,7 @@ pub trait McpServerClient: Send + Sync {
         };
 
         let server_name = self.name().to_string();
-        let circuit = Arc::new(CircuitBreaker::new(3));
+        let circuit = Arc::new(CircuitBreaker::new(20));
         let mut result = Vec::with_capacity(tools.len());
 
         for t in tools {

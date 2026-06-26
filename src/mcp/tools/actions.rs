@@ -1,5 +1,8 @@
-//! Built-in "actions" tool — triggers system actions like kanban dispatcher,
-//! relevance indexer, and hindsight populator.
+//! Built-in action tools — each system action is its own MCP tool
+//! instead of a single "actions" tool with a command parameter.
+//!
+//! Tools: actions:kanban_dispatcher, actions:relevance_indexer,
+//!        actions:hindsight_populator, actions:setup_knowledge_pipeline
 
 use anyhow::Result;
 use serde_json::Value;
@@ -7,7 +10,8 @@ use std::sync::Arc;
 
 use crate::mcp::{AppContext, McpTool, McpToolResult};
 
-/// Returns the list of built-in action tools.
+/// Returns 4 separate MCP tools, one per system action.
+/// Each has server_name="actions" so qualified names become "actions:<name>".
 pub fn tools() -> Vec<McpTool> {
     vec![
         kanban_dispatcher_tool(),
@@ -19,15 +23,15 @@ pub fn tools() -> Vec<McpTool> {
 
 fn kanban_dispatcher_tool() -> McpTool {
     McpTool {
-        name: "actions_kanban_dispatcher".to_string(),
-        description: "Trigger the kanban dispatcher — picks up pending kanban tasks and creates agent threads for them.".to_string(),
+        name: "kanban_dispatcher".to_string(),
+        description: "Process pending kanban tasks: move 'todo' tasks to 'ready' by creating threads and messages, respecting dependencies and ordering by priority and position.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {},
-            "required": []
+            "required": [],
         }),
-        server_name: None,
-        handler: Arc::new(|_args: Value, ctx: AppContext| -> Result<McpToolResult> {
+        server_name: Some("actions".to_string()),
+        handler: Arc::new(|_: Value, ctx: AppContext| -> Result<McpToolResult> {
             let pool = ctx.pool.clone();
             let data_dir = ctx.data_dir.clone();
             tokio::spawn(async move {
@@ -36,7 +40,7 @@ fn kanban_dispatcher_tool() -> McpTool {
                 }
             });
             Ok(McpToolResult {
-                call_id: "".to_string(),
+                call_id: String::new(),
                 content: "Kanban dispatcher triggered".to_string(),
                 is_error: false,
             })
@@ -46,15 +50,15 @@ fn kanban_dispatcher_tool() -> McpTool {
 
 fn relevance_indexer_tool() -> McpTool {
     McpTool {
-        name: "actions_relevance_indexer".to_string(),
-        description: "Trigger the relevance indexer — scans wiki files and updates the relevant-index.md based on recency and reference count.".to_string(),
+        name: "relevance_indexer".to_string(),
+        description: "Update the wiki relevance index. Scans wiki files and updates Qdrant vector index entries.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {},
-            "required": []
+            "required": [],
         }),
-        server_name: None,
-        handler: Arc::new(|_args: Value, ctx: AppContext| -> Result<McpToolResult> {
+        server_name: Some("actions".to_string()),
+        handler: Arc::new(|_: Value, ctx: AppContext| -> Result<McpToolResult> {
             let pool = ctx.pool.clone();
             let data_dir = ctx.data_dir.clone();
             tokio::spawn(async move {
@@ -63,7 +67,7 @@ fn relevance_indexer_tool() -> McpTool {
                 }
             });
             Ok(McpToolResult {
-                call_id: "".to_string(),
+                call_id: String::new(),
                 content: "Relevance indexer triggered".to_string(),
                 is_error: false,
             })
@@ -73,15 +77,15 @@ fn relevance_indexer_tool() -> McpTool {
 
 fn hindsight_populator_tool() -> McpTool {
     McpTool {
-        name: "actions_hindsight_populator".to_string(),
-        description: "Trigger the hindsight populator — queries recent messages from the database and retains them into the omniagent-hindsight persistent memory store for future recall.".to_string(),
+        name: "hindsight_populator".to_string(),
+        description: "Retain recent messages into Hindsight memory. Queries new messages since the last watermark and sends them to the hindsight memory server for long-term persistent recall.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {},
-            "required": []
+            "required": [],
         }),
-        server_name: None,
-        handler: Arc::new(|_args: Value, ctx: AppContext| -> Result<McpToolResult> {
+        server_name: Some("actions".to_string()),
+        handler: Arc::new(|_: Value, ctx: AppContext| -> Result<McpToolResult> {
             let pool = ctx.pool.clone();
             let data_dir = ctx.data_dir.clone();
             tokio::spawn(async move {
@@ -90,7 +94,7 @@ fn hindsight_populator_tool() -> McpTool {
                 }
             });
             Ok(McpToolResult {
-                call_id: "".to_string(),
+                call_id: String::new(),
                 content: "Hindsight populator triggered".to_string(),
                 is_error: false,
             })
@@ -100,23 +104,23 @@ fn hindsight_populator_tool() -> McpTool {
 
 fn setup_knowledge_pipeline_tool() -> McpTool {
     McpTool {
-        name: "actions_setup_knowledge_pipeline".to_string(),
-        description: "Create the Knowledge Pipeline cron job (idempotent). Sets up a periodic maintenance pipeline that summarizes channels, updates wiki/skills from thread messages, runs relevance indexing, and populates hindsight memory. Accepts optional schedule and prompt overrides (default: every 6 hours).".to_string(),
+        name: "setup_knowledge_pipeline".to_string(),
+        description: "Create or verify the periodic knowledge pipeline cron job. Loads the knowledge-pipeline template and runs the periodic maintenance pipeline (summarize channels, update wiki/skills, relevance indexing, hindsight populate).".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "schedule": {
                     "type": "string",
-                    "description": "Optional cron schedule expression in 5-field Linux format (minute hour day month weekday). Default: '0 */6 * * *' = every 6 hours. No leading seconds field."
+                    "description": "Optional cron schedule in 5-field Linux format. Default: '0 */6 * * *'."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Optional prompt override (default: 'Execute the Knowledge Pipeline according to the task template above.')"
+                    "description": "Optional prompt override."
                 }
             },
-            "required": []
+            "required": [],
         }),
-        server_name: None,
+        server_name: Some("actions".to_string()),
         handler: Arc::new(|args: Value, ctx: AppContext| -> Result<McpToolResult> {
             let pool = ctx.pool.clone();
             let data_dir = ctx.data_dir.clone();
@@ -125,25 +129,25 @@ fn setup_knowledge_pipeline_tool() -> McpTool {
 
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async {
-                    match crate::scheduler::setup_knowledge_pipeline(&pool, &data_dir, schedule, prompt).await {
-                        Ok(()) => {
-                            tracing::info!("[actions] Knowledge pipeline cron created/verified");
-                            Ok(McpToolResult {
-                                call_id: "".to_string(),
-                                content: "Knowledge Pipeline cron job created or already exists. It will run every 6 hours (default) to summarize channels, update wiki/skills, run relevance indexing, and populate hindsight.".to_string(),
-                                is_error: false,
-                            })
-                        }
-                        Err(e) => {
-                            tracing::error!("[actions] Knowledge pipeline setup failed: {:?}", e);
-                            Ok(McpToolResult {
-                                call_id: "".to_string(),
-                                content: format!("Failed to create Knowledge Pipeline: {}", e),
-                                is_error: true,
-                            })
-                        }
+                match crate::scheduler::setup_knowledge_pipeline(&pool, &data_dir, schedule, prompt).await {
+                    Ok(()) => {
+                        tracing::info!("[actions] Knowledge pipeline cron created/verified");
+                        Ok(McpToolResult {
+                            call_id: String::new(),
+                            content: "Knowledge Pipeline cron job created or already exists. It will run every 6 hours (default) to summarize channels, update wiki/skills, run relevance indexing, and populate hindsight.".to_string(),
+                            is_error: false,
+                        })
                     }
-                })
+                    Err(e) => {
+                        tracing::error!("[actions] Knowledge pipeline setup failed: {:?}", e);
+                        Ok(McpToolResult {
+                            call_id: String::new(),
+                            content: format!("Failed to create Knowledge Pipeline: {}", e),
+                            is_error: true,
+                        })
+                    }
+                }
+            })
         }),
     }
 }

@@ -72,7 +72,7 @@ pub struct KanbanTaskDb {
     pub template: Option<String>,
     pub archived: Option<bool>,
     pub position: Option<i32>,
-    pub channel_id: Option<String>,
+    pub channel_id: Option<i64>,
     pub planning_mode: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,

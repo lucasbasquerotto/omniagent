@@ -76,8 +76,6 @@ fn task_to_json(task: &db::kanban::KanbanTaskDb) -> serde_json::Value {
         "archived": task.archived,
         "channel_id": task.channel_id,
         "planning_mode": task.planning_mode,
-        "created_at": task.created_at.map(|t| t.to_rfc3339()),
-        "updated_at": task.updated_at.map(|t| t.to_rfc3339()),
     })
 }
 

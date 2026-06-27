@@ -87,6 +87,7 @@ pub struct KanbanHistoryRow {
     pub action: String,
     pub initial_board: Option<String>,
     pub final_board: Option<String>,
+    pub previous_values: Option<serde_json::Value>,
     pub created_at: Option<String>,
 }
 
@@ -112,6 +113,7 @@ pub async fn list_kanban_history(
         KanbanHistoryRow,
         r#"
         SELECT id, kanban_task_id, action, initial_board, final_board,
+               previous_values,
                created_at::text AS created_at
         FROM kanban_history
         WHERE (:task_id = '' OR kanban_task_id = :task_id)

@@ -27,6 +27,7 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     phase_17_drop_message_provider_model(pool).await?;
     phase_18_create_kanban_channel(pool).await?;
     phase_19_drop_threads_task_id_fk(pool).await?;
+    phase_20_backfill_kanban_created_events(pool).await?;
     Ok(())
 }
 
@@ -1336,5 +1337,27 @@ async fn phase_18_create_kanban_channel(pool: &PgPool) -> Result<()> {
     .await?;
 
     tracing::info!("[migration] Phase 18 complete: kanban channel created if not already present");
+    Ok(())
+}
+
+/// Phase 20: Backfill a "created" history event for existing kanban tasks that don't have one.
+/// Tasks created before the history logging was implemented are missing their creation event.
+async fn phase_20_backfill_kanban_created_events(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO kanban_history (kanban_task_id, action, final_board, created_at)
+        SELECT t.id, 'created', t.status, t.created_at
+        FROM kanban_tasks t
+        WHERE NOT EXISTS (
+            SELECT 1 FROM kanban_history h
+            WHERE h.kanban_task_id = t.id AND h.action = 'created'
+        )
+        AND t.created_at IS NOT NULL
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    tracing::info!("[migration] Phase 20 complete: backfilled missing 'created' history events");
     Ok(())
 }

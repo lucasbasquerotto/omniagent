@@ -38,7 +38,8 @@ use crate::db::types as queries;
 use crate::llm::{resolve_llm_api_key, ChatMessage, CompletionRequest, LLMClient};
 use crate::mcp::{AppContext, McpRegistry, McpToolCall};
 use crate::prompt_builder::{
-    build_planning_prompt, build_system_prompt, MemoryStore, PlanningPromptParams,
+    build_planning_prompt, build_system_prompt, build_system_prompt_parts,
+    MemoryStore, PlanningPromptParams,
 };
 
 mod diagnostic;
@@ -390,14 +391,54 @@ async fn prompt_handler(
         .as_ref()
         .and_then(|c| c.platform.as_deref())
         .unwrap_or("");
-    let system_prompt = build_system_prompt(&memory_store, platform, None, profile_name);
+    let parts = build_system_prompt_parts(&memory_store, platform, None, profile_name);
 
-    let result = format!(
-        "System Prompt:\n{}\n\n---\n\nMessages sent to LLM:\n\n{{\n  \"role\": \"system\",\n  \"content\": \"\"\"\n{}\n  \"\"\"\n}},\n{{\n  \"role\": \"cause\",\n  \"content\": \"<<<prompt>>>\"\n}}",
-        system_prompt, system_prompt
-    );
+    // Build system prompt TEMPLATE — stable + context + volatile placeholders
+    let mut segments: Vec<String> = Vec::new();
 
-    (StatusCode::OK, result)
+    if !parts.stable.is_empty() {
+        segments.push(parts.stable);
+    }
+    if !parts.context.is_empty() {
+        segments.push(parts.context);
+    }
+
+    // Build volatile placeholder section — memory/soul headers only, <<memory>> / <<soul>> placeholders
+    let separator = "═".repeat(46);
+    let mut locked_entries: Vec<String> = Vec::new();
+
+    if let Some(mem_block) = memory_store.format_for_system_prompt("memory") {
+        let header_line = mem_block
+            .lines()
+            .nth(1)
+            .unwrap_or("MEMORY (your personal notes)");
+        locked_entries.push(format!(
+            "{}\n{}\n{}\n\n<<memory>>",
+            separator, header_line, separator
+        ));
+    }
+
+    if let Some(user_block) = memory_store.format_for_system_prompt("user") {
+        let header_line = user_block
+            .lines()
+            .nth(1)
+            .unwrap_or("USER PROFILE (who the user is)");
+        locked_entries.push(format!(
+            "{}\n{}\n{}\n\n<<soul>>",
+            separator, header_line, separator
+        ));
+    }
+
+    if !locked_entries.is_empty() {
+        let locked_content = locked_entries.join("\n\n");
+        segments.push(format!(
+            "═══ LOCKED INSTRUCTIONS (FOLLOW EXACTLY) ═══\n{}",
+            locked_content
+        ));
+    }
+
+    let template = segments.join("\n\n");
+    (StatusCode::OK, template)
 }
 
 // ── Prompt preview endpoint ──

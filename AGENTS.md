@@ -2,6 +2,16 @@
 
 ## Guidelines
 
+### NEVER modify the database directly — always use the API
+
+**When sending messages or creating threads, NEVER use `psql`, `sqlx`, `sql_forge`, `INSERT INTO` or any other direct database modification.** Always use the HTTP API (port 3001):
+
+- `POST /api/kanban/tasks` — create a kanban task (set `status: "ready"` to trigger agent execution)
+- `POST /api/schedule` — create a cron job
+- Use `curl` against `http://localhost:12346/api/...` (dashboard proxy → omniagent)
+
+Direct DB writes bypass the agent's state machine, timestamp tracking, and error handling. The API is the single source of truth for state changes.
+
 ### SQL Queries: Always use sql_forge!()
 **Every SQL query MUST use `sql_forge!()`.** No raw `sqlx::query`, `sqlx::query_as`, or `sqlx::query_scalar` except where documented below:
 

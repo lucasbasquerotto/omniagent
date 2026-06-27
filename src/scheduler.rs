@@ -66,6 +66,25 @@ pub fn spawn(
     mcp_registry: McpRegistry,
     app_context: AppContext,
 ) -> tokio::task::JoinHandle<()> {
+    // Clear stale running flags from previous process life (crash/restart)
+    let pool2 = pool.clone();
+    tokio::spawn(async move {
+        match sqlx::query("UPDATE cron_jobs SET running = false, updated_at = NOW() WHERE running = true")
+            .execute(&pool2)
+            .await
+        {
+            Ok(res) => {
+                if res.rows_affected() > 0 {
+                    info!(
+                        "[cron-scheduler] Cleared {} stale running flag(s) from previous process life",
+                        res.rows_affected()
+                    );
+                }
+            }
+            Err(e) => error!("[cron-scheduler] Failed to clear stale running flags: {:?}", e),
+        }
+    });
+
     tokio::spawn(async move {
         info!("[cron-scheduler] Starting cron scheduler loop");
 

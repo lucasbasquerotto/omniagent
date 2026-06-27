@@ -64,14 +64,18 @@ async fn insert_history(
 }
 
 /// Build a JSON with the current task fields for previous_values.
-#[allow(dead_code)]
-fn task_to_json(task: &KanbanTaskRow) -> serde_json::Value {
+fn task_to_json(task: &db::kanban::KanbanTaskDb) -> serde_json::Value {
     serde_json::json!({
         "title": task.title,
         "body": task.body,
         "status": task.status,
         "priority": task.priority,
         "assignee": task.assignee,
+        "profile": task.profile,
+        "template": task.template,
+        "archived": task.archived,
+        "created_at": task.created_at.map(|t| t.to_rfc3339()),
+        "updated_at": task.updated_at.map(|t| t.to_rfc3339()),
     })
 }
 
@@ -255,19 +259,18 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     };
 
     let old_status = before_row.status.clone();
-    let old_title = before_row.title.clone();
-    let old_body = before_row.body.clone();
-    let old_priority = before_row.priority;
-    let old_assignee = before_row.assignee.clone();
 
-    // Build previous_values JSON from the fields that will be updated
-    let mut changed_fields = serde_json::Map::new();
+    // Build previous_values with ALL current fields before the edit
+    let all_previous = task_to_json(&before_row);
+
+    // ── Apply field updates ──
+    let mut has_field_changes = false;
 
     if let Some(title) = args["title"].as_str() {
         if title.is_empty() {
             anyhow::bail!("Task title must not be empty");
         }
-        changed_fields.insert("title".to_string(), serde_json::json!(&old_title));
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET title = :val, updated_at = NOW() WHERE id = :id",
             ( :val = title, :id = &id_clone )
@@ -278,7 +281,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("body").is_some() {
         let body = args["body"].as_str().unwrap_or("");
-        changed_fields.insert("body".to_string(), serde_json::json!(&old_body));
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET body = :val, updated_at = NOW() WHERE id = :id",
             ( :val = body, :id = &id_clone )
@@ -294,7 +297,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
         if !valid_statuses.contains(&status) {
             anyhow::bail!("Invalid status '{status}'");
         }
-        changed_fields.insert("status".to_string(), serde_json::json!(&old_status));
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET status = :val, updated_at = NOW() WHERE id = :id",
             ( :val = status, :id = &id_clone )
@@ -305,7 +308,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("priority").is_some() {
         let priority = args["priority"].as_i64().unwrap_or(0) as i32;
-        changed_fields.insert("priority".to_string(), serde_json::json!(old_priority));
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET priority = :val, updated_at = NOW() WHERE id = :id",
             ( :val = priority, :id = &id_clone )
@@ -316,7 +319,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("assignee").is_some() {
         let assignee = args["assignee"].as_str().unwrap_or("");
-        changed_fields.insert("assignee".to_string(), serde_json::json!(&old_assignee));
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET assignee = :val, updated_at = NOW() WHERE id = :id",
             ( :val = assignee, :id = &id_clone )
@@ -327,6 +330,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("channel_id").is_some() {
         let cid = args["channel_id"].as_i64().unwrap_or(0);
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET channel_id = :val, updated_at = NOW() WHERE id = :id",
             ( :val = cid, :id = &id_clone )
@@ -337,6 +341,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     if args.get("profile").is_some() {
         let profile = args["profile"].as_str().unwrap_or("");
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET profile = NULLIF(:val, '')::text, updated_at = NOW() WHERE id = :id",
             ( :val = profile, :id = &id_clone )
@@ -347,6 +352,7 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
     // Handle archive/unarchive via the "archived" field
     if let Some(archived) = args["archived"].as_bool() {
+        has_field_changes = true;
         sql_forge!(
             "UPDATE kanban_tasks SET archived = :val, updated_at = NOW() WHERE id = :id",
             ( :val = archived, :id = &id_clone )
@@ -357,21 +363,15 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
     }
 
     // ── Kanban history ──
-    let previous_json = if changed_fields.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(changed_fields))
-    };
-
-    // Determine the action type
+    // previous_values is ONLY stored for "edited" action (not move/archive/unarchive)
     let new_status = args["status"].as_str();
     let archived = args["archived"].as_bool();
 
     if let Some(arch) = archived {
         if arch {
-            insert_history(pool, &id_clone, "archived", None, None, previous_json).await?;
+            insert_history(pool, &id_clone, "archived", None, None, None).await?;
         } else {
-            insert_history(pool, &id_clone, "unarchived", None, None, previous_json).await?;
+            insert_history(pool, &id_clone, "unarchived", None, None, None).await?;
         }
     } else if let Some(new_st) = new_status {
         if new_st != old_status {
@@ -381,18 +381,16 @@ async fn handle_update(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
                 "moved",
                 Some(&old_status),
                 Some(new_st),
-                previous_json,
+                None,
             )
             .await?;
-        } else {
-            // Same status, other fields changed — log as "edited"
-            if previous_json.is_some() {
-                insert_history(pool, &id_clone, "edited", None, None, previous_json).await?;
-            }
+        } else if has_field_changes {
+            // Same status, other fields changed — log as "edited" with full previous values
+            insert_history(pool, &id_clone, "edited", None, None, Some(all_previous)).await?;
         }
-    } else if previous_json.is_some() {
-        // Other field changes without status change
-        insert_history(pool, &id_clone, "edited", None, None, previous_json).await?;
+    } else if has_field_changes {
+        // No status change, other fields changed — log as "edited" with full previous values
+        insert_history(pool, &id_clone, "edited", None, None, Some(all_previous)).await?;
     }
 
     Ok((format!("Kanban task '{}' updated successfully", id), false))

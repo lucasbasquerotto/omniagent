@@ -499,12 +499,25 @@ pub async fn process_thread(
             match cfg.llm.completion(plan_request).await {
                 Ok(resp) => {
                     helpers::merge_usage(&mut cumulative_usage, resp.usage.clone());
-                    let content = resp.content;
+                    // Use reasoning as fallback when plan content is empty (e.g. DeepSeek
+                    // puts everything in reasoning/thinking and leaves content empty).
+                    let plan_content = if !resp.content.is_empty() {
+                        resp.content.clone()
+                    } else if let Some(ref r) = resp.reasoning {
+                        if !r.is_empty() {
+                            r.clone()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
 
                     info!(
-                        "[plan] Generated plan for thread {} ({} chars, iteration {}/{})",
+                        "[plan] Generated plan for thread {} ({} chars from field '{}', iteration {}/{})",
                         thread.id,
-                        content.len(),
+                        plan_content.len(),
+                        if !resp.content.is_empty() { "content" } else if resp.reasoning.as_ref().is_some_and(|r| !r.is_empty()) { "reasoning" } else { "empty" },
                         iter + 1,
                         max_iter + 1,
                     );
@@ -520,12 +533,12 @@ pub async fn process_thread(
                     });
                     let plan_duration_ms = Some(resp.duration_ms as i32);
 
-                    // Save the plan as a plan-type message (skip if empty — 0-char plan generates noise)
-                    if !content.is_empty() {
+                    // Save the plan as a plan-type message (skip if both content and reasoning are empty)
+                    if !plan_content.is_empty() {
                         let plan_msg = MessageNew {
                             thread_id: thread.id,
                             role: "agent".to_string(),
-                            content: content.clone(),
+                            content: plan_content.clone(),
                             thread_sequence: {
                                 let v = next_seq;
                                 next_seq += 1;
@@ -555,12 +568,12 @@ pub async fn process_thread(
                     }
 
                     // For complex tasks, auto-create subtasks from JSON plan content
-                    if enable_subtasks && content.len() > 100 {
+                    if enable_subtasks && plan_content.len() > 100 {
                         let max_json_retries: u32 = std::env::var("MAX_UNFINISHED_SUBTASK_RETRIES")
                             .ok()
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(3);
-                        match serde_json::from_str::<serde_json::Value>(&content) {
+                        match serde_json::from_str::<serde_json::Value>(&plan_content) {
                             Ok(plan_json) => {
                                 if let Some(steps) =
                                     plan_json.get("steps").and_then(|v| v.as_array())
@@ -602,7 +615,7 @@ pub async fn process_thread(
                                          Attempt {}/{} — fix the JSON or the thread will fail.",
                                         json_failure_count, max_json_retries
                                     ));
-                                    last_plan = Some(content.clone());
+                                    last_plan = Some(plan_content.clone());
                                     continue;
                                 }
                             }
@@ -621,13 +634,13 @@ pub async fn process_thread(
                                      Attempt {}/{} — fix the JSON or the thread will fail.",
                                     e, json_failure_count, max_json_retries
                                 ));
-                                last_plan = Some(content.clone());
+                                last_plan = Some(plan_content.clone());
                                 continue;
                             }
                         }
                     }
 
-                    last_plan = Some(content);
+                    last_plan = Some(plan_content);
 
                     // One-shot: no refinement iterations — plan is final
                     break;

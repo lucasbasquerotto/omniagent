@@ -1415,8 +1415,7 @@ pub async fn process_thread(
 
     // 9. Save the main agent response (when limit_reached, generate LLM summary instead)
     let agent_elapsed_ms = start_time.elapsed().as_millis() as i32;
-    let is_empty_response = final_content.trim().is_empty()
-        && final_reasoning.as_ref().map(|r| r.trim().is_empty()).unwrap_or(true);
+    let is_empty_response = final_content.trim().is_empty();
 
     let saved = if limit_reached {
         // ── Summary generation (when interrupted / iteration limit reached) ──

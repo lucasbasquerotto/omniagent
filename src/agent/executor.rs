@@ -1622,6 +1622,27 @@ pub async fn process_thread(
     )
     .await?;
 
+    // ── Send completion reaction to platform ──
+    if let Some(ref ext_id) = cause_msg.external_id {
+        if let Some(ref platform) = channel.platform {
+            if let Some(ref resource) = channel.resource_identifier {
+                let emoji = match final_status {
+                    "completed" => ":white_check_mark:",
+                    "failed" => ":x:",
+                    "interrupted" => ":broken_heart:",
+                    _ => ":o:",
+                };
+                helpers::enqueue_reaction(
+                    &cfg.ctx,
+                    platform,
+                    resource,
+                    ext_id,
+                    emoji,
+                ).await;
+            }
+        }
+    }
+
     // If this thread is linked to a kanban task, update its status
     if let Some(ref task_id) = thread.task_id {
         let kanban_status = if final_status == "completed" {

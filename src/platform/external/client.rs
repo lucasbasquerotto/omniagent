@@ -7,8 +7,8 @@
 //! [`PlatformRegistry`] just like built-in platforms.
 
 use crate::platform::external::{
-    build_deliver_request, build_initialize_request, parse_response, DeliverParams,
-    InitializeResult, PlatformPluginConfig, PluginResponse,
+    build_deliver_request, build_initialize_request, build_react_request, parse_response,
+    DeliverParams, InitializeResult, PlatformPluginConfig, PluginResponse, ReactParams,
 };
 use crate::platform::{OutboundReceiver, Platform};
 use crate::error::{Error, AppResult, ErrorContext};
@@ -268,6 +268,47 @@ impl Platform for ExternalPlatformClient {
                         }
                     }
 
+                    // ── Reaction envelope: handle as react request instead of deliver ──
+                    if envelope.msg_type == "reaction" {
+                        let reactor_params = ReactParams {
+                            resource_identifier: envelope.resource_identifier,
+                            external_id: envelope.cause_external_id.unwrap_or_default(),
+                            emoji: envelope.content,
+                        };
+                        let id = next_id_val;
+                        next_id_val += 1;
+                        let req = build_react_request(id, &reactor_params);
+
+                        tracing::debug!(
+                            "Sending react request to '{}' (emoji={})",
+                            plugin_name,
+                            reactor_params.emoji,
+                        );
+
+                        if let Err(e) = stdin.write_all(req.as_bytes()).await {
+                            tracing::error!("Failed to write react to plugin '{}' stdin: {:?}", plugin_name, e);
+                            if let Ok(mut circuit) = self.circuit.lock() {
+                                circuit.record_failure();
+                            }
+                            continue;
+                        }
+                        if let Err(e) = stdin.write_all(b"\n").await {
+                            tracing::error!("Failed to write newline to plugin '{}' stdin: {:?}", plugin_name, e);
+                            if let Ok(mut circuit) = self.circuit.lock() {
+                                circuit.record_failure();
+                            }
+                            continue;
+                        }
+                        if let Err(e) = stdin.flush().await {
+                            tracing::error!("Failed to flush plugin '{}' stdin: {:?}", plugin_name, e);
+                            if let Ok(mut circuit) = self.circuit.lock() {
+                                circuit.record_failure();
+                            }
+                            continue;
+                        }
+                        continue;
+                    }
+
                     // Build deliver params from envelope
                     let params = DeliverParams {
                         resource_identifier: envelope.resource_identifier.clone(),
@@ -455,7 +496,7 @@ impl Platform for ExternalPlatformClient {
                                                                 task_id: None,
                                                                 schedule_task_id: None,
                                                                 content: inbound.text.clone(),
-                                                                external_id: Some(inbound.external_id),
+                                                                external_id: Some(inbound.external_id.clone()),
                                                                 metadata: {
                                                                     let mut meta = inbound.metadata.clone();
                                                                     if let Some(ref t) = channel.template {
@@ -471,6 +512,13 @@ impl Platform for ExternalPlatformClient {
                                                             },
                                                         ).await {
                                                             // success — message and thread created
+                                                            let _ = send_react(
+                                                                &mut stdin,
+                                                                &mut next_id_val,
+                                                                &inbound.resource_identifier,
+                                                                &inbound.external_id,
+                                                                ":+1:",
+                                                            ).await;
                                                         } else {
                                                             tracing::error!("Failed to create thread for inbound message from '{}'", plugin_name);
                                                         }
@@ -803,6 +851,33 @@ async fn handle_external_profile_command(
             "Profile reset to 'default'.".to_string()
         }
     }
+}
+
+/// Send a reaction to a platform message via the plugin's stdin.
+async fn send_react(
+    stdin: &mut ChildStdin,
+    next_id: &mut u64,
+    resource_identifier: &str,
+    external_id: &str,
+    emoji: &str,
+) {
+    let id = *next_id;
+    *next_id += 1;
+    let params = ReactParams {
+        resource_identifier: resource_identifier.to_string(),
+        external_id: external_id.to_string(),
+        emoji: emoji.to_string(),
+    };
+    let req = build_react_request(id, &params);
+    if let Err(e) = stdin.write_all(req.as_bytes()).await {
+        tracing::warn!("Failed to send react request: {:?}", e);
+        return;
+    }
+    if let Err(e) = stdin.write_all(b"\n").await {
+        tracing::warn!("Failed to send react newline: {:?}", e);
+        return;
+    }
+    let _ = stdin.flush().await;
 }
 
 impl Drop for ExternalPlatformClient {

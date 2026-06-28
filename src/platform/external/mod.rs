@@ -379,6 +379,29 @@ pub fn build_delete_request(id: u64, params: &DeleteParams) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// React
+// ---------------------------------------------------------------------------
+
+/// Parameters for the react method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactParams {
+    pub resource_identifier: String,
+    pub external_id: String,
+    pub emoji: String,
+}
+
+/// Build a react request JSON string.
+#[allow(dead_code)]
+pub fn build_react_request(id: u64, params: &ReactParams) -> String {
+    let req = PluginRequest {
+        id: Some(id),
+        method: "react".to_string(),
+        params: Some(serde_json::to_value(params).unwrap_or_default()),
+    };
+    serde_json::to_string(&req).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // Response parser
 // ---------------------------------------------------------------------------
 

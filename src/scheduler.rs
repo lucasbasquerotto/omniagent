@@ -14,6 +14,15 @@
 //! only one tick can win the claim for a given due time. Runs themselves are
 //! NOT stored beyond the cadence marker - they are observable via the threads
 //! each schedule creates (`threads.schedule_task_id = <yml key>`).
+//!
+//! Run-semantics contract (operator, 2026-09-12): a NON-silent run ALWAYS
+//! leaves a thread whose seq-0 message is the action/schedule name and whose
+//! last message states the outcome (a success message, or an 'error'-typed
+//! message carrying the actual error text); a SILENT action run leaves a
+//! thread only on error, backfilled at the END with seq 0 + the error message
+//! (the outcome is unknown when the run starts). Both the cron tick and the
+//! manual force-run share `execute_action_mode`, so the two paths cannot
+//! diverge.
 
 use crate::err_msg;
 use crate::error::{AppResult, Error};
@@ -236,7 +245,7 @@ async fn tick(
                 schedule_task_id: Some(job.id.clone()),
                 toolset: job.toolset.clone(),
                 content: prompt_content,
-                external_id: Some(format!("cron:{}:{}", job.id, now.timestamp())),
+                external_id: Some(cron_message_external_id(&job.id, now.timestamp())),
                 metadata: serde_json::json!({
                     "cron_job_id": job.id,
                     "cron_job_name": job.name,
@@ -448,9 +457,11 @@ struct ActionRunOutcome {
 }
 
 /// Execute one action-mode run: resolve the action, execute the MCP tool and
-/// (unless silent-success) create the result thread. Always returns an
-/// outcome so the caller can persist it in `schedule_runs` and log a
-/// terminal line - never a silent failure.
+/// create the result thread per the run-semantics contract:
+/// - non-silent: a thread is created for EVERY run (success and error);
+/// - silent: no thread on success, a retroactively backfilled thread on error.
+/// Always returns an outcome so the caller can persist it in `schedule_runs`
+/// and log a terminal line - never a silent failure.
 async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
     let is_silent = ctx.job.silent.unwrap_or(false);
 
@@ -462,8 +473,22 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
                 ctx.display_name
             );
             error!("[cron-action] {}", msg);
+            // An error: a non-silent run ALWAYS leaves a thread, and a silent
+            // run leaves one on error too, so the failure stays traceable.
+            let thread_id = create_action_thread(ActionThreadCtx {
+                pool: ctx.pool,
+                data_dir: ctx.data_dir,
+                job: ctx.job,
+                now: ctx.now,
+                display_name: ctx.display_name,
+                result_content: &msg,
+                is_error: true,
+                cause: ctx.cause,
+            })
+            .await
+            .ok();
             return ActionRunOutcome {
-                thread_id: None,
+                thread_id,
                 is_error: true,
                 output: msg,
             };
@@ -522,8 +547,8 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
                 );
             }
 
-            // Create thread if non-silent (always) OR silent with error
-            let thread_id = if !is_silent || is_error {
+            // Thread contract: non-silent always, silent only on error.
+            let thread_id = if should_create_action_thread(is_silent, is_error) {
                 match create_action_thread(ActionThreadCtx {
                     pool: ctx.pool,
                     data_dir: ctx.data_dir,
@@ -562,8 +587,9 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
                 ctx.display_name, action_id, e
             );
 
-            // Always create a failure thread for visible error trail
-            let err_content = format!("Action execution failed: {}", e);
+            // Always create a failure thread for a visible error trail
+            // (silent jobs included: an error always leaves a thread).
+            let err_content = e.to_string();
             let thread_id = match create_action_thread(ActionThreadCtx {
                 pool: ctx.pool,
                 data_dir: ctx.data_dir,
@@ -594,6 +620,58 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
         }
     }
 }
+// ─── Run-semantics contract helpers (shared by cron tick + force-run) ───────
+
+/// Should an action run leave a thread?
+/// Non-silent runs: ALWAYS (success and error). Silent runs: only on error
+/// (a successful silent run stays traceless - that is the point of silent).
+fn should_create_action_thread(is_silent: bool, is_error: bool) -> bool {
+    !is_silent || is_error
+}
+
+/// seq-0 content of an action-run thread: the action name, i.e. the schedule
+/// entry name/key the Schedules page shows (`display_name`). It used to be
+/// "Cron: <name>", which no consumer parsed; the contract is now the bare
+/// name, identical for silent and non-silent runs.
+fn action_first_message(display_name: &str) -> String {
+    display_name.to_string()
+}
+
+/// Type of the terminal result message: a failure is typed 'error' so a failed
+/// run is visible as a failure wherever thread/message types are read;
+/// a success stays 'tool-result' (the existing contract for tool output).
+fn action_result_msg_type(is_error: bool) -> &'static str {
+    if is_error {
+        "error"
+    } else {
+        "tool-result"
+    }
+}
+
+/// Content of the terminal result message: a success states the success
+/// explicitly (the tool output is kept as evidence); an error carries the
+/// ACTUAL error text, never a generic "run failed".
+fn action_result_content(display_name: &str, is_error: bool, output: &str) -> String {
+    let detail = output.trim();
+    if is_error {
+        if detail.is_empty() {
+            format!(
+                "Action '{}' FAILED (no error text was returned).",
+                display_name
+            )
+        } else {
+            format!("Action '{}' FAILED: {}", display_name, detail)
+        }
+    } else if detail.is_empty() {
+        format!("Action '{}' completed successfully.", display_name)
+    } else {
+        format!(
+            "Action '{}' completed successfully.\n\n{}",
+            display_name, detail
+        )
+    }
+}
+
 /// Context for `create_action_thread`: groups 8 params to stay under clippy's 7-arg limit.
 struct ActionThreadCtx<'a> {
     pool: &'a PgPool,
@@ -608,10 +686,12 @@ struct ActionThreadCtx<'a> {
 
 /// Create a system/user thread with the action result saved as a message.
 ///
-/// Creates a thread with the given cause ('system' for scheduled, 'user'
-/// for manual run), a seq-0 cause message (msg_type='cron', msg_subtype
-/// = cron job name), saves the tool result as a seq-1 message, then
-/// marks the thread as terminal (system for success, failed for error).
+/// One atomic backfill path: the thread is created WITH its seq-0 message
+/// (msg_type='cron', msg_subtype = cron job name, content = the action name)
+/// and the seq-1 terminal result message is appended immediately after, so a
+/// reader never sees a thread with half the contract (silent error runs call
+/// this only at the END, once the outcome is known). The thread is then marked
+/// terminal (system for success, failed for error).
 async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
     // Resolve the channel the same way as the agentic mode path
     // explicit channel -> default_schedule_channel -> '' (fail-with-record).
@@ -641,7 +721,9 @@ async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
     };
 
     let subtype = ctx.job.name.clone().unwrap_or_default();
-    let prompt_content = format!("Cron: {}", ctx.display_name);
+    // seq 0 = the action name (the schedule entry name/key shown on the
+    // Schedules page): the same first message for silent and non-silent runs.
+    let first_message = action_first_message(ctx.display_name);
 
     // Create the thread with the given cause and a seq-0 cause message (msg_type='cron')
     let (thread, _cause_msg) = queries::create_thread_with_cause(
@@ -656,10 +738,11 @@ async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
             task_id: None,
             schedule_task_id: Some(ctx.job.id.clone()),
             toolset: ctx.job.toolset.clone(),
-            content: prompt_content,
-            external_id: Some(format!("cron:{}:{}", ctx.job.id, ctx.now.timestamp())),
+            content: first_message,
+            external_id: Some(cron_message_external_id(&ctx.job.id, ctx.now.timestamp())),
             metadata: serde_json::json!({
                 "cron_job_id": ctx.job.id,
+                "action_id": ctx.job.action_id,
                 "cron_job_name": ctx.job.name,
                 "scheduled_at": ctx.job.schedule,
                 "channel_id": channel_id,
@@ -678,11 +761,14 @@ async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
     )
     .await?;
 
-    // Save the tool result as a seq-1 message (role='agent', msg_type='tool-result')
+    // Save the terminal result as a seq-1 message: a success states the success
+    // (msg_type='tool-result', with the output kept as evidence), a failure is
+    // typed 'error' and carries the actual error text.
+    let result_content = action_result_content(ctx.display_name, ctx.is_error, ctx.result_content);
     let result_msg = queries::MessageNew {
         thread_id: thread.id,
         role: "agent".to_string(),
-        content: ctx.result_content.to_string(),
+        content: result_content,
         thread_sequence: 1,
         external_id: Some(format!(
             "cron:{}:{}:result",
@@ -697,7 +783,7 @@ async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
         summary_text: None,
         is_summary: false,
         original_thread_id: None,
-        msg_type: "tool-result".to_string(),
+        msg_type: action_result_msg_type(ctx.is_error).to_string(),
         msg_subtype: None,
         iteration_number: 0,
         duration_ms: ctx.is_error as i32,
@@ -728,6 +814,20 @@ async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
 // ─── Action run records (schedule_runs) ─────────────────────────────────────
 
 /// Monotonic suffix keeping run ids unique inside the same millisecond.
+/// Process-unique token appended to a run's seq-0 `external_id`.
+///
+/// The `uq_messages_seq0_external_id` index is UNIQUE on
+/// (channel_id, external_id) for thread_sequence = 0, so two runs of the same
+/// schedule inside the same second must NOT build the same id: the losing
+/// insert fails and leaves an orphan thread with zero messages while the run
+/// is reported with no thread (repeated-run gate).
+static CRON_MSG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn cron_message_external_id(job_id: &str, ts: i64) -> String {
+    let n = CRON_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("cron:{}:{}:{}", job_id, ts, n)
+}
+
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a unique run id: `<task_key>-<millis>-<seq>`.
@@ -1122,7 +1222,7 @@ pub async fn fire_cron_job_by_id(
             schedule_task_id: Some(job.id.clone()),
             toolset: job.toolset.clone(),
             content: prompt_content,
-            external_id: Some(format!("cron:{}:{}", job.id, now.timestamp())),
+            external_id: Some(cron_message_external_id(&job.id, now.timestamp())),
             metadata: serde_json::json!({
                 "cron_job_id": job.id,
                 "cron_job_name": job.name,
@@ -1658,5 +1758,81 @@ mod tests {
     #[test]
     fn test_validate_cron_5field_with_whitespace() {
         assert!(validate_cron_schedule_5field("  0 9 * * *  "));
+    }
+
+    // ─── Run-semantics contract (non-silent always thread / silent error) ───
+
+    #[test]
+    fn test_thread_created_for_every_non_silent_run() {
+        // Non-silent: a thread is created for success AND error.
+        assert!(should_create_action_thread(false, false));
+        assert!(should_create_action_thread(false, true));
+    }
+
+    #[test]
+    fn test_thread_only_on_error_for_silent_runs() {
+        // Silent success stays traceless; a silent error gets a thread
+        // (created at the END by create_action_thread's backfill path).
+        assert!(!should_create_action_thread(true, false));
+        assert!(should_create_action_thread(true, true));
+    }
+
+    #[test]
+    fn test_action_first_message_is_the_action_name() {
+        assert_eq!(action_first_message("daily-backup"), "daily-backup");
+        assert!(!action_first_message("daily-backup").starts_with("Cron:"));
+    }
+
+    #[test]
+    fn test_result_message_type_is_error_on_failure() {
+        assert_eq!(action_result_msg_type(false), "tool-result");
+        assert_eq!(action_result_msg_type(true), "error");
+    }
+
+    #[test]
+    fn test_success_result_content_states_success_and_keeps_output() {
+        let c = action_result_content("daily-backup", false, "exit_code: 0\nbackup written");
+        assert!(c.starts_with("Action 'daily-backup' completed successfully."));
+        assert!(
+            c.contains("backup written"),
+            "tool output must stay as evidence: {c}"
+        );
+    }
+
+    #[test]
+    fn test_error_result_content_carries_the_error_text() {
+        let c = action_result_content("daily-backup", true, "connection refused (exit_code 1)");
+        assert!(c.contains("FAILED"));
+        assert!(
+            c.contains("connection refused (exit_code 1)"),
+            "the actual error text must be in the message: {c}"
+        );
+    }
+
+    #[test]
+    fn test_result_content_never_empty_even_with_empty_output() {
+        assert_eq!(
+            action_result_content("job", false, "   "),
+            "Action 'job' completed successfully."
+        );
+        assert!(action_result_content("job", true, "").contains("FAILED"));
+    }
+
+    #[test]
+    fn test_cron_message_external_id_unique_per_run_in_same_second() {
+        // Two runs of the SAME schedule inside the same second must not build
+        // the same seq-0 external_id: `uq_messages_seq0_external_id` is UNIQUE
+        // on (channel_id, external_id) for thread_sequence = 0, so the losing
+        // insert used to fail and leave an orphan thread with zero messages
+        // while the run reported no thread (repeated-run gate).
+        let a = cron_message_external_id("daily-backup", 1789242086);
+        let b = cron_message_external_id("daily-backup", 1789242086);
+        assert_ne!(a, b, "two runs in the same second must differ");
+        assert!(
+            a.starts_with("cron:daily-backup:1789242086:"),
+            "the external_id keeps the historical prefix shape: {a}"
+        );
+        // A different schedule in the same second is distinct as well.
+        assert_ne!(a, cron_message_external_id("daily-report", 1789242086));
     }
 }

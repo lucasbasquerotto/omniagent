@@ -181,10 +181,14 @@ fn test_list_plugins_no_stale_entries() {
 fn test_list_builtins_have_source_code() {
     let resp = api_get("/plugins");
     let data = resp["data"].as_array().expect("Expected data array");
+    // NOTE: "memory" is intentionally absent. The builtin Rust memory plugin
+    // was removed in edc7da0 ("refactor(memory): remove the builtin Rust memory
+    // plugin (remote Python only)"); memory is now a remote Python plugin, so
+    // it is no longer discoverable with source == "built-in" (see
+    // tests/tool_behavior_descriptors.rs for the same documented removal).
     for name in &[
         "cron",
         "kanban",
-        "memory",
         "plugin-manager",
         "search",
         "ssh",

@@ -376,7 +376,7 @@ fn get_all_setting_definitions() -> Vec<(String, SettingMeta)> {
             "prompt_generate_tool".into(),
             SettingMeta {
                 field_type: "select".into(),
-                description: "Name of the MCP tool to call for generating prompts".into(),
+                description: "Name of the MCP tool core calls for generating prompts. The value is the tool's registered qualified name ({plugin}__{tool}); the prompt plugin may be installed or renamed under a different name.".into(),
                 options: None,
                 readonly: false,
                 default: Some("prompt__generate".into()),
@@ -386,17 +386,17 @@ fn get_all_setting_definitions() -> Vec<(String, SettingMeta)> {
             "prompt_compact_messages_tool".into(),
             SettingMeta {
                 field_type: "select".into(),
-                description: "Name of the MCP tool to call for compacting conversation history".into(),
+                description: "Name of the MCP tool core calls for compacting conversation history. The value is the tool's registered qualified name ({plugin}__{tool}); the prompt plugin may be installed or renamed under a different name.".into(),
                 options: None,
                 readonly: false,
-                default: Some("prompt__compact_messages".into()),
+                default: Some("prompt__compact-messages".into()),
             },
         ),
         (
             "redaction_tool".into(),
             SettingMeta {
                 field_type: "select".into(),
-                description: "Name of the MCP tool to call for redacting possible secrets from outgoing messages and tool output before delivery. Empty (default) = no redaction. Example: redaction_redact (the omni-plugins redaction tool)".into(),
+                description: "Name of the MCP tool core calls to redact possible secrets from outgoing messages and tool output before delivery. Empty (default) = no redaction. The value must be the tool's runtime-qualified name ({plugin}__{tool}), for example redaction__redact: the omni-plugins redaction plugin provides the tool 'redact', and the plugin may be installed or renamed under a different name.".into(),
                 options: None,
                 readonly: false,
                 default: Some("".into()),
@@ -406,7 +406,7 @@ fn get_all_setting_definitions() -> Vec<(String, SettingMeta)> {
             "malformed_response_tool".into(),
             SettingMeta {
                 field_type: "select".into(),
-                description: "Name of the MCP tool to call to detect PROVIDER-SPECIFIC malformed LLM response forms (e.g. DeepSeek DSML text-mode tool-call markup) in the assistant's last message and to return the cleaned text. The core uses the tool's malformed verdict (plus its cleaned text and continuation_intent) to decide the terminal summary; empty (default) = the core's built-in provider-neutral heuristic. Example: llm-response-hygiene_classify (the omni-plugins llm-response-hygiene tool)".into(),
+                description: "Name of the MCP tool to call to detect PROVIDER-SPECIFIC malformed LLM response forms (e.g. DeepSeek DSML text-mode tool-call markup) in the assistant's last message and to return the cleaned text. The core uses the tool's malformed verdict (plus its cleaned text and continuation_intent) to decide the terminal summary; empty (default) = the core's built-in provider-neutral heuristic. The value must be the tool's runtime-qualified name ({plugin}__{tool}), for example llm-response-hygiene__classify: the omni-plugins llm-response-hygiene plugin provides the tool 'classify', and the plugin may be installed or renamed under a different name.".into(),
                 options: None,
                 readonly: false,
                 default: Some("".into()),
@@ -416,10 +416,10 @@ fn get_all_setting_definitions() -> Vec<(String, SettingMeta)> {
             "git_sync_tool".into(),
             SettingMeta {
                 field_type: "select".into(),
-                description: "Name of the MCP tool to call for git sync (pull/rebase/push). Used by the dashboard explorer sync button and the backup/restore hook; defaults to the builtin git plugin's git_sync tool".into(),
+                description: "Name of the MCP tool core calls for the git actions API (fetch/pull --rebase/push), for example the dashboard explorer sync button. The value is the tool's registered qualified name ({plugin}__{tool}); defaults to the builtin git plugin's git__sync tool.".into(),
                 options: None,
                 readonly: false,
-                default: Some("git_sync".into()),
+                default: Some("git__sync".into()),
             },
         ),
         (
@@ -1302,10 +1302,8 @@ mod tests {
         // PREVIOUS key names (`soft_delete_after_days` / `hard_delete_after_days`)
         // must yield the same effective values under the CURRENT names when the
         // file is read, and the current name must win when both are present.
-        let dir = std::env::temp_dir().join(format!(
-            "omniagent-settings-legacy-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("omniagent-settings-legacy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = dir.join("config");
         std::fs::create_dir_all(&cfg).expect("create config dir");
@@ -1346,5 +1344,77 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn git_sync_tool_default_matches_builtin_git_plugin_tool() {
+        // Drift guard: the `git_sync_tool` registry default must equal the
+        // runtime-qualified name of the builtin git plugin's sync tool
+        // ({plugin}__{tool}), computed from the plugin manifest plus the tool
+        // name the plugin registers. A rename on either side fails here.
+        let defs = get_all_setting_definitions();
+        let by_name: std::collections::HashMap<&str, &SettingMeta> =
+            defs.iter().map(|(n, m)| (n.as_str(), m)).collect();
+        let meta = by_name
+            .get("git_sync_tool")
+            .unwrap_or_else(|| panic!("git_sync_tool must be defined"));
+        let default = meta
+            .default
+            .as_deref()
+            .expect("git_sync_tool must ship a default");
+
+        let root = env!("CARGO_MANIFEST_DIR");
+        let manifest = std::fs::read_to_string(format!("{root}/plugins/tools/git/plugin.json"))
+            .expect("builtin git plugin.json must be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&manifest).expect("git plugin.json must be valid JSON");
+        let plugin = parsed["name"]
+            .as_str()
+            .expect("git plugin.json must declare a name");
+        let main_rs = std::fs::read_to_string(format!("{root}/plugins/tools/git/src/main.rs"))
+            .expect("builtin git plugin main.rs must be readable");
+
+        // The tool name the builtin git plugin itself registers (bare/unqualified).
+        const SYNC_TOOL: &str = "git_sync";
+        assert!(
+            main_rs.contains(&format!("name: \"{SYNC_TOOL}\"")),
+            "the builtin git plugin must register the `{SYNC_TOOL}` tool"
+        );
+        let qualified = crate::mcp::tool_qualify(plugin, SYNC_TOOL);
+        assert_eq!(
+            default, qualified,
+            "git_sync_tool default must be the registered (qualified) git tool name"
+        );
+        assert_eq!(default, "git__sync");
+    }
+    #[test]
+    fn tool_indirection_descriptions_use_runtime_qualified_names() {
+        // Guard against re-introducing the pre-`{plugin}__{tool}` grammar in
+        // any setting description (single-underscore legacy names), against
+        // calling a PLUGIN a tool, and against core claiming knowledge of
+        // per-installation hooks or of a specific API consumer (dashboard).
+        let defs = get_all_setting_definitions();
+        for (name, meta) in defs.iter() {
+            for forbidden in [
+                "redaction_redact",
+                "llm-response-hygiene_classify",
+                "prompt__compact_messages",
+                "prompt_generate ",
+                "backup/restore hook",
+            ] {
+                assert!(
+                    !meta.description.contains(forbidden),
+                    "setting {name}: description must not contain the stale `{forbidden}`"
+                );
+            }
+        }
+        let by_name: std::collections::HashMap<&str, &SettingMeta> =
+            defs.iter().map(|(n, m)| (n.as_str(), m)).collect();
+        let git = by_name.get("git_sync_tool").expect("git_sync_tool defined");
+        assert_eq!(git.default.as_deref(), Some("git__sync"));
+        // The git-sync setting is framed as the git actions API core calls;
+        // the dashboard may appear only as an example API consumer.
+        assert!(git.description.contains("git actions API"));
+        assert!(git.description.contains("dashboard explorer sync button"));
+        assert!(!git.description.contains("Used by the dashboard"));
     }
 }

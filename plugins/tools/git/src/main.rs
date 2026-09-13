@@ -1863,8 +1863,8 @@ async fn main() -> Result<()> {
                 name: "git_sync".to_string(),
                 description:
                     "SYNC a git repository: fetch, pull --rebase, then push to origin. \
-                    The canonical sync entrypoint used by the dashboard explorer sync button \
-                    and the backup/restore hook. Authentication uses the GitHub App \
+                    The canonical sync entrypoint for git actions API calls (for example, \
+                    the dashboard explorer sync button). Authentication uses the GitHub App \
                     installation token; if a fetch/pull/push fails because the token is \
                     expired or revoked, a fresh token is generated from the app private key \
                     and the sync is retried once. 'repo_dir' defaults to the omni_dir config \

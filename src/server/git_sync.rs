@@ -2,9 +2,10 @@
 //!
 //! Executes the configurable sync tool (settings `git_sync_tool`, default
 //! `git__sync` from the builtin git plugin) via the MCP registry. This is the
-//! SAME call the dashboard explorer sync button (bottom of the left panel)
-//! and the toolbox backup/restore hooks use, so the whole stack shares one
-//! sync implementation and one token-recovery path.
+//! SAME call that API clients of the git actions API make (for example, the
+//! dashboard explorer sync button), so the whole stack shares one sync
+//! implementation and one token-recovery path. Core does not know any hook:
+//! hooks are per-installation/user artifacts created outside omniagent.
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 use std::sync::Arc;

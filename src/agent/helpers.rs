@@ -516,7 +516,7 @@ pub async fn enqueue_delivery(
 
     // ── Secret redaction: configured redaction tool (default empty = none) ──
     // Core no longer hardcodes secret patterns. When the global setting
-    // `redaction_tool` names an MCP tool (e.g. "redaction_redact"), the
+    // `redaction_tool` names an MCP tool (runtime-qualified, e.g. "redaction__redact"), the
     // outgoing content is passed through it before delivery. Empty (default)
     // means no redaction at all. Tool failures are logged and the original
     // content is delivered unchanged (fail-open).

@@ -30,8 +30,10 @@
 //!   (same fail-open semantics as `redaction_tool`).
 //!
 //! The reference implementation of the detector is the omni-plugins python
-//! plugin `tools/llm-response-hygiene` (tool `llm-response-hygiene_classify`),
-//! which ports the DSML/XML/markdown detection and the continuation heuristic.
+//! plugin `llm-response-hygiene` (it provides the tool `classify`, whose
+//! runtime-qualified name is `llm-response-hygiene__classify`; the plugin may
+//! be installed or renamed under a different name), which ports the
+//! DSML/XML/markdown detection and the continuation heuristic.
 //! A tool verdict must reproduce the built-in decision on the same input
 //! (reference equivalence, covered by tests on both sides).
 

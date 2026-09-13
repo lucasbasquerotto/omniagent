@@ -127,7 +127,8 @@ pub struct AgentConfig {
     /// under a different name.
     pub prompt_tool_name: String,
     /// MCP tool name for compacting conversation history.
-    /// Default: "prompt__compact_messages".
+    /// Default: "prompt__compact-messages" (the prompt plugin's registered
+    /// qualified name).
     pub compact_messages_tool_name: String,
     /// MCP tool name for redacting possible secrets from outgoing messages
     /// and tool output before delivery. Empty (default) = no redaction at
@@ -301,7 +302,7 @@ impl AgentConfig {
             prompt_tool_name: get("prompt_generate_tool", "prompt__generate"),
             compact_messages_tool_name: get(
                 "prompt_compact_messages_tool",
-                "prompt__compact_messages",
+                "prompt__compact-messages",
             ),
             redaction_tool: get("redaction_tool", ""),
             malformed_response_tool: get("malformed_response_tool", ""),
@@ -417,7 +418,7 @@ impl AgentConfig {
             prompt_tool_name: get("prompt_generate_tool", "prompt__generate"),
             compact_messages_tool_name: get(
                 "prompt_compact_messages_tool",
-                "prompt__compact_messages",
+                "prompt__compact-messages",
             ),
             redaction_tool: get("redaction_tool", ""),
             malformed_response_tool: get("malformed_response_tool", ""),
@@ -499,7 +500,7 @@ mod tests {
             delete_after_days_hard: None,
             kanban_dispatcher_interval_secs: 15,
             prompt_tool_name: "prompt__generate".to_string(),
-            compact_messages_tool_name: "prompt__compact_messages".to_string(),
+            compact_messages_tool_name: "prompt__compact-messages".to_string(),
             redaction_tool: String::new(),
             malformed_response_tool: String::new(),
             sub_prompt_max_chars: 4000,

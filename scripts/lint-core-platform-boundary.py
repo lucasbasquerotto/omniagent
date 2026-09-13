@@ -128,7 +128,7 @@ TOOL_NAMES = frozenset({
     "skills__list_skills", "skills__view_skill",
     "manage_subtasks", "subtasks__manage_subtasks", "subtasks__list_subtasks",
     "subtasks__add_subtask", "prompt_generate", "prompt_compact-messages",
-    "prompt__generate", "prompt__compact_messages",
+    "prompt__generate", "prompt__compact-messages",
     "git__status", "git__run_command",
 })
 

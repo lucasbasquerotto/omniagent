@@ -5,8 +5,8 @@
 //! Expired/revoked-token recovery: when a fetch/pull/push fails with an auth
 //! error (e.g. a stale or revoked installation token), the token cache is
 //! invalidated, a FRESH token is minted from the app private key, and the
-//! sync is retried ONCE. This keeps the dashboard explorer sync button (and
-//! the backup/restore hook that calls the same endpoint) from surfacing the
+//! sync is retried ONCE. This keeps API clients of the sync endpoint (for
+//! example, the dashboard explorer sync button) from surfacing the
 //! `500 Pull failed: Command failed: git pull --rebase
 //! https://x-access-token:ghs_...` error when a previously minted token has
 //! expired.
@@ -107,7 +107,7 @@ async fn sync_pass(repo_dir: &str, auth_cfg: &[String]) -> Result<String> {
 }
 
 /// `git_sync`: pull/rebase/push the repo's origin (the canonical sync used
-/// by the dashboard explorer sync button and the backup/restore hook).
+/// by the git actions API, for example the dashboard explorer sync button).
 ///
 /// `repo_dir` defaults to the omni_dir config repo. On an auth failure the
 /// token is regenerated and the sync is retried once.

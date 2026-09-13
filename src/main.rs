@@ -414,8 +414,7 @@ async fn run_server() -> AppResult<()> {
         let interval = tokio::time::Duration::from_secs(soft_interval);
         loop {
             tokio::time::sleep(interval).await;
-            let days =
-                agent::config::get_global().and_then(|c| c.read().delete_after_days_soft);
+            let days = agent::config::get_global().and_then(|c| c.read().delete_after_days_soft);
             match omniagent::retention::run_soft_delete(&pool_retention_soft, days).await {
                 Ok(report) => tracing::info!(
                     "Retention soft-delete run: status={} rows={:?} total={} ms={}",
@@ -433,8 +432,7 @@ async fn run_server() -> AppResult<()> {
         let interval = tokio::time::Duration::from_secs(hard_interval);
         loop {
             tokio::time::sleep(interval).await;
-            let days =
-                agent::config::get_global().and_then(|c| c.read().delete_after_days_hard);
+            let days = agent::config::get_global().and_then(|c| c.read().delete_after_days_hard);
             match omniagent::retention::run_hard_delete(&pool_retention_hard, days).await {
                 Ok(report) => tracing::info!(
                     "Retention hard-delete run: status={} rows={:?} total={} ms={}",

@@ -460,8 +460,8 @@ struct ActionRunOutcome {
 /// create the result thread per the run-semantics contract:
 /// - non-silent: a thread is created for EVERY run (success and error);
 /// - silent: no thread on success, a retroactively backfilled thread on error.
-/// Always returns an outcome so the caller can persist it in `schedule_runs`
-/// and log a terminal line - never a silent failure.
+///   Always returns an outcome so the caller can persist it in `schedule_runs`
+///   and log a terminal line - never a silent failure.
 async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
     let is_silent = ctx.job.silent.unwrap_or(false);
 

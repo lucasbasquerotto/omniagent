@@ -31,7 +31,7 @@ use sqlx::FromRow;
 use std::sync::Arc;
 use tracing::error;
 
-use super::{err_json, ok_json, AppState};
+use super::{apply_tri_state_string, deserialize_double_option, err_json, ok_json, AppState};
 use crate::tasks_yaml::{self, ScheduleDef};
 
 // ---------------------------------------------------------------------------
@@ -232,19 +232,30 @@ pub struct CreateScheduleRequest {
 }
 
 #[derive(Debug, Deserialize)]
+/// PATCH body. The string fields below are TRI-STATE: an absent key leaves the
+/// stored value unchanged, an explicit JSON `null` (or a blank string) clears
+/// it, any other value sets it. A plain `Option<String>` cannot tell `null`
+/// apart from an absent key, so a clear sent by the dashboard (which spells an
+/// empty select as `value || null`) used to be silently dropped.
 pub struct UpdateScheduleRequest {
     pub name: Option<String>,
     pub cron: Option<String>,
-    pub prompt: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub prompt: Option<Option<String>>,
     pub active: Option<bool>,
     pub enabled: Option<bool>,
-    pub channel: Option<String>,
-    pub profile: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub channel: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub profile: Option<Option<String>>,
     pub mode: Option<String>,
-    pub action_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub action_id: Option<Option<String>>,
     pub silent: Option<bool>,
-    pub template: Option<String>,
-    pub toolset: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub template: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub toolset: Option<Option<String>>,
     pub plan: Option<bool>,
 }
 
@@ -575,18 +586,10 @@ async fn update_schedule_handler(
         }
         def.cron = sched.clone();
     }
-    if let Some(p) = body.prompt.clone() {
-        def.prompt = if p.is_empty() { None } else { Some(p) };
-    }
-    if let Some(p) = body.profile.clone() {
-        def.profile = if p.is_empty() { None } else { Some(p) };
-    }
-    if let Some(t) = body.template.clone() {
-        def.template = if t.is_empty() { None } else { Some(t) };
-    }
-    if let Some(t) = body.toolset.clone() {
-        def.toolset = if t.is_empty() { None } else { Some(t) };
-    }
+    apply_tri_state_string(&mut def.prompt, &body.prompt);
+    apply_tri_state_string(&mut def.profile, &body.profile);
+    apply_tri_state_string(&mut def.template, &body.template);
+    apply_tri_state_string(&mut def.toolset, &body.toolset);
     if let Some(silent) = body.silent {
         def.silent = Some(silent);
     }
@@ -598,16 +601,18 @@ async fn update_schedule_handler(
     }
     if let Some(mode) = body.mode.as_deref() {
         if mode == "action" {
-            if body
+            let action_id = body
                 .action_id
-                .as_deref()
+                .as_ref()
+                .and_then(|v| v.as_deref())
                 .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
-            {
-                return err_json(StatusCode::BAD_REQUEST, "mode=action requires an action_id");
+                .filter(|a| !a.is_empty());
+            match action_id {
+                Some(a) => def.action = Some(a.to_string()),
+                None => {
+                    return err_json(StatusCode::BAD_REQUEST, "mode=action requires an action_id")
+                }
             }
-            def.action = body.action_id.clone().filter(|a| !a.trim().is_empty());
         } else if mode == "agentic" {
             def.action = None;
         } else {
@@ -616,19 +621,17 @@ async fn update_schedule_handler(
                 "mode must be 'agentic' or 'action'",
             );
         }
-    } else if let Some(action_id) = body.action_id.clone() {
-        if action_id.trim().is_empty() {
-            def.action = None;
-        } else {
-            def.action = Some(action_id);
-        }
+    } else {
+        // Tri-state: absent = leave the action unchanged, null/"" = clear it.
+        apply_tri_state_string(&mut def.action, &body.action_id);
     }
-    if let Some(cid) = body.channel {
-        if cid.trim().is_empty() {
-            def.channel = None;
+    if let Some(cid) = body.channel.as_ref() {
+        let name = cid.as_deref().map(str::trim).unwrap_or("");
+        def.channel = if name.is_empty() {
+            None
         } else {
-            def.channel = tasks_yaml::channel_name_for_id(&state.pool, Some(cid)).await;
-        }
+            tasks_yaml::channel_name_for_id(&state.pool, Some(name.to_string())).await
+        };
     }
     if let Some(plan) = body.plan {
         def.plan = Some(plan);
@@ -1075,5 +1078,33 @@ mod tests {
         write_tasks(data_dir, "schedules: {}\n");
         let removed = delete_schedule_from_tasks(data_dir, "nope").unwrap();
         assert!(!removed);
+    }
+
+    #[test]
+    fn schedule_patch_distinguishes_absent_null_blank_and_value() {
+        use crate::server::apply_tri_state_string;
+
+        // Absent key = leave the stored value alone.
+        let absent: UpdateScheduleRequest = serde_json::from_str("{}").unwrap();
+        assert!(absent.toolset.is_none());
+        // Explicit JSON null = clear (dashboard sends `toolset || null`).
+        let cleared: UpdateScheduleRequest = serde_json::from_str(r#"{"toolset":null}"#).unwrap();
+        assert_eq!(cleared.toolset, Some(None));
+        // Blank string = clear alias.
+        let blank: UpdateScheduleRequest = serde_json::from_str(r#"{"template":"  "}"#).unwrap();
+        assert_eq!(blank.template, Some(Some("  ".to_string())));
+        // A real value sets it.
+        let set: UpdateScheduleRequest = serde_json::from_str(r#"{"toolset":"dev_set"}"#).unwrap();
+        assert_eq!(set.toolset, Some(Some("dev_set".to_string())));
+
+        let mut stored = Some("dev_set".to_string());
+        apply_tri_state_string(&mut stored, &absent.toolset);
+        assert_eq!(stored.as_deref(), Some("dev_set"), "absent keeps the value");
+        apply_tri_state_string(&mut stored, &blank.template);
+        assert_eq!(stored, None, "blank clears");
+        apply_tri_state_string(&mut stored, &set.toolset);
+        assert_eq!(stored.as_deref(), Some("dev_set"), "value sets");
+        apply_tri_state_string(&mut stored, &cleared.toolset);
+        assert_eq!(stored, None, "explicit null clears");
     }
 }

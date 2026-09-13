@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tracing::error;
 
 use super::schedule::{ScheduleThread, ScheduleThreadsResponse, ThreadsQueryParams};
-use super::{err_json, ok_json, AppState};
+use super::{apply_tri_state_string, deserialize_double_option, err_json, ok_json, AppState};
 use crate::hooks::default_counter;
 use crate::tasks_yaml::{self, HookDef};
 use sql_forge::sql_forge;
@@ -153,25 +153,32 @@ struct UpdateHookRequest {
     event: Option<String>,
     #[serde(default)]
     scope: Option<String>,
-    #[serde(default)]
-    target: Option<String>,
+    // Tri-state string fields: an absent key leaves the stored value
+    // unchanged, an explicit JSON `null` (or a blank string) clears it, any
+    // other value sets it. A plain `Option<String>` cannot tell `null` apart
+    // from an absent key, so a clear sent by the dashboard (which spells an
+    // empty select as `value || null`) was silently dropped and the old
+    // value survived (same bug class as the profiles provider clear).
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    target: Option<Option<String>>,
     #[serde(default)]
     count: Option<i32>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    action_id: Option<String>,
-    #[serde(default)]
-    profile: Option<String>,
-    #[serde(default)]
-    channel: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    mode: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    prompt: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    action_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    profile: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    channel: Option<Option<String>>,
     #[serde(default)]
     plan: Option<bool>,
-    #[serde(default)]
-    template: Option<String>,
-    toolset: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    template: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    toolset: Option<Option<String>>,
     #[serde(default)]
     enabled: Option<bool>,
 }
@@ -398,40 +405,23 @@ async fn update_hook_handler(
             def.scope = s;
         }
     }
-    if let Some(t) = body.target.clone() {
-        def.target = if t.is_empty() { None } else { Some(t) };
-    }
+    apply_tri_state_string(&mut def.target, &body.target);
     if let Some(c) = body.count {
         def.count = c;
     }
-    if let Some(p) = body.prompt.clone() {
-        def.prompt = if p.is_empty() { None } else { Some(p) };
-    }
-    if let Some(p) = body.profile.clone() {
-        def.profile = if p.is_empty() { None } else { Some(p) };
-    }
-    if let Some(t) = body.template.clone() {
-        def.template = if t.is_empty() { None } else { Some(t) };
-    }
-    if let Some(t) = body.toolset.clone() {
-        def.toolset = if t.is_empty() { None } else { Some(t) };
-    }
-    if let Some(mode) = body.mode.clone() {
-        def.mode = if mode.is_empty() { None } else { Some(mode) };
-    }
-    if let Some(action_id) = body.action_id.clone() {
-        def.action = if action_id.is_empty() {
+    apply_tri_state_string(&mut def.prompt, &body.prompt);
+    apply_tri_state_string(&mut def.profile, &body.profile);
+    apply_tri_state_string(&mut def.template, &body.template);
+    apply_tri_state_string(&mut def.toolset, &body.toolset);
+    apply_tri_state_string(&mut def.mode, &body.mode);
+    apply_tri_state_string(&mut def.action, &body.action_id);
+    if let Some(cid) = body.channel.as_ref() {
+        let name = cid.as_deref().map(str::trim).unwrap_or("");
+        def.channel = if name.is_empty() {
             None
         } else {
-            Some(action_id)
+            tasks_yaml::channel_name_for_id(&state.pool, Some(name.to_string())).await
         };
-    }
-    if let Some(cid) = body.channel {
-        if cid.trim().is_empty() {
-            def.channel = None;
-        } else {
-            def.channel = tasks_yaml::channel_name_for_id(&state.pool, Some(cid)).await;
-        }
     }
     if body.plan.is_some() {
         def.plan = body.plan;
@@ -717,5 +707,38 @@ async fn fire_hook_handler(
                 &format!("Failed to fire hook: {}", e),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod patch_tri_state_tests {
+    use super::UpdateHookRequest;
+    use crate::server::apply_tri_state_string;
+
+    #[test]
+    fn hook_patch_distinguishes_absent_null_blank_and_value() {
+        // Absent key = leave the stored value alone.
+        let absent: UpdateHookRequest = serde_json::from_str("{}").unwrap();
+        assert!(absent.toolset.is_none());
+        // Explicit JSON null = clear (this is what the dashboard sends for an
+        // empty select: `toolset || null`).
+        let cleared: UpdateHookRequest = serde_json::from_str(r#"{"toolset":null}"#).unwrap();
+        assert_eq!(cleared.toolset, Some(None));
+        // Blank string = clear alias.
+        let blank: UpdateHookRequest = serde_json::from_str(r#"{"toolset":"  "}"#).unwrap();
+        assert_eq!(blank.toolset, Some(Some("  ".to_string())));
+        // A real value sets it.
+        let set: UpdateHookRequest = serde_json::from_str(r#"{"toolset":"dev_set"}"#).unwrap();
+        assert_eq!(set.toolset, Some(Some("dev_set".to_string())));
+
+        let mut stored = Some("dev_set".to_string());
+        apply_tri_state_string(&mut stored, &absent.toolset);
+        assert_eq!(stored.as_deref(), Some("dev_set"), "absent keeps the value");
+        apply_tri_state_string(&mut stored, &blank.toolset);
+        assert_eq!(stored, None, "blank clears");
+        apply_tri_state_string(&mut stored, &set.toolset);
+        assert_eq!(stored.as_deref(), Some("dev_set"), "value sets");
+        apply_tri_state_string(&mut stored, &cleared.toolset);
+        assert_eq!(stored, None, "explicit null clears");
     }
 }

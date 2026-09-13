@@ -33,7 +33,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::{err_json, ok_json, AppState};
+use super::{deserialize_double_option, err_json, ok_json, AppState};
 use crate::profiles_yaml::{validate_profile, ProfilesFile};
 
 // ---------------------------------------------------------------------------
@@ -102,17 +102,6 @@ struct CreateProfileRequest {
 struct ImportRequest {
     #[serde(default)]
     yaml: Option<String>,
-}
-
-/// Deserialize a tri-state field: absent -> `None` (leave unchanged),
-/// explicit JSON `null` -> `Some(None)` (clear to UNDEFINED), any other value
-/// -> `Some(Some(value))`.
-fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 /// Fields a PATCH may update.

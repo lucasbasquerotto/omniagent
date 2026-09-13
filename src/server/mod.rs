@@ -112,6 +112,43 @@ pub(crate) mod retention;
 pub(crate) type PlatformRestartSignals =
     Arc<Mutex<HashMap<String, (Arc<AtomicU64>, Arc<AtomicBool>, Arc<Notify>)>>>;
 
+/// Deserialize a TRI-STATE field: an absent key -> `None` (leave the stored
+/// value unchanged), an explicit JSON `null` -> `Some(None)` (clear it), any
+/// other value -> `Some(Some(value))` (set it).
+///
+/// With a plain `Option<T>` an explicit `null` is indistinguishable from an
+/// absent key, so "clear this field back to Default" was silently dropped
+/// (profiles PATCH regression, 2026-09-12: the previous provider stayed in
+/// effect). Every PATCH body that must tell "unchanged" apart from "clear"
+/// uses this deserializer plus [`apply_tri_state_string`].
+pub(crate) fn deserialize_double_option<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+/// Apply a tri-state string PATCH field to a stored `Option<String>`:
+/// `None` (key absent) leaves it unchanged, `Some(None)` (explicit `null`)
+/// and `Some(Some(blank))` (empty/whitespace) clear it, `Some(Some(value))`
+/// stores the trimmed value.
+pub(crate) fn apply_tri_state_string(
+    current: &mut Option<String>,
+    incoming: &Option<Option<String>>,
+) {
+    if let Some(value) = incoming {
+        let trimmed = value.as_deref().map(str::trim).unwrap_or("");
+        *current = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+}
+
 /// Shared application state for the HTTP server.
 #[derive(Clone)]
 pub(crate) struct AppState {

@@ -115,20 +115,29 @@ where
     Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
-/// Fields a PATCH may update (bare names; empty string clears to None).
+/// Fields a PATCH may update.
+///
+/// Every field is TRI-STATE: the key absent leaves the stored value unchanged,
+/// an explicit JSON `null` clears it to None (so the resolution chain falls
+/// through), and a value sets it. Empty / blank strings clear too - a
+/// back-compat alias for `null` used by CLI callers and by the dashboard
+/// provider select, whose "Default/None" option carries an empty value.
+///
+/// Before this was tri-state, `{"provider": null}` was indistinguishable from
+/// an ABSENT key, so "clear the provider back to Default" from the dashboard
+/// was silently ignored and the previous provider stayed in effect.
 #[derive(Debug, Deserialize, Default)]
 struct UpdateProfileRequest {
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    plan: Option<bool>,
-    #[serde(default)]
-    template: Option<String>,
-    /// Tri-state tool list: absent = leave unchanged; `null` = clear to
-    /// UNDEFINED (no restriction, all tools); `[]` = explicitly allow NO tool;
-    /// a list = allow exactly these tools.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    provider: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    plan: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    template: Option<Option<String>>,
+    /// Tri-state toolset id: absent = leave unchanged; `null` / `""` = clear to
+    /// UNDEFINED (no profile-level toolset); a value = this toolset id.
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub toolset: Option<Option<String>>,
 }
@@ -160,6 +169,30 @@ fn list_skills(data_dir: &str, name: &str) -> Vec<String> {
 /// Normalize an optional field from the API: empty/whitespace → None.
 fn clean_opt(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Apply a tri-state PATCH body to a stored definition (see
+/// [`UpdateProfileRequest`]): absent = leave unchanged, inner `None` = clear,
+/// inner `Some(value)` = set (blank strings clear, via [`clean_opt`]).
+///
+/// Extracted from the handler so the clear/set/unchanged contract is directly
+/// unit-testable without spinning up the HTTP router.
+fn apply_update(def: &mut crate::profiles_yaml::ProfileDef, req: &UpdateProfileRequest) {
+    if let Some(v) = req.provider.clone() {
+        def.provider = clean_opt(v);
+    }
+    if let Some(v) = req.model.clone() {
+        def.model = clean_opt(v);
+    }
+    if let Some(v) = req.plan {
+        def.plan = v;
+    }
+    if let Some(v) = req.template.clone() {
+        def.template = clean_opt(v);
+    }
+    if let Some(v) = req.toolset.clone() {
+        def.toolset = clean_opt(v);
+    }
 }
 
 /// Extract the YAML document from an import request body: a JSON
@@ -223,8 +256,13 @@ async fn create_profile_handler(
     }
 }
 
-/// PATCH /profiles/{id} - update one or more bare fields. Empty strings
-/// clear provider/model/template to None (fall through the resolution chain).
+/// PATCH /profiles/{id} - update one or more bare fields.
+///
+/// Tri-state per field: an ABSENT key leaves it unchanged, an explicit JSON
+/// `null` (or an empty/blank string, back-compat) clears
+/// provider/model/plan/template/toolset to None so the resolution chain falls
+/// through, and a value stores it. Response body = the updated entry, so a
+/// caller can assert the stored state without a second GET.
 async fn update_profile_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -236,23 +274,7 @@ async fn update_profile_handler(
     }
     let result = crate::profiles_yaml::update_profile_in(&state.data_dir, &name, |existing| {
         let mut def = existing.cloned().unwrap_or_default();
-        if req.provider.is_some() {
-            def.provider = clean_opt(req.provider.clone());
-        }
-        if req.model.is_some() {
-            def.model = clean_opt(req.model.clone());
-        }
-        if req.plan.is_some() {
-            def.plan = req.plan;
-        }
-        if req.template.is_some() {
-            def.template = clean_opt(req.template.clone());
-        }
-        if let Some(toolset) = req.toolset.clone() {
-            def.toolset = toolset
-                .map(|t| t.trim().to_string())
-                .filter(|v| !v.is_empty());
-        }
+        apply_update(&mut def, &req);
         Ok(def)
     });
     match result {
@@ -373,5 +395,61 @@ profiles:
             Some("opencode-go")
         );
         assert_eq!(clean_opt(None), None);
+    }
+
+    fn populated_def() -> crate::profiles_yaml::ProfileDef {
+        crate::profiles_yaml::ProfileDef {
+            provider: Some("opencode-go".to_string()),
+            model: Some("deepseek-v4-flash".to_string()),
+            plan: Some(true),
+            template: Some("dev-development".to_string()),
+            toolset: Some("dev_set".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn patch_absent_keys_leave_values_unchanged() {
+        let mut def = populated_def();
+        let req: UpdateProfileRequest = serde_json::from_str("{}").unwrap();
+        apply_update(&mut def, &req);
+        assert_eq!(def.provider.as_deref(), Some("opencode-go"));
+        assert_eq!(def.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(def.plan, Some(true));
+        assert_eq!(def.template.as_deref(), Some("dev-development"));
+        assert_eq!(def.toolset.as_deref(), Some("dev_set"));
+    }
+
+    #[test]
+    fn patch_explicit_null_clears_to_none() {
+        let mut def = populated_def();
+        let req: UpdateProfileRequest = serde_json::from_str(
+            r#"{"provider":null,"model":null,"plan":null,"template":null,"toolset":null}"#,
+        )
+        .unwrap();
+        apply_update(&mut def, &req);
+        assert_eq!(def.provider, None, "explicit null must clear the provider");
+        assert_eq!(def.model, None);
+        assert_eq!(def.plan, None);
+        assert_eq!(def.template, None);
+        assert_eq!(def.toolset, None);
+    }
+
+    #[test]
+    fn patch_empty_string_clears_and_value_sets() {
+        let mut def = populated_def();
+        let req: UpdateProfileRequest =
+            serde_json::from_str(r#"{"provider":"","model":"   ","toolset":""}"#).unwrap();
+        apply_update(&mut def, &req);
+        assert_eq!(def.provider, None, "empty string must clear the provider");
+        assert_eq!(def.model, None);
+        assert_eq!(def.toolset, None);
+        // Explicit values are stored (and trimmed).
+        let req: UpdateProfileRequest =
+            serde_json::from_str(r#"{"provider":" deepseek ","model":"deepseek-v4-flash"}"#)
+                .unwrap();
+        apply_update(&mut def, &req);
+        assert_eq!(def.provider.as_deref(), Some("deepseek"));
+        assert_eq!(def.model.as_deref(), Some("deepseek-v4-flash"));
     }
 }

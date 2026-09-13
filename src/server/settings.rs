@@ -416,7 +416,7 @@ fn get_all_setting_definitions() -> Vec<(String, SettingMeta)> {
             "git_sync_tool".into(),
             SettingMeta {
                 field_type: "select".into(),
-                description: "Name of the MCP tool core calls for the git actions API (fetch/pull --rebase/push), for example the dashboard explorer sync button. The value is the tool's registered qualified name ({plugin}__{tool}); defaults to the builtin git plugin's git__sync tool.".into(),
+                description: "Name of the MCP tool core calls for git actions API calls (for example, the dashboard explorer sync button). The value is the tool's registered qualified name ({plugin}__{tool}); defaults to the builtin git plugin's git__sync tool.".into(),
                 options: None,
                 readonly: false,
                 default: Some("git__sync".into()),

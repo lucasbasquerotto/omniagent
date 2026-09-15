@@ -146,11 +146,13 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     assert_retention_regression_guards(pool).await?;
 
     // -- Kanban boards (config/boards.yml) --
-    // Nullable `board` column on kanban_tasks: NULL = no board. Board gating is
-    // feature-flagged on the presence of config/boards.yml (src/boards.rs); the
-    // column is inert (and stays NULL for existing tasks) when the file is
-    // absent. Board deletion removes its tasks via the board-delete API handler
-    // (per-task cleanup mirrors the existing task-delete behavior).
+    // Nullable `board` column on kanban_tasks: NULL = no board. Boards are
+    // ALWAYS enabled (src/boards.rs): a task's board is always validated against
+    // the effective board set (config/boards.yml when present, else the built-in
+    // default set) and a missing file never disables boards; only pre-existing
+    // rows keep NULL until they are edited. Board deletion removes its tasks via
+    // the board-delete API handler (per-task cleanup mirrors the existing
+    // task-delete behavior).
     sqlx::query("ALTER TABLE kanban_tasks ADD COLUMN IF NOT EXISTS board TEXT")
         .execute(pool)
         .await

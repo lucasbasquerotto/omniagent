@@ -78,6 +78,33 @@ fn encode_query_value(s: &str) -> String {
     out
 }
 
+/// Forward an optional `board` argument into a request body (pure + unit-tested).
+///
+/// Semantics: the value is forwarded VERBATIM, and only when it is a non-empty
+/// string. Absent / `null` / `""` / whitespace all mean "the caller did not
+/// choose a board": the field is omitted so the core API applies its own rule
+/// (it REQUIRES the board while `boards.yml` is present and rejects an explicit
+/// clear) and its error surfaces verbatim through `api_call`. The tool never
+/// invents a default board - a silent default would hide the operator's board
+/// choice.
+fn forward_board(req: &mut Value, args: &Value) {
+    if let Some(board) = args.get("board").and_then(|b| b.as_str()) {
+        if !board.trim().is_empty() {
+            (*req)["board"] = serde_json::json!(board);
+        }
+    }
+}
+
+/// The `&board=` query suffix for `GET /kanban/tasks` (empty = no filter).
+fn board_query_suffix(board: &str) -> String {
+    let board = board.trim();
+    if board.is_empty() {
+        String::new()
+    } else {
+        format!("&board={}", encode_query_value(board))
+    }
+}
+
 async fn handle_create(
     _pool: &PgPool,
     args: &Value,
@@ -102,13 +129,8 @@ async fn handle_create(
             .or_else(|| args["workflow_id"].as_str())
             .unwrap_or(""),
     });
-    // Optional `board` (POST /kanban/tasks `board`): forwarded VERBATIM and
-    // only when non-empty. When boards are enabled the server REQUIRES it, and
-    // its error is surfaced verbatim by api_call - the tool never invents a
-    // default board (a silent default would hide the operator's board choice).
-    if let Some(board) = args["board"].as_str().filter(|b| !b.trim().is_empty()) {
-        req["board"] = serde_json::json!(board);
-    }
+    // Optional `board` (POST /kanban/tasks `board`): see `forward_board`.
+    forward_board(&mut req, args);
     // Optional `toolset` / `plan` / `tags`: same fields the HTTP API accepts.
     if let Some(toolset) = args["toolset"].as_str() {
         req["toolset"] = serde_json::json!(toolset);
@@ -159,10 +181,7 @@ async fn handle_list(_pool: &PgPool, args: &Value) -> Result<(String, bool)> {
         "/kanban/tasks?show_archived={}",
         if show_archived { "true" } else { "false" }
     );
-    if !board_filter.trim().is_empty() {
-        path.push_str("&board=");
-        path.push_str(&encode_query_value(board_filter.trim()));
-    }
+    path.push_str(&board_query_suffix(board_filter));
     let resp = api_call(reqwest::Method::GET, &path, None).await?;
     let tasks = resp["data"]
         .as_array()
@@ -243,11 +262,7 @@ async fn handle_update(
     // Board: PATCH accepts `board` and MOVES the task between boards. Empty or
     // null means "unchanged" here, so the field is omitted rather than sent as
     // "" (the server rejects an explicit clear while boards are enabled).
-    if let Some(b) = args.get("board").and_then(|b| b.as_str()) {
-        if !b.trim().is_empty() {
-            req["board"] = serde_json::json!(b);
-        }
-    }
+    forward_board(&mut req, args);
     // Server-side field is `workflow`; accept `workflow_id` as legacy alias.
     // Explicit empty string clears the workflow (board default applies).
     let wf = args.get("workflow").or_else(|| args.get("workflow_id"));
@@ -768,5 +783,85 @@ mod tests {
                 "'{d}' should be invalid"
             );
         }
+    }
+
+    /// The tool SCHEMAS must expose `board` on create/update/list - the exact
+    /// drift the operator hit (schema without `board` while the API requires it).
+    #[test]
+    fn kanban_schemas_expose_board() {
+        let pool: Arc<RwLock<Option<PgPool>>> = Arc::new(RwLock::new(None));
+        let tools = build_tools(&pool);
+        for name in [
+            "create_kanban_task",
+            "update_kanban_task",
+            "list_kanban_tasks",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.def.name == name)
+                .unwrap_or_else(|| panic!("tool {name} missing"));
+            let board = &tool.def.input_schema["properties"]["board"];
+            assert_eq!(
+                board["type"], "string",
+                "{name} must expose a string board parameter: {board:?}"
+            );
+        }
+        let create = tools
+            .iter()
+            .find(|t| t.def.name == "create_kanban_task")
+            .expect("create_kanban_task present");
+        assert_eq!(
+            create.def.input_schema["required"],
+            serde_json::json!(["title"]),
+            "title stays the ONLY required parameter: board must be forwarded, never forced client-side"
+        );
+    }
+
+    /// create: `board` is forwarded verbatim; absent/empty/null is NOT sent, so
+    /// the API's "board is required when boards are enabled" error surfaces.
+    #[test]
+    fn create_forwards_board_verbatim_and_only_when_present() {
+        let mut req = serde_json::json!({});
+        forward_board(&mut req, &serde_json::json!({"board": "omnidev"}));
+        assert_eq!(req["board"], "omnidev");
+
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"board": null}),
+            serde_json::json!({"board": ""}),
+            serde_json::json!({"board": "   "}),
+        ] {
+            let mut req = serde_json::json!({});
+            forward_board(&mut req, &args);
+            assert!(
+                req.get("board").is_none(),
+                "board must not be invented or sent for {args}: {req}"
+            );
+        }
+    }
+
+    /// update: a board MOVES the task; empty means "unchanged" (the API rejects
+    /// an explicit clear while boards are enabled).
+    #[test]
+    fn update_forwards_board_and_empty_means_unchanged() {
+        let mut req = serde_json::json!({});
+        forward_board(&mut req, &serde_json::json!({"board": "omnidev"}));
+        assert_eq!(req["board"], "omnidev");
+
+        let mut req = serde_json::json!({});
+        forward_board(&mut req, &serde_json::json!({"board": ""}));
+        assert!(
+            req.get("board").is_none(),
+            "empty board = unchanged, not an explicit clear"
+        );
+    }
+
+    /// list: the `&board=` filter is applied only when set and is percent-encoded.
+    #[test]
+    fn list_path_is_board_scoped_and_percent_encoded() {
+        assert_eq!(board_query_suffix(""), "");
+        assert_eq!(board_query_suffix("   "), "");
+        assert_eq!(board_query_suffix("omnidev"), "&board=omnidev");
+        assert_eq!(board_query_suffix(" v0.3.0 beta "), "&board=v0.3.0%20beta");
     }
 }

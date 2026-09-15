@@ -130,15 +130,28 @@ fn subtask_family_tools_are_recognised_under_any_id() {
     assert!(registry.family_tools("kanban").is_empty());
 }
 
-/// (d) No behaviour change: the descriptors shipped in `plugins/tools/*` must
-/// derive EXACTLY the guarded-read set the removed name allowlist produced.
+/// (d) The descriptors shipped in `plugins/tools/*` must derive EXACTLY the
+/// guarded-read set of the removed name allowlist PLUS the read tools of the
+/// unified `tasks` plugin.
+///
+/// Why the `tasks` reads are in the set: the deleted `kanban` / `cron` tool
+/// plugins shipped no `tools` array at all, so every read operation they
+/// exposed was UNGUARDED. The unified `tasks` plugin (the 1:1 migration of
+/// those same operations plus hooks) declares its behaviour descriptors on
+/// every tool, `read_only` + `repeat_guard` included - that is the task
+/// mandate ("preserve the per-tool behaviour descriptors on every `tasks__*`
+/// tool"), and it is what the registry resolves at runtime. The guarded set
+/// therefore legitimately grows by those five migrated/new read operations;
+/// the OPERATIONS themselves are unchanged. The same expectation is pinned
+/// next to the registry in `src/mcp/behavior.rs`.
 ///
 /// The builtin Rust memory plugin was removed (remote Python plugin only), so
 /// `memory__list_memories` is no longer declared by any manifest shipped in
 /// this repository and is intentionally absent from the expected set.
 #[test]
-fn shipped_manifests_reproduce_the_legacy_guarded_read_set() {
+fn shipped_manifests_guard_the_legacy_reads_and_the_tasks_reads() {
     let expected: BTreeSet<&str> = [
+        // The legacy name allowlist (unchanged).
         "filesystem__read",
         "filesystem__info",
         "filesystem__list",
@@ -154,6 +167,13 @@ fn shipped_manifests_reproduce_the_legacy_guarded_read_set() {
         "search__channel_prompts",
         "skills__list_skills",
         "skills__view_skill",
+        // Plus the read operations of the unified `tasks` plugin: the migrated
+        // kanban/cron lists plus the three hook reads.
+        "tasks__get_hook",
+        "tasks__list_cron_jobs",
+        "tasks__list_hook_threads",
+        "tasks__list_hooks",
+        "tasks__list_kanban_tasks",
     ]
     .into_iter()
     .collect();
@@ -210,7 +230,7 @@ fn shipped_manifests_reproduce_the_legacy_guarded_read_set() {
     let guarded_refs: BTreeSet<&str> = guarded.iter().map(String::as_str).collect();
     assert_eq!(
         guarded_refs, expected,
-        "descriptor-derived guarded set must equal the legacy allowlist"
+        "descriptor-derived guarded set must equal the legacy allowlist plus the unified tasks read tools"
     );
 }
 

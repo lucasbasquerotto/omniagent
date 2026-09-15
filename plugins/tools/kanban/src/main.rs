@@ -58,6 +58,20 @@ async fn api_call(method: reqwest::Method, path: &str, body: Option<&Value>) -> 
     Ok(json)
 }
 
+/// Percent-encode a query-string value (RFC 3986 unreserved set kept).
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 async fn handle_create(
     _pool: &PgPool,
     args: &Value,
@@ -82,12 +96,32 @@ async fn handle_create(
             .or_else(|| args["workflow_id"].as_str())
             .unwrap_or(""),
     });
+    // Optional `board` (POST /kanban/tasks `board`): forwarded VERBATIM and
+    // only when non-empty. When boards are enabled the server REQUIRES it, and
+    // its error is surfaced verbatim by api_call - the tool never invents a
+    // default board (a silent default would hide the operator's board choice).
+    if let Some(board) = args["board"].as_str().filter(|b| !b.trim().is_empty()) {
+        req["board"] = serde_json::json!(board);
+    }
+    // Optional `toolset` / `plan` / `tags`: same fields the HTTP API accepts.
+    if let Some(toolset) = args["toolset"].as_str() {
+        req["toolset"] = serde_json::json!(toolset);
+    }
+    if let Some(plan) = args["plan"].as_bool() {
+        req["plan"] = serde_json::json!(plan);
+    }
+    if let Some(tags) = args["tags"].as_array() {
+        req["tags"] = serde_json::json!(tags);
+    }
     let channel_id = args["channel_id"]
         .as_str()
+        .or_else(|| args["channel"].as_str())
         .map(String::from)
         .or_else(|| meta.and_then(|m| m.channel_id.clone()));
     if let Some(cid) = channel_id {
-        req["channel_id"] = serde_json::json!(cid);
+        // The HTTP API field is `channel` (there is no `channel_id` field), so
+        // the old name silently dropped the value.
+        req["channel"] = serde_json::json!(cid);
     }
     let profile = args["profile"]
         .as_str()
@@ -112,16 +146,27 @@ async fn handle_create(
 // ---------------------------------------------------------------------------
 
 async fn handle_list(_pool: &PgPool, args: &Value) -> Result<(String, bool)> {
-    let _status_filter = args["status"].as_str().unwrap_or("");
-    let resp = api_call(
-        reqwest::Method::GET,
-        "/kanban/tasks?show_archived=true",
-        None,
-    )
-    .await?;
+    let status_filter = args["status"].as_str().unwrap_or("");
+    let board_filter = args["board"].as_str().unwrap_or("");
+    let show_archived = args["show_archived"].as_bool().unwrap_or(true);
+    let mut path = format!(
+        "/kanban/tasks?show_archived={}",
+        if show_archived { "true" } else { "false" }
+    );
+    if !board_filter.trim().is_empty() {
+        path.push_str("&board=");
+        path.push_str(&encode_query_value(board_filter.trim()));
+    }
+    let resp = api_call(reqwest::Method::GET, &path, None).await?;
     let tasks = resp["data"]
         .as_array()
         .ok_or_else(|| anyhow!("Unexpected list response from kanban API"))?;
+    let tasks: Vec<&Value> = tasks
+        .iter()
+        // `status` used to be a declared-but-dead argument (the API has no
+        // status filter); apply it here instead of silently ignoring it.
+        .filter(|t| status_filter.is_empty() || t["status"].as_str() == Some(status_filter))
+        .collect();
     if tasks.is_empty() {
         return Ok(("_No kanban tasks found._".to_string(), false));
     }
@@ -147,11 +192,13 @@ async fn handle_list(_pool: &PgPool, args: &Value) -> Result<(String, bool)> {
             };
             let assignee = t["assignee"].as_str().unwrap_or("");
             let created = t["created_at"].as_str().unwrap_or("");
+            let board = t["board"].as_str().unwrap_or("");
             lines.push(format!(
-                "  {}. **{}** (`{}`)\n     - Priority: {} | Assignee: {} | Created: {}",
+                "  {}. **{}** (`{}`)\n     - Board: {} | Priority: {} | Assignee: {} | Created: {}",
                 i + 1,
                 title,
                 id,
+                board,
                 priority_label,
                 assignee,
                 created
@@ -175,17 +222,24 @@ async fn handle_update(
         .ok_or_else(|| anyhow!("Missing required argument: 'id'"))?;
     let mut req = serde_json::json!({});
     for field in [
-        "title",
-        "body",
-        "status",
-        "priority",
-        "assignee",
-        "channel_id",
-        "profile",
-        "archived",
+        "title", "body", "status", "priority", "assignee", "profile", "archived", "template",
+        "toolset", "plan",
     ] {
         if let Some(v) = args.get(field) {
             req[field] = v.clone();
+        }
+    }
+    // Channel: the HTTP API field is `channel`; `channel_id` remains accepted as
+    // a legacy alias on input.
+    if let Some(v) = args.get("channel").or_else(|| args.get("channel_id")) {
+        req["channel"] = v.clone();
+    }
+    // Board: PATCH accepts `board` and MOVES the task between boards. Empty or
+    // null means "unchanged" here, so the field is omitted rather than sent as
+    // "" (the server rejects an explicit clear while boards are enabled).
+    if let Some(b) = args.get("board").and_then(|b| b.as_str()) {
+        if !b.trim().is_empty() {
+            req["board"] = serde_json::json!(b);
         }
     }
     // Server-side field is `workflow`; accept `workflow_id` as legacy alias.
@@ -443,7 +497,7 @@ async fn main() -> Result<()> {
             def: McpToolDef {
                 name: "create_kanban_task".to_string(),
                 description:
-                    "Create a new kanban task. Adds a task to the kanban board with optional body, status, priority, and assignee."
+                    "Create a new kanban task. Adds a task to the kanban board with optional body, status, priority, and assignee. When boards are enabled (boards.yml present) the target `board` is REQUIRED and must name an existing board - the API error is returned verbatim (no silent default board)."
                         .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -469,7 +523,8 @@ async fn main() -> Result<()> {
                             "type": "string",
                             "description": "Optional assignee name"
                         },
-                        "channel_id": { "type": "string", "description": "Optional channel name for thread/cause creation (default: current channel)" },
+                        "channel_id": { "type": "string", "description": "Optional channel name for thread/cause creation (default: current channel). Legacy alias of `channel`" },
+                        "channel": { "type": "string", "description": "Optional channel name for thread/cause creation (default: current channel)" },
                         "profile": {
                             "type": "string",
                             "description": "Optional profile name for the task (default: current profile)"
@@ -485,6 +540,23 @@ async fn main() -> Result<()> {
                         "workflow_id": {
                             "type": "string",
                             "description": "Deprecated alias for workflow (accepted for backward compatibility)"
+                        },
+                        "board": {
+                            "type": "string",
+                            "description": "Target board name. REQUIRED when boards are enabled (boards.yml present) and must name an existing board; the API error is returned verbatim. When boards are disabled it is stored but inert."
+                        },
+                        "toolset": {
+                            "type": "string",
+                            "description": "Optional toolset name for the task's threads"
+                        },
+                        "plan": {
+                            "type": "boolean",
+                            "description": "Optional: whether the task runs in plan mode (defaults to the board's plan setting)"
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional list of tags to attach to the new task"
                         }
                     },
                     "required": ["title"]
@@ -502,6 +574,14 @@ async fn main() -> Result<()> {
                         "status": {
                             "type": "string",
                             "description": "Optional status filter. One of: backlog, todo, running, testing, review, blocked, done"
+                        },
+                        "board": {
+                            "type": "string",
+                            "description": "Optional board filter: when set, only tasks of that board are returned (maps to GET /kanban/tasks?board=)"
+                        },
+                        "show_archived": {
+                            "type": "boolean",
+                            "description": "Include archived tasks (default: true)"
                         }
                     }
                 }),
@@ -511,7 +591,7 @@ async fn main() -> Result<()> {
         McpToolEntry {
             def: McpToolDef {
                 name: "update_kanban_task".to_string(),
-                description: "Update an existing kanban task. Only provided fields are updated. Status changes are recorded in history.".to_string(),
+                description: "Update an existing kanban task. Only provided fields are updated. Status changes are recorded in history; `board` moves the task between boards.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -540,7 +620,12 @@ async fn main() -> Result<()> {
                             "type": "string",
                             "description": "New assignee"
                         },
-                        "channel_id": { "type": "string", "description": "New channel name" },
+                        "channel_id": { "type": "string", "description": "New channel name (legacy alias of `channel`)" },
+                        "channel": { "type": "string", "description": "New channel name" },
+                        "template": { "type": "string", "description": "New template file name (without .md)" },
+                        "toolset": { "type": "string", "description": "New toolset name" },
+                        "plan": { "type": "boolean", "description": "New plan-mode flag" },
+                        "board": { "type": "string", "description": "Move the task to another board. Only sent when non-empty; empty/null means unchanged (the API rejects an explicit clear while boards are enabled)" },
                         "profile": {
                             "type": "string",
                             "description": "New profile name"
@@ -679,6 +764,13 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_values_are_percent_encoded() {
+        assert_eq!(encode_query_value("plain-board_1.0"), "plain-board_1.0");
+        assert_eq!(encode_query_value("v0.3.0 beta"), "v0.3.0%20beta");
+        assert_eq!(encode_query_value("a&b=c"), "a%26b%3Dc");
+    }
 
     #[test]
     fn review_decision_whitelist_matches_server() {

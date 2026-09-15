@@ -1772,7 +1772,13 @@ fn core_api_url(base_url: &str, path: &str) -> String {
 /// tools with ONE generic tool: method + path + optional JSON body. Covers
 /// kanban task CRUD (/kanban/tasks...), schedule CRUD (/schedule... including
 /// DELETE /schedule/{id}), run-cron (/schedule/{id}/run), review
-/// (/kanban/tasks/{id}/review), plugins and actions endpoints.
+/// (/kanban/tasks/{id}/review), hooks CRUD/fire (/hooks, /hooks/{id},
+/// /hooks/{id}/toggle, /hooks/{id}/fire, /hooks/{id}/threads), plugins
+/// (/api/plugins...) and actions endpoints.
+///
+/// It is a VERBATIM PASSTHROUGH: the tool never rewrites API semantics, so it
+/// cannot drift from the HTTP API the way a hand-written wrapper can (the
+/// 2026-09-14 kanban `board` bug). Path/method are unrestricted.
 ///
 /// The core API base URL is resolved once by [`core_api_base_url`] and used
 /// BOTH in the tool description and in the request URL (audit V-8: the
@@ -1782,7 +1788,7 @@ fn omniagent_api_tool() -> McpTool {
     McpTool {
         name: tool_qualify(CORE_PLUGIN_NAME, "omniagent_api"),
         description: format!(
-            "Call the core omniagent HTTP API ({}). Specify an HTTP method, an API path and an optional JSON body; returns the response body as text. Covers kanban task CRUD (/kanban/tasks...), schedule CRUD (/schedule, /schedule/{{id}} incl. DELETE), run-cron (/schedule/{{id}}/run), review (/kanban/tasks/{{id}}/review), plugins and actions endpoints. This replaces the old kanban_*/cron_* plugin tools.",
+            "Call the core omniagent HTTP API ({}). Specify an HTTP method, an API path and an optional JSON body; returns the response body as text. Covers kanban task CRUD (/kanban/tasks...), schedule CRUD (/schedule, /schedule/{{id}} incl. DELETE), run-cron (/schedule/{{id}}/run), review (/kanban/tasks/{{id}}/review), hooks (/hooks, /hooks/{{id}}, /hooks/{{id}}/toggle, /hooks/{{id}}/fire, /hooks/{{id}}/threads), plugins (/api/plugins...) and actions endpoints. This replaces the old kanban_*/cron_* plugin tools; it is a verbatim passthrough, so it cannot drift from the API.",
             base_url
         ),
         input_schema: serde_json::json!({
@@ -1994,6 +2000,11 @@ mod tests {
             "description {:?} does not contain base URL {:?}",
             desc,
             base
+        );
+        assert!(
+            desc.contains("/hooks"),
+            "description must name the hooks endpoints: {:?}",
+            desc
         );
     }
 

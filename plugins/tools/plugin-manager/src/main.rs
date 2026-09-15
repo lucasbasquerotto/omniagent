@@ -3,10 +3,27 @@
 //!
 //! Tool: plugin_manager
 //! Parameters:
-//!   action: "list" | "install" | "uninstall" | "enable" | "disable" | "config"
+//!   action: "list" | "get" | "install" | "uninstall" | "enable" | "disable" | "config"
 //!   name: string (required for all except list)
 //!   url: string (required for install)
 //!   config: object (required for config action)
+//!
+//! PARITY (2026-09-15, kanban-tool-parity task): this tool is a convenience
+//! SUBSET of the plugin HTTP API (`src/server/plugins.rs`). Deliberate gaps
+//! (audited; each remains reachable through `core__omniagent_api`
+//! /api/plugins/... and the dashboard, so nothing is unreachable):
+//!   - install-git (POST /api/plugins/install-git)
+//!   - reinstall (POST /api/plugins/{type}/{source}/{name}/reinstall)
+//!   - setup (POST /api/plugins/{type}/{source}/{name}/setup)
+//!   - download (POST /api/plugins/{type}/{source}/{name}/download)
+//!   - refresh-models (POST /api/plugins/{type}/{source}/{name}/refresh-models)
+//!   - rename (POST /api/plugins/{type}/{source}/{name}/rename)
+//!
+//! These are administrative/dashboard lifecycle operations needing full
+//! {type}/{source}/{name} addressing and long-running download/setup semantics;
+//! exposing them as agent MCP actions would duplicate the API surface without
+//! adding capability. The `get` action WAS added because reading one plugin's
+//! detail (incl. kind/source) is a normal agent need.
 
 use anyhow::Result;
 use mcp_server_util::*;
@@ -184,6 +201,28 @@ async fn handle_config(data_dir: &str, args: &Value) -> Result<(String, bool)> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool: plugin_manager: get
+// ---------------------------------------------------------------------------
+
+/// Single-plugin detail (incl. kind/source, enabled state and config).
+async fn handle_get(data_dir: &str, args: &Value) -> Result<(String, bool)> {
+    let name = args["name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing required argument: 'name'"))?;
+
+    let yaml_type = match plugins_yaml::get_disk_plugin_type(data_dir, name) {
+        Ok(Some(t)) => plugins_yaml::PluginYamlType::from_type_str(&t),
+        _ => return Ok((format!("Plugin '{}' not found.", name), false)),
+    };
+
+    match plugins_yaml::get_plugin(data_dir, name, &yaml_type) {
+        Ok(Some(detail)) => Ok((serde_json::to_string_pretty(&detail)?, false)),
+        Ok(None) => Ok((format!("Plugin '{}' not found.", name), false)),
+        Err(e) => Ok((format!("Failed to read plugin: {:#}", e), true)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool: plugin_manager: main dispatch
 // ---------------------------------------------------------------------------
 
@@ -194,6 +233,7 @@ async fn handle_plugin_manager(data_dir: &str, args: &Value) -> Result<(String, 
 
     match action {
         "list" => handle_list(data_dir, args).await,
+        "get" => handle_get(data_dir, args).await,
         "install" => handle_install(data_dir, args).await,
         "uninstall" => handle_uninstall(data_dir, args).await,
         "enable" => handle_enable(data_dir, args).await,
@@ -201,7 +241,7 @@ async fn handle_plugin_manager(data_dir: &str, args: &Value) -> Result<(String, 
         "config" => handle_config(data_dir, args).await,
         _ => Ok((
             format!(
-                "Unknown action '{}'. Valid actions: list, install, uninstall, enable, disable, config",
+                "Unknown action '{}'. Valid actions: list, get, install, uninstall, enable, disable, config. (install-git, reinstall, setup, download, refresh-models and rename are administrative API/dashboard operations: use core__omniagent_api /api/plugins/...)",
                 action
             ),
             true,
@@ -257,19 +297,19 @@ async fn main() -> Result<()> {
     let tools = vec![McpToolEntry {
         def: McpToolDef {
             name: "plugin_manager".to_string(),
-            description: "Manage plugins: list, install, uninstall, enable, disable, or configure."
+            description: "Manage plugins: list, get, install, uninstall, enable, disable, or configure. This tool covers the common lifecycle actions; the administrative ones (install-git, reinstall, setup, download, refresh-models, rename) stay on the HTTP API (/api/plugins/..., reachable via core__omniagent_api) and the dashboard."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "install", "uninstall", "enable", "disable", "config"],
+                        "enum": ["list", "get", "install", "uninstall", "enable", "disable", "config"],
                         "description": "Action to perform"
                     },
                     "name": {
                         "type": "string",
-                        "description": "Plugin name (required for all except list)"
+                        "description": "Plugin name (required for all except list; resolved across plugin kinds by name)"
                     },
                     "url": {
                         "type": "string",
@@ -277,7 +317,7 @@ async fn main() -> Result<()> {
                     },
                     "config": {
                         "type": "object",
-                        "description": "Config object (required for config action)"
+                        "description": "Config object (required for config action); values may use $env:VAR and $secret:NAME references and boolean/number types"
                     }
                 },
                 "required": ["action"]

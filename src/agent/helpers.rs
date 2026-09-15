@@ -1,3 +1,4 @@
+use chrono::Utc;
 use sqlx::PgPool;
 use tracing::{error, warn};
 
@@ -20,6 +21,30 @@ pub fn merge_usage(cumulative: &mut Option<Usage>, new_usage: Option<Usage>) {
         } else {
             *cumulative = Some(new);
         }
+    }
+}
+/// Real elapsed time of a thread in milliseconds, measured from the thread's
+/// own start to "now".
+///
+/// THE single source of truth for a terminal thread's `duration_ms`: it uses
+/// the `started_at` set atomically by `claim_thread` - the same start reference
+/// completed threads measure from. Every terminal failure path passes this
+/// value to `finalize_thread`, so a failed thread records the SAME real elapsed
+/// total as a completed one instead of a hardcoded 0.
+///
+/// A thread that was never claimed (`started_at` still NULL, e.g. the
+/// supervisor paths that finalize before the claim) yields 0 here on purpose:
+/// `complete_thread` / `mark_thread_terminal` take the GREATEST of this value,
+/// the live progress value and the row's OWN elapsed
+/// (`NOW() - COALESCE(started_at, created_at)`), so such a thread still records
+/// its real total time (measured from the row) and a failure can never REDUCE
+/// an already recorded total. Deliberately NOT falling back to the struct's
+/// `created_at`: a stale in-memory `Thread` (loaded before the claim) would then
+/// overstate the total and diverge from `ended_at - started_at`.
+pub(crate) fn elapsed_ms_since_start(thread: &Thread) -> i32 {
+    match thread.started_at {
+        Some(start) => (Utc::now() - start).num_milliseconds().max(0) as i32,
+        None => 0,
     }
 }
 
@@ -60,7 +85,10 @@ pub async fn persist_or_abort(
                 "FK violation inserting message for thread {}: marking thread as failed",
                 thread_id
             );
-            // Mark the thread as failed
+            // Mark the thread as failed. No Thread handle is available on this
+            // path: `complete_thread` computes the real elapsed duration from
+            // the row's own `started_at`/`created_at` (GREATEST with the live
+            // value), so this failure still records a real total time.
             if let Err(e) = queries::complete_thread(
                 pool,
                 thread_id,

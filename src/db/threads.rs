@@ -899,7 +899,12 @@ pub async fn complete_thread(
                                      ELSE usage_agg.cached_tokens END,
                 output_tokens = CASE WHEN :output_tokens > 0 THEN :output_tokens
                                      ELSE usage_agg.output_tokens END,
-                duration_ms = :duration_ms,
+                duration_ms = GREATEST(
+                    0,
+                    :duration_ms,
+                    COALESCE(t.duration_ms, 0),
+                    COALESCE((EXTRACT(EPOCH FROM (NOW() - COALESCE(t.started_at, t.created_at))) * 1000)::int, 0)
+                ),
                 ended_at = NOW(),
                 iterations = COALESCE(
                     (SELECT MAX(iteration_number)
@@ -1157,6 +1162,11 @@ where
         r#"        UPDATE threads t
             SET status = :status,
                 ended_at = NOW(),
+                duration_ms = GREATEST(
+                    0,
+                    COALESCE(t.duration_ms, 0),
+                    COALESCE((EXTRACT(EPOCH FROM (NOW() - COALESCE(t.started_at, t.created_at))) * 1000)::int, 0)
+                ),
                 input_tokens = usage_agg.input_tokens,
                 cached_tokens = usage_agg.cached_tokens,
                 output_tokens = usage_agg.output_tokens,
@@ -2886,6 +2896,167 @@ mod tests {
         let _ = sqlx::query("DELETE FROM threads WHERE id IN ($1, $2)")
             .bind(thread_id)
             .bind(sys_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_write_records_real_elapsed_and_never_reduces_live_duration() {
+        // DB-backed regression (thread 2010): a FAILED thread must record its
+        // REAL total time in threads.duration_ms, exactly like a completed one,
+        // and the terminal failure write must never reduce a larger live
+        // progress value to 0. Covers all three terminal choke points:
+        // complete_thread("failed"), complete_thread with live progress, and
+        // mark_thread_terminal("skipped"). Skipped when DATABASE_URL is absent
+        // (offline/CI without a DB). It only ever touches rows it creates
+        // itself, and never runs against a production database.
+        let Ok(db_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let _db_guard = crate::db::DB_TEST_LOCK.lock().await;
+        let pool = sqlx::PgPool::connect(&db_url)
+            .await
+            .expect("connect dev db");
+
+        async fn duration_of(pool: &PgPool, id: i64) -> (i32, String) {
+            sqlx::query_as("SELECT duration_ms, status FROM threads WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("fetch terminal duration")
+        }
+
+        // (a) FAILED with a larger live progress value: the legacy hardcoded
+        // duration_ms = 0 failure write must NOT reset it.
+        let id_live: i64 = sqlx::query_scalar(
+            "INSERT INTO threads (status, cause, channel_id, profile) \
+             VALUES ('pending', 'user', 'test-channel-duration-failed', 'test-profile') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert live thread");
+        assert!(claim_thread(&pool, id_live).await, "claim must succeed");
+        // Backdate the start so the wall clock alone would be ~200 ms.
+        sqlx::query(
+            "UPDATE threads SET started_at = NOW() - INTERVAL '200 milliseconds' WHERE id = $1",
+        )
+        .bind(id_live)
+        .execute(&pool)
+        .await
+        .expect("backdate start");
+        update_thread_progress(
+            &pool,
+            id_live,
+            1,
+            CompleteThreadStats {
+                input_tokens: 0,
+                cached_tokens: 0,
+                output_tokens: 0,
+                duration_ms: 5000,
+            },
+        )
+        .await
+        .expect("live progress update");
+        complete_thread(
+            &pool,
+            id_live,
+            "failed",
+            CompleteThreadStats {
+                input_tokens: 0,
+                cached_tokens: 0,
+                output_tokens: 0,
+                duration_ms: 0,
+            },
+        )
+        .await
+        .expect("failed terminal write");
+        let (dur_live, status_live) = duration_of(&pool, id_live).await;
+        assert_eq!(status_live, "failed");
+        assert!(
+            dur_live >= 5000,
+            "failure must never reduce the live total time (got {dur_live})"
+        );
+
+        // (b) FAILED with zero stats: the real elapsed time must be recorded
+        // (not 0) and must match ended_at - started_at.
+        let id_fail: i64 = sqlx::query_scalar(
+            "INSERT INTO threads (status, cause, channel_id, profile) \
+             VALUES ('pending', 'user', 'test-channel-duration-failed', 'test-profile') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert failed thread");
+        assert!(claim_thread(&pool, id_fail).await, "claim must succeed");
+        sqlx::query(
+            "UPDATE threads SET started_at = NOW() - INTERVAL '1500 milliseconds' WHERE id = $1",
+        )
+        .bind(id_fail)
+        .execute(&pool)
+        .await
+        .expect("backdate start");
+        complete_thread(
+            &pool,
+            id_fail,
+            "failed",
+            CompleteThreadStats {
+                input_tokens: 0,
+                cached_tokens: 0,
+                output_tokens: 0,
+                duration_ms: 0,
+            },
+        )
+        .await
+        .expect("failed terminal write");
+        let (dur_fail, status_fail) = duration_of(&pool, id_fail).await;
+        assert_eq!(status_fail, "failed");
+        assert!(dur_fail > 0, "failed thread must record a real duration");
+        let (elapsed_ms,): (i32,) = sqlx::query_as(
+            "SELECT (EXTRACT(EPOCH FROM (ended_at - started_at)) * 1000)::int FROM threads WHERE id = $1",
+        )
+        .bind(id_fail)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch elapsed");
+        assert!(
+            (dur_fail - elapsed_ms).abs() <= 5,
+            "duration_ms ({dur_fail}) must equal ended_at - started_at ({elapsed_ms})"
+        );
+
+        // (c) SKIPPED via mark_thread_terminal: also records the real elapsed.
+        let id_skip: i64 = sqlx::query_scalar(
+            "INSERT INTO threads (status, cause, channel_id, profile) \
+             VALUES ('pending', 'user', 'test-channel-duration-failed', 'test-profile') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert skipped thread");
+        assert!(claim_thread(&pool, id_skip).await, "claim must succeed");
+        sqlx::query(
+            "UPDATE threads SET started_at = NOW() - INTERVAL '800 milliseconds' WHERE id = $1",
+        )
+        .bind(id_skip)
+        .execute(&pool)
+        .await
+        .expect("backdate start");
+        skip_thread(&pool, id_skip).await.expect("skip thread");
+        let (dur_skip, status_skip) = duration_of(&pool, id_skip).await;
+        assert_eq!(status_skip, "skipped");
+        assert!(
+            dur_skip >= 700,
+            "skipped thread must record its real elapsed time (got {dur_skip})"
+        );
+
+        // Cleanup: delete only the rows this test created.
+        let _ = sqlx::query("DELETE FROM messages WHERE thread_id IN ($1, $2, $3)")
+            .bind(id_live)
+            .bind(id_fail)
+            .bind(id_skip)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM threads WHERE id IN ($1, $2, $3)")
+            .bind(id_live)
+            .bind(id_fail)
+            .bind(id_skip)
             .execute(&pool)
             .await;
     }

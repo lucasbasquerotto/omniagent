@@ -626,8 +626,48 @@ struct KanbanTaskEntry {
     goal_max_rounds: Option<i32>,
     goal_revision: Option<i32>,
     tags: Vec<String>,
+    /// Per-role workflow attempt counters.
+    ///
+    /// Populated by the DETAIL endpoint (`GET /kanban/tasks/{id}`) only; the
+    /// board list leaves it `None` and `skip_serializing_if` drops the key, so
+    /// the list payload stays lean and the dashboard needs no extra request
+    /// per task (no N+1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    counters: Option<TaskCounters>,
     created_at: Option<String>,
     updated_at: Option<String>,
+}
+
+/// Per-role workflow counters for one kanban task.
+///
+/// Semantics: every counter is the number of THREADS DISPATCHED for that role
+/// for this task - an attempt count, NOT "threads currently in this status".
+/// It therefore stays correct while the task sits in any other column.
+///
+/// The threads table carries only `workflow_step` (there is no
+/// `workflow_role` column), so the role is derived from the step mapping that
+/// the workflow engine itself uses (`agent::fail_thread::workflow_role_for_step`):
+/// `running` -> executor, `testing` -> tester, `review` -> reviewer.
+#[derive(Debug, Serialize, Default)]
+struct TaskCounters {
+    /// Executor attempts: threads whose workflow step is `running`.
+    executor: i64,
+    /// Tester attempts: threads whose workflow step is `testing`.
+    tester: i64,
+    /// Reviewer attempts: threads whose workflow step is `review`.
+    reviewer: i64,
+    /// Total executor attempts (`executor`). A task that never reworked = 1.
+    executions: i64,
+    /// Executor attempts beyond the first: `executions - 1` (0 when the task
+    /// has no executor attempt yet). Reworks add executor attempts.
+    retries: i64,
+}
+
+#[derive(FromRow)]
+struct TaskCountersRow {
+    executor: Option<i64>,
+    tester: Option<i64>,
+    reviewer: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -794,6 +834,9 @@ fn task_row_to_entry(data_dir: &str, r: KanbanTaskRow) -> KanbanTaskEntry {
                     .collect()
             })
             .unwrap_or_default(),
+        // Counters are attached by the detail handler only (see
+        // `fetch_task_counters`); the board list omits the key entirely.
+        counters: None,
         goal_phase: r.goal_phase,
         goal_blocked_code: r.goal_blocked_code,
         goal_blocked_message: r.goal_blocked_message,
@@ -1025,7 +1068,58 @@ async fn get_task_handler(
         }
     };
 
-    ok_json(task_row_to_entry(&state.data_dir, row))
+    let mut entry = task_row_to_entry(&state.data_dir, row);
+
+    // Workflow counters: ONE aggregate over this task's threads, so the
+    // dashboard renders the per-role attempt counts without any extra request.
+    // A counters failure must not take the whole detail page down: log it and
+    // return the task without the counters block (the dashboard hides it).
+    match fetch_task_counters(&state.pool, &id).await {
+        Ok(counters) => entry.counters = Some(counters),
+        Err(e) => error!("[kanban/tasks/{}] counters query failed: {:?}", id, e),
+    }
+
+    ok_json(entry)
+}
+
+/// Per-role workflow attempt counters for one kanban task: a single indexed
+/// aggregate over `threads` (no N+1 per task/role), keyed by `task_id`.
+///
+/// `executions`/`retries` are derived from the SAME attempt data: the executor
+/// attempts are the task's executions, and retries are every attempt beyond
+/// the first (`executions - 1`, saturating at 0).
+///
+/// NOTE: this is deliberately NOT `kanban_tasks.workflow_state.executions` -
+/// that engine counter is resettable (`POST /kanban/tasks/{id}/workflow/
+/// executions/reset`) and is cleared on review for some workflows, so it does
+/// not answer "how much work did this task consume". The thread attempts do.
+async fn fetch_task_counters(
+    pool: &sqlx::PgPool,
+    task_id: &str,
+) -> Result<TaskCounters, sqlx::Error> {
+    let row = sql_forge!(
+        TaskCountersRow,
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE workflow_step = 'running') AS executor,
+            COUNT(*) FILTER (WHERE workflow_step = 'testing') AS tester,
+            COUNT(*) FILTER (WHERE workflow_step = 'review')  AS reviewer
+        FROM threads
+        WHERE task_id = :task_id
+        "#,
+        ( :task_id = task_id )
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let executor = row.executor.unwrap_or(0);
+    Ok(TaskCounters {
+        executor,
+        tester: row.tester.unwrap_or(0),
+        reviewer: row.reviewer.unwrap_or(0),
+        executions: executor,
+        retries: (executor - 1).max(0),
+    })
 }
 
 // ---------------------------------------------------------------------------

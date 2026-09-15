@@ -186,14 +186,7 @@ fn test_list_builtins_have_source_code() {
     // plugin (remote Python only)"); memory is now a remote Python plugin, so
     // it is no longer discoverable with source == "built-in" (see
     // tests/tool_behavior_descriptors.rs for the same documented removal).
-    for name in &[
-        "cron",
-        "kanban",
-        "plugin-manager",
-        "search",
-        "ssh",
-        "subtasks",
-    ] {
+    for name in &["tasks", "plugin-manager", "search", "ssh", "subtasks"] {
         let plugin = data
             .iter()
             .find(|p| p["name"] == *name && p["source"] == "built-in");

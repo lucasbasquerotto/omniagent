@@ -1,0 +1,49 @@
+{
+  "name": "Tasks MCP Server",
+  "id": "mcp-server-tasks",
+  "version": "0.1.0",
+  "description": "Unified task management MCP server: kanban tasks (create/list/update/delete, dependencies, review), cron/schedule jobs (create/list/update/delete) and hooks (create/list/update/toggle/delete/fire/threads)",
+  "type": "mcp",
+  "entrypoint": {
+    "command": "mcp-server-tasks",
+    "args": [],
+    "transport": "stdio"
+  },
+  "config_schema": [
+    {
+      "key": "database_url",
+      "label": "Database URL",
+      "type": "string",
+      "default": "$env:DATABASE_URL",
+      "description": "PostgreSQL connection URL for kanban task / cron job storage"
+    },
+    {
+      "key": "base_url",
+      "label": "Core API base URL",
+      "type": "string",
+      "default": "http://localhost:8080",
+      "description": "Base URL of the core omniagent HTTP API used by the kanban and hooks tools"
+    }
+  ],
+  "tools": [
+    { "name": "create_kanban_task", "behavior": {} },
+    { "name": "list_kanban_tasks", "behavior": { "read_only": true, "repeat_guard": true } },
+    { "name": "update_kanban_task", "behavior": {} },
+    { "name": "delete_kanban_task", "behavior": {} },
+    { "name": "add_kanban_dependency", "behavior": {} },
+    { "name": "remove_kanban_dependency", "behavior": {} },
+    { "name": "kanban_review_task", "behavior": {} },
+    { "name": "create_cron_job", "behavior": {} },
+    { "name": "list_cron_jobs", "behavior": { "read_only": true, "repeat_guard": true } },
+    { "name": "update_cron_job", "behavior": {} },
+    { "name": "delete_cron_job", "behavior": {} },
+    { "name": "list_hooks", "behavior": { "read_only": true, "repeat_guard": true } },
+    { "name": "get_hook", "behavior": { "read_only": true, "repeat_guard": true } },
+    { "name": "create_hook", "behavior": {} },
+    { "name": "update_hook", "behavior": {} },
+    { "name": "toggle_hook", "behavior": {} },
+    { "name": "delete_hook", "behavior": {} },
+    { "name": "fire_hook", "behavior": { "affects_own_stack": true } },
+    { "name": "list_hook_threads", "behavior": { "read_only": true, "repeat_guard": true } }
+  ]
+}

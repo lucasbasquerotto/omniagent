@@ -1,8 +1,8 @@
 [package]
-name = "mcp-server-kanban"
+name = "mcp-server-tasks"
 version = "0.1.0"
 edition = "2021"
-description = "Kanban MCP server"
+description = "Unified task MCP server: kanban tasks, cron/schedule jobs and hooks"
 
 [dependencies]
 mcp-server-util = { path = "../util" }
@@ -14,5 +14,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio", "chrono"] }
+sql-forge = "0.5.0"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json"] }
+cron = "0.13"
+reqwest = { version = "0.12", features = ["json", "blocking"] }

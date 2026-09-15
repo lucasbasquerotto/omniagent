@@ -961,7 +961,7 @@ fn build_plugin_detail(
 
     // Compute has_source_code: Cargo.toml, package.json, pyproject.toml, or source
     // files (.py, .js, .ts) in the plugin directory indicate source code is present.
-    // Bare binary names like "mcp-server-cron" or API-mode providers have no source.
+    // Bare binary names like "mcp-server-tasks" or API-mode providers have no source.
     // Remote plugins without explicit entrypoint may still have source files.
     let has_source_code = if manifest.api_mode.is_some() {
         false
@@ -1042,7 +1042,7 @@ fn build_plugin_detail(
                             }
                         }
                     }
-                    // Bare entrypoint (e.g., "mcp-server-cron") is a pre-compiled binary : not a script.
+                    // Bare entrypoint (e.g., "mcp-server-tasks") is a pre-compiled binary : not a script.
                     // But if there are source files by extension AND no build system, it's a script.
                     // has_source_code was set to true by has_source_file_by_extension which found .py/.js/.sh files.
                     // Without Cargo.toml/package.json/pyproject.toml, these are script files.
@@ -2727,14 +2727,14 @@ providers:
     fn test_build_plugin_detail_bare_binary_without_source() {
         // A bare precompiled binary with no source files stays "no source code".
         let (d, data_dir) = test_data_dir();
-        let plugin_dir = d.path().join("plugins/mcp-server-cron");
+        let plugin_dir = d.path().join("plugins/mcp-server-tasks");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(
-            plugin_dir.join("mcp-server-cron"),
+            plugin_dir.join("mcp-server-tasks"),
             b"ELF-binary-placeholder",
         )
         .unwrap();
-        let manifest = test_manifest("mcp-server-cron", vec![]);
+        let manifest = test_manifest("mcp-server-tasks", vec![]);
         let detail = build_plugin_detail(
             &manifest,
             "remote",

@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn read_looking_names_are_detected_for_the_loud_warning() {
         assert!(looks_like_read_tool("notes_note-list"));
-        assert!(looks_like_read_tool("cron_list-cron-jobs"));
+        assert!(looks_like_read_tool("tasks_list-cron-jobs"));
         assert!(looks_like_read_tool("search_thread-messages"));
         assert!(!looks_like_read_tool("docker_compose"));
         assert!(!looks_like_read_tool("git_commit-and-push"));

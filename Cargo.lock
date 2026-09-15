@@ -1313,24 +1313,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcp-server-cron"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "cron",
- "mcp-server-util",
- "omniagent",
- "serde",
- "serde_json",
- "sql-forge",
- "sqlx",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "mcp-server-fetch"
 version = "0.1.0"
 dependencies = [
@@ -1373,23 +1355,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mcp-server-kanban"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "mcp-server-util",
- "omniagent",
- "reqwest",
- "serde",
- "serde_json",
- "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1498,6 +1463,25 @@ dependencies = [
  "chrono",
  "mcp-server-util",
  "omniagent",
+ "serde",
+ "serde_json",
+ "sql-forge",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mcp-server-tasks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "cron",
+ "mcp-server-util",
+ "omniagent",
+ "reqwest",
  "serde",
  "serde_json",
  "sql-forge",

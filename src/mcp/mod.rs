@@ -1605,7 +1605,7 @@ pub async fn default_registry(ctx: &mut AppContext) -> McpRegistry {
     // ── External MCP servers are loaded from config + plugins/mcp/ ──
     // All tools are loaded from external subprocess MCP servers:
     //   fetch, filesystem, skills (Python stdio)
-    //   cron, kanban, search, memory, git, query, metrics, subtasks, plugin-manager, actions (Rust stdio)
+    //   tasks (unified kanban + cron + hooks), search, memory, git, query, metrics, subtasks, plugin-manager, actions (Rust stdio)
     // External servers are auto-discovered via load_servers_config() below.
 
     // External MCP servers (load from config + plugins/mcp/, best-effort)
@@ -1768,8 +1768,9 @@ fn core_api_url(base_url: &str, path: &str) -> String {
 }
 
 /// Build the `omniagent-api` tool: generic fetch-like HTTP client for the
-/// core omniagent API. Replaces the cron/kanban plugin MCP
-/// tools with ONE generic tool: method + path + optional JSON body. Covers
+/// core omniagent API. Complements the `tasks` plugin MCP tools (kanban
+/// tasks + schedules + hooks) with ONE generic tool: method + path + optional
+/// JSON body. Covers
 /// kanban task CRUD (/kanban/tasks...), schedule CRUD (/schedule... including
 /// DELETE /schedule/{id}), run-cron (/schedule/{id}/run), review
 /// (/kanban/tasks/{id}/review), hooks CRUD/fire (/hooks, /hooks/{id},

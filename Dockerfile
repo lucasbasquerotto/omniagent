@@ -15,9 +15,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY db-migrations/Cargo.toml ./db-migrations/
 COPY plugins/tools/util/Cargo.toml ./plugins/tools/util/
-COPY plugins/tools/cron/Cargo.toml ./plugins/tools/cron/
+COPY plugins/tools/tasks/Cargo.toml ./plugins/tools/tasks/
 COPY plugins/tools/docker/Cargo.toml ./plugins/tools/docker/
-COPY plugins/tools/kanban/Cargo.toml ./plugins/tools/kanban/
 COPY plugins/tools/search/Cargo.toml ./plugins/tools/search/
 COPY plugins/tools/plugin-manager/Cargo.toml ./plugins/tools/plugin-manager/
 COPY plugins/tools/subtasks/Cargo.toml ./plugins/tools/subtasks/

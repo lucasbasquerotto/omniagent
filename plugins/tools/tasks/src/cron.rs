@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! mcp-server-cron: standalone MCP server for cron job management.
 //! Communicates via stdio JSON-RPC (MCP protocol).
 //!
@@ -534,12 +535,9 @@ impl PluginConfig {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Shared pool - populated by configure callback before any tool call
+pub fn build_tools(pool: &Arc<RwLock<Option<PgPool>>>) -> Vec<McpToolEntry> {
     // Channels live in {OMNI_DIR}/config/channels.yml - set the global data dir.
     omniagent::channels_yaml::set_data_dir(&data_dir());
-    let pool = Arc::new(RwLock::new(None::<PgPool>));
 
     // Wrap each handler to capture a clone of the shared pool
     let p_cron = pool.clone();
@@ -669,24 +667,5 @@ async fn main() -> Result<()> {
         },
     ];
 
-    let server_info = ServerInfo {
-        name: "mcp-server-cron".to_string(),
-        version: "0.1.0".to_string(),
-    };
-
-    run_server_with_config(server_info, tools, {
-        let p = pool.clone();
-        Some(move |params: serde_json::Value| {
-            let config = PluginConfig::from_json(&params);
-            tokio::task::block_in_place(|| {
-                let rt = tokio::runtime::Handle::current();
-                let new_pool = rt
-                    .block_on(db::connect(&config.database_url))
-                    .expect("Failed to connect to database");
-                *p.blocking_write() = Some(new_pool);
-            });
-            tracing::info!("Cron plugin configured with database_url");
-        })
-    })
-    .await
+    tools
 }

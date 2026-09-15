@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! mcp-server-kanban: standalone MCP server for kanban task management.
 //! Communicates via stdio JSON-RPC (MCP protocol).
 //!
@@ -27,6 +28,11 @@ use tokio::sync::RwLock;
 
 /// Core server base URL (configure message `base_url`; default localhost:8080).
 static BASE_URL: OnceLock<String> = OnceLock::new();
+
+/// Set the core API base URL (from the plugin configure message).
+pub fn set_base_url(url: String) {
+    let _ = BASE_URL.set(url);
+}
 
 fn api_url(path: &str) -> String {
     let base = BASE_URL
@@ -403,10 +409,8 @@ async fn handle_review(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Shared pool - populated by configure callback before any tool call
-    let pool: Arc<RwLock<Option<PgPool>>> = Arc::new(RwLock::new(None));
+pub fn build_tools(pool: &Arc<RwLock<Option<PgPool>>>) -> Vec<McpToolEntry> {
+    omniagent::channels_yaml::set_data_dir(&crate::data_dir());
 
     let p_create = pool.clone();
     let create_handler: ToolHandler = Box::new(move |args: Value, meta: Option<McpMeta>| {
@@ -738,27 +742,7 @@ async fn main() -> Result<()> {
     ];
 
     // Start the MCP server
-    let server_info = ServerInfo {
-        name: "mcp-server-kanban".to_string(),
-        version: "0.1.0".to_string(),
-    };
-
-    run_server_with_config(server_info, tools, {
-        let p = pool.clone();
-        Some(move |params: serde_json::Value| {
-            let config = PluginConfig::from_json(&params);
-            let _ = BASE_URL.set(config.base_url.clone());
-            tokio::task::block_in_place(|| {
-                let rt = tokio::runtime::Handle::current();
-                let new_pool = rt
-                    .block_on(db::connect(&config.database_url))
-                    .expect("Failed to connect to database");
-                *p.blocking_write() = Some(new_pool);
-            });
-            tracing::info!("Kanban plugin configured with database_url");
-        })
-    })
-    .await
+    tools
 }
 
 #[cfg(test)]

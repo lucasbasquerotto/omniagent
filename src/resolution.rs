@@ -88,11 +88,13 @@ fn channel_def_from(data_dir: &str, name: &str) -> Option<ChannelDef> {
 /// - `profile`: task → board.profile → channel.profile → default profile
 /// - `plan`: task → board.plan
 ///
-/// Fail-loud (mirrors `crate::boards::task_board` semantics): when boards.yml
-/// exists and the task's board is NULL or unknown → `Err` - never a silent
-/// empty fallback that changes behavior. When boards.yml is absent (feature
-/// disabled) the board contributes nothing and the task behaves exactly like
-/// a non-board task.
+/// Fail-loud (mirrors `crate::boards::task_board` semantics): boards are
+/// ALWAYS enabled, so a task whose board is NULL/empty or unknown → `Err` -
+/// never a silent fallback. When boards.yml is absent the built-in DEFAULT
+/// board set applies (at least `main`), so a board-less task is still an
+/// explicit error and an unknown board still fails loudly; the default board
+/// itself contributes no options, so the other tiers keep resolving exactly
+/// as before.
 pub fn resolve_task_defaults(
     data_dir: &str,
     task: &TaskFallbackFields<'_>,
@@ -406,14 +408,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_task_defaults_plain_task_boards_disabled() {
-        // No boards.yml → board contributes nothing; the task's own fields
-        // are the effective values (workflow/channel/profile/plan).
+    fn resolve_task_defaults_plain_task_missing_boards_uses_default_set() {
+        // No boards.yml → the built-in DEFAULT board set ({main}, no options)
+        // is in use: the board contributes nothing, the task's own fields are
+        // the effective values (workflow/channel/profile/plan), and a task on
+        // the default board resolves fine.
         let dir = temp_data_dir(None, None, None);
         let resolved = resolve_task_defaults(
             &dir,
             &TaskFallbackFields {
-                board: None,
+                board: Some(crate::boards::DEFAULT_BOARD_NAME),
                 workflow_id: Some("omniagent-dev"),
                 channel_id: Some("kanban"),
                 profile: Some("omni"),
@@ -421,11 +425,47 @@ mod tests {
                 template: None,
             },
         )
-        .expect("boards disabled → no board error");
+        .expect("default board set → no board error");
         assert_eq!(resolved.workflow_id.as_deref(), Some("omniagent-dev"));
         assert_eq!(resolved.channel_id, "kanban");
         assert_eq!(resolved.profile, "omni");
         assert_eq!(resolved.plan, Some(true));
+    }
+
+    #[test]
+    fn resolve_task_defaults_missing_boards_still_validates_board() {
+        // Boards are ALWAYS enabled: with boards.yml missing, board validation
+        // still runs against the built-in default set - the board field is
+        // never inert (no Ok(None) path).
+        let dir = temp_data_dir(None, None, None);
+        let no_board = resolve_task_defaults(
+            &dir,
+            &TaskFallbackFields {
+                board: None,
+                workflow_id: None,
+                channel_id: None,
+                profile: None,
+                plan: None,
+                template: None,
+            },
+        );
+        assert_eq!(no_board.unwrap_err(), "task has no board");
+
+        let unknown = resolve_task_defaults(
+            &dir,
+            &TaskFallbackFields {
+                board: Some("no-such-board"),
+                workflow_id: None,
+                channel_id: None,
+                profile: None,
+                plan: None,
+                template: None,
+            },
+        );
+        assert_eq!(
+            unknown.unwrap_err(),
+            "task board 'no-such-board' not found in boards.yml"
+        );
     }
 
     #[test]
@@ -848,7 +888,8 @@ mod template_chain_tests {
     #[test]
     fn template_all_tiers_empty_is_none() {
         let dir = data_dir("all-empty", None, None, None);
-        let r = resolve_task_defaults(&dir, &fields(None, None)).expect("boards disabled");
+        let r = resolve_task_defaults(&dir, &fields(Some(crate::boards::DEFAULT_BOARD_NAME), None))
+            .expect("default board set (boards.yml missing) → no board error");
         assert_eq!(r.template, None, "nothing set anywhere -> no template");
     }
 

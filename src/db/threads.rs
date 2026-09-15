@@ -1479,8 +1479,10 @@ pub(crate) async fn create_kanban_step_thread(
 
     // 1b. Resolve the task's effective defaults ONCE at load (task → board →
     //     channel → global settings) - the universal resolution pattern. The
-    //     board gate is part of the resolution: boards.yml present + invalid
-    //     board (NULL or not in the file) fails LOUD here, and the thread is
+    //     board gate is part of the resolution: boards are ALWAYS enabled, so an
+    //     invalid board (NULL or not in the effective board set - boards.yml or
+    //     the built-in default set when the file is missing) fails LOUD here,
+    //     and the thread is
     //     created and IMMEDIATELY terminated as 'failed' with a clear Error
     //     message (mirrors the no-channel failure path in
     //     create_thread_with_cause).
@@ -1864,16 +1866,15 @@ async fn fail_kanban_thread_no_board(
 
 /// Board validity guard for workflow-transition thread creators that do NOT
 /// go through `create_kanban_step_thread` (tester/reviewer step threads in
-/// kanban_updater). Boards disabled -> always Ok. Boards enabled -> Err(msg)
-/// when the task's board is NULL or unknown.
+/// kanban_updater). Boards are ALWAYS enabled, so the guard ALWAYS runs:
+/// `Err(msg)` when the task's board is NULL/empty or unknown, or when the board
+/// configuration itself is unreadable/invalid/empty (fail loud - never an
+/// inert board field).
 pub async fn ensure_task_board_valid(
     pool: &PgPool,
     data_dir: &str,
     task_id: &str,
 ) -> Result<(), String> {
-    if !crate::boards::boards_enabled(data_dir) {
-        return Ok(());
-    }
     let board: Option<String> = sql_forge!(
         scalar Option<String>,
         "SELECT board FROM kanban_tasks WHERE id = :id",
@@ -1882,19 +1883,7 @@ pub async fn ensure_task_board_valid(
     .fetch_one(pool)
     .await
     .map_err(|e| format!("failed to load task board: {e}"))?;
-    match board {
-        None => Err("task has no board".to_string()),
-        Some(name) => {
-            let path = crate::config_path::config_path(data_dir, "boards.yml");
-            let file = crate::boards::BoardsFile::load(&path)
-                .map_err(|e| format!("failed to load boards.yml: {e}"))?;
-            if file.boards.contains_key(&name) {
-                Ok(())
-            } else {
-                Err(format!("task board '{name}' not found in boards.yml"))
-            }
-        }
-    }
+    crate::boards::task_board(data_dir, board.as_deref()).map(|_| ())
 }
 
 /// Dispatch a kanban task AFTER its status changed (UI move / API status

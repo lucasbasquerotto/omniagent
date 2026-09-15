@@ -10,7 +10,7 @@
 use serde::Serialize;
 use sql_forge::sql_forge;
 use sqlx::PgPool;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::error::{AppResult, Error};
 
@@ -253,38 +253,37 @@ pub async fn dispatch_todo_tasks(pool: &PgPool, data_dir: &str) -> AppResult<Dis
         .filter(|t| scan_row_eligible(&t.status, t.archived))
         .collect();
 
-    // 1b. Board gate (feature-flagged on the presence of config/boards.yml):
-    //     when boards are enabled, tasks with no board or an unknown board
-    //     are INVALID-BOARD tasks - skipped exactly like backlog/archived
-    //     tasks (never promoted/dispatched). Thread creation for them is
-    //     additionally blocked/failed in create_kanban_step_thread.
-    let boards_enabled = crate::boards::boards_enabled(data_dir);
-    let boards_file: Option<crate::boards::BoardsFile> = if boards_enabled {
-        match crate::boards::BoardsFile::load(&crate::config_path::config_path(
-            data_dir,
-            "boards.yml",
-        )) {
-            Ok(file) => Some(file),
-            Err(e) => {
-                error!("[kanban/dispatch] failed to load boards.yml: {:?}", e);
-                return Err(Error::Message("Failed to load boards.yml".to_string()));
-            }
+    // 1b. Board gate (ALWAYS ON - boards are never feature-flagged off):
+    //     tasks with no board or an unknown board are INVALID-BOARD tasks -
+    //     skipped exactly like backlog/archived tasks (never
+    //     promoted/dispatched). Thread creation for them is additionally
+    //     blocked/failed in create_kanban_step_thread.
+    //
+    //     The EFFECTIVE board set is loaded ONCE per scan: `boards.yml` when
+    //     the file is present+valid, the built-in DEFAULT board set when the
+    //     file is missing (with a loud warning - a missing config must never
+    //     disable boards or silently empty them). An unreadable/invalid/empty
+    //     file is an explicit error, never a silent fallback to "no board".
+    let boards_config = match crate::boards::load_boards_config(data_dir) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            error!("[kanban/dispatch] failed to load boards.yml: {:?}", e);
+            return Err(Error::Message(format!("Failed to load boards.yml: {e}")));
         }
-    } else {
-        None
     };
-    let tasks: Vec<DispatchTaskRow> = match &boards_file {
-        Some(file) => tasks
-            .into_iter()
-            .filter(|t| {
-                t.board
-                    .as_deref()
-                    .map(|b| file.boards.contains_key(b))
-                    .unwrap_or(false)
-            })
-            .collect(),
-        None => tasks,
-    };
+    if let Some(w) = boards_config.warning.as_ref() {
+        warn!("[kanban/dispatch] {} (config: {})", w.message, w.path);
+    }
+    let boards_file = boards_config.file;
+    let tasks: Vec<DispatchTaskRow> = tasks
+        .into_iter()
+        .filter(|t| {
+            t.board
+                .as_deref()
+                .map(|b| boards_file.boards.contains_key(b))
+                .unwrap_or(false)
+        })
+        .collect();
 
     // 1c. Goal resume-eligibility gate (per-task filter, like the board
     //     gate): a task whose goal machine is blocked with the typed code
@@ -332,12 +331,10 @@ pub async fn dispatch_todo_tasks(pool: &PgPool, data_dir: &str) -> AppResult<Dis
             resolve_task_channel(
                 data_dir,
                 t.channel_id.as_deref(),
-                boards_file.as_ref().and_then(|file| {
-                    t.board
-                        .as_deref()
-                        .and_then(|b| file.boards.get(b))
-                        .and_then(|cfg| cfg.channel.as_deref())
-                }),
+                t.board
+                    .as_deref()
+                    .and_then(|b| boards_file.boards.get(b))
+                    .and_then(|cfg| cfg.channel.as_deref()),
             )
         })
         .collect();
@@ -428,12 +425,10 @@ pub async fn dispatch_todo_tasks(pool: &PgPool, data_dir: &str) -> AppResult<Dis
         let channel_id = resolve_task_channel(
             data_dir,
             task.channel_id.as_deref(),
-            boards_file.as_ref().and_then(|file| {
-                task.board
-                    .as_deref()
-                    .and_then(|b| file.boards.get(b))
-                    .and_then(|cfg| cfg.channel.as_deref())
-            }),
+            task.board
+                .as_deref()
+                .and_then(|b| boards_file.boards.get(b))
+                .and_then(|cfg| cfg.channel.as_deref()),
         );
         let active = match channel_active_thread_count(pool, &channel_id).await {
             Ok(n) => n,

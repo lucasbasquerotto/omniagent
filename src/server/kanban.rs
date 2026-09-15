@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tracing::error;
 
 use super::{err_json, ok_json, AppState};
-use crate::boards::{boards_enabled, task_board};
+use crate::boards::{load_boards_config, task_board, BoardsConfig, BoardsSource};
 use crate::db::threads::{
     create_kanban_step_thread, dispatch_task_for_status, kanban_step_actionable,
 };
@@ -771,7 +771,7 @@ fn task_row_to_entry(data_dir: &str, r: KanbanTaskRow) -> KanbanTaskEntry {
     // AT LOAD TIME: the API hands out resolved channel/workflow/profile/plan/
     // template - never the shallow row (board-based tasks carry NULLs even
     // though the board defines their effective values). On an invalid board
-    // (boards.yml present + unknown board) dispatch fails loudly elsewhere;
+    // (unknown board) dispatch fails loudly elsewhere;
     // here we log and fall back to the raw row so the API stays displayable.
     let resolved = match crate::resolution::resolve_task_defaults(
         data_dir,
@@ -914,41 +914,43 @@ fn validate_status(status: &str) -> bool {
 
 /// Validate the `board` value on task CREATE.
 ///
-/// When boards are enabled (boards.yml present) the board is REQUIRED and
-/// must name an existing board - a board-less task would otherwise be
-/// silently skipped by the auto-dispatcher forever. When boards are disabled
-/// the field is inert and any value is accepted.
+/// Boards are ALWAYS enabled: the board is REQUIRED and must name a board of
+/// the EFFECTIVE board set (`boards.yml`, or the built-in default board set
+/// when the file is missing) - a board-less task would otherwise be silently
+/// skipped by the auto-dispatcher forever. A missing/empty field or an unknown
+/// board is a clear 400; an unreadable/invalid/empty configuration is a loud
+/// error too (boards.rs) - there is no "boards disabled" accept path.
 fn validate_create_board(
     data_dir: impl AsRef<std::path::Path>,
     board: Option<&str>,
 ) -> Result<(), String> {
-    if !boards_enabled(data_dir.as_ref()) {
-        return Ok(());
-    }
-    match board {
-        Some(b) if !b.trim().is_empty() => task_board(data_dir, Some(b.trim())).map(|_| ()),
-        _ => Err("board is required when boards are enabled (boards.yml present)".to_string()),
+    match board.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => task_board(data_dir, Some(b)).map(|_| ()),
+        _ => Err(
+            "board is required: boards are ALWAYS enabled (boards.yml, with a built-in \
+                  default board set when the file is missing)"
+                .to_string(),
+        ),
     }
 }
 
 /// Validate the `board` field on task UPDATE.
 ///
-/// When boards are enabled (boards.yml present) the resulting task must
-/// always carry a valid board: a missing field keeps the existing (already
-/// valid) board; an explicit clear (empty string) or an unknown board name is
-/// rejected. When boards are disabled the field is inert (clearing allowed).
+/// Boards are ALWAYS enabled, so the resulting task must always carry a valid
+/// board: a missing field keeps the existing (already valid) board; an
+/// explicit clear (empty string) or an unknown board name is rejected. A
+/// configuration error is propagated loudly (never a silent accept).
 fn validate_update_board(
     data_dir: impl AsRef<std::path::Path>,
     board: Option<&str>,
 ) -> Result<(), String> {
-    if !boards_enabled(data_dir.as_ref()) {
-        return Ok(());
-    }
     match board {
         None => Ok(()),
-        Some(b) if b.trim().is_empty() => {
-            Err("board cannot be cleared when boards are enabled (boards.yml present)".to_string())
-        }
+        Some(b) if b.trim().is_empty() => Err(
+            "board cannot be cleared: boards are ALWAYS enabled (boards.yml, with a built-in \
+             default board set when the file is missing)"
+                .to_string(),
+        ),
         Some(b) => task_board(data_dir, Some(b.trim())).map(|_| ()),
     }
 }
@@ -1240,9 +1242,10 @@ async fn create_task_handler(
         return err_json(StatusCode::BAD_REQUEST, "Title is required");
     }
 
-    // Board validation: when boards are enabled (boards.yml present), the
-    // board is required and must name an existing board - otherwise the
-    // auto-dispatcher silently skips the task forever (boards.rs).
+    // Board validation: boards are ALWAYS enabled, so the board is required
+    // and must name a board of the effective set (boards.yml, or the built-in
+    // default set when the file is missing) - otherwise the auto-dispatcher
+    // silently skips the task forever (boards.rs).
     if let Err(msg) = validate_create_board(&state.data_dir, body.board.as_deref()) {
         return err_json(StatusCode::BAD_REQUEST, &msg);
     }
@@ -1944,7 +1947,7 @@ async fn update_task_handler(
         }
     }
 
-    // Board validation: when boards are enabled, the resulting task must
+    // Board validation (boards are ALWAYS enabled): the resulting task must
     // always carry a valid board - clearing (empty string) or setting an
     // unknown board is rejected; a missing field keeps the existing board.
     if let Err(msg) = validate_update_board(&state.data_dir, body.board.as_deref()) {
@@ -3194,33 +3197,46 @@ fn boards_file_path(state: &AppState) -> std::path::PathBuf {
     crate::config_path::config_path(&state.data_dir, "boards.yml")
 }
 
-/// Load the boards file; a missing file counts as an empty document.
+/// Load the EFFECTIVE boards file for CRUD: `boards.yml` when present, else
+/// the built-in DEFAULT board set (boards are always enabled, so a missing
+/// file must never yield an empty board list). An unreadable/invalid/empty
+/// document is propagated as an explicit error.
 fn load_boards_file(
     state: &AppState,
 ) -> Result<crate::boards::BoardsFile, crate::boards::BoardsConfigError> {
-    let path = boards_file_path(state);
-    match crate::boards::BoardsFile::load(&path) {
-        Ok(file) => Ok(file),
-        Err(crate::boards::BoardsConfigError::NotFound { .. }) => {
-            Ok(crate::boards::BoardsFile::default())
-        }
-        Err(err) => Err(err),
+    load_boards_config(&state.data_dir).map(|config| config.file)
+}
+
+/// Wrap a just-loaded/written file as the `File`-sourced effective config (the
+/// CRUD paths always operate on a materialized `boards.yml` after saving).
+fn file_config(file: crate::boards::BoardsFile) -> BoardsConfig {
+    BoardsConfig {
+        file,
+        source: BoardsSource::File,
+        warning: None,
     }
 }
 
-/// Serialize a boards file for the API.
-fn boards_response(file: &crate::boards::BoardsFile) -> serde_json::Value {
-    let boards: Vec<serde_json::Value> = file
+/// Serialize the EFFECTIVE boards configuration for the API: the boards, the
+/// `config_source` (`file` | `default`) and a LOUD structured `config_warning`
+/// when `boards.yml` is missing - never a silent empty board list.
+fn boards_response(config: &BoardsConfig) -> serde_json::Value {
+    let boards: Vec<serde_json::Value> = config
+        .file
         .boards
         .iter()
         .map(|(key, board)| serde_json::json!({ "key": key, "board": board }))
         .collect();
-    serde_json::json!({ "boards": boards })
+    serde_json::json!({
+        "boards": boards,
+        "config_source": config.source.as_str(),
+        "config_warning": config.warning,
+    })
 }
 
 async fn list_boards_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match load_boards_file(&state) {
-        Ok(file) => ok_json(boards_response(&file)),
+    match load_boards_config(&state.data_dir) {
+        Ok(config) => ok_json(boards_response(&config)),
         Err(err) => err_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("failed to load boards.yml: {err}"),
@@ -3253,7 +3269,7 @@ async fn upsert_board_handler(
             &format!("failed to write boards.yml: {err}"),
         );
     }
-    ok_json(boards_response(&file))
+    ok_json(boards_response(&file_config(file)))
 }
 
 /// Delete a board AND every task that belongs to it. The per-task cleanup
@@ -3372,7 +3388,7 @@ async fn delete_board_handler(
             &format!("failed to write boards.yml: {err}"),
         );
     }
-    ok_json(boards_response(&file))
+    ok_json(boards_response(&file_config(file)))
 }
 
 // ---------------------------------------------------------------------------
@@ -3786,12 +3802,28 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_create_board_disabled_accepts_any() {
-        // boards.yml absent -> feature disabled: board optional/inert.
+    fn test_validate_create_board_always_requires_a_valid_board() {
+        // Boards are ALWAYS enabled. With boards.yml ABSENT the built-in
+        // default board set applies, so `main` is valid and everything else
+        // (including missing/empty) is rejected - the board field is never inert.
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(validate_create_board(dir.path(), None).is_ok());
-        assert!(validate_create_board(dir.path(), Some("")).is_ok());
-        assert!(validate_create_board(dir.path(), Some("anything")).is_ok());
+        let err = validate_create_board(dir.path(), None).unwrap_err();
+        assert!(err.contains("board is required"), "got: {err}");
+        let err = validate_create_board(dir.path(), Some("")).unwrap_err();
+        assert!(err.contains("board is required"), "got: {err}");
+        let err = validate_create_board(dir.path(), Some("anything")).unwrap_err();
+        assert!(err.contains("not found in boards.yml"), "got: {err}");
+        assert!(validate_create_board(dir.path(), Some(crate::boards::DEFAULT_BOARD_NAME)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_create_board_fails_loud_on_empty_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = crate::boards::boards_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let err = validate_create_board(dir.path(), Some("main")).unwrap_err();
+        assert!(err.contains("defines no boards"), "got: {err}");
     }
 
     #[test]
@@ -3815,12 +3847,26 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_update_board_disabled_allows_clear() {
-        // boards.yml absent -> clearing allowed, any value ok.
+    fn test_validate_update_board_missing_config_blocks_clear_and_unknown() {
+        // Boards are ALWAYS enabled: even with boards.yml absent the default
+        // board set applies, so clearing or an unknown board is rejected.
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(validate_update_board(dir.path(), None).is_ok());
-        assert!(validate_update_board(dir.path(), Some("")).is_ok());
-        assert!(validate_update_board(dir.path(), Some("anything")).is_ok());
+        let err = validate_update_board(dir.path(), Some("")).unwrap_err();
+        assert!(err.contains("cannot be cleared"), "got: {err}");
+        let err = validate_update_board(dir.path(), Some("anything")).unwrap_err();
+        assert!(err.contains("not found in boards.yml"), "got: {err}");
+        assert!(validate_update_board(dir.path(), Some(crate::boards::DEFAULT_BOARD_NAME)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_update_board_fails_loud_on_invalid_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = crate::boards::boards_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "boards: [not, a, dict").unwrap();
+        let err = validate_update_board(dir.path(), Some("main")).unwrap_err();
+        assert!(err.contains("invalid boards.yml"), "got: {err}");
     }
 
     #[test]

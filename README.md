@@ -413,7 +413,7 @@ The agent exposes an HTTP API on port 8080 (see `api-reference.md` for the full 
 | Channels | `GET/POST/PATCH /channels`, `GET /channels/{name}` |
 | Profiles | `GET /profiles` |
 | Cron | `GET/POST /schedule`, `GET/PATCH/DELETE /schedule/{id}`, `POST /schedule/{id}/run` |
-| Kanban | `GET/POST /kanban/tasks`, `GET/PATCH/DELETE /kanban/tasks/{id}`, `POST /kanban/tasks/{id}/review`, `GET/POST /kanban/boards` (when boards.yml present) |
+| Kanban | `GET/POST /kanban/tasks`, `GET/PATCH/DELETE /kanban/tasks/{id}`, `POST /kanban/tasks/{id}/review`, `GET/POST /kanban/boards` (boards are ALWAYS enabled; built-in default board set when boards.yml is missing) |
 | Plugins | `GET /plugins`, `POST /plugins/{type}/{source}/{name}/install`, `DELETE /plugins/{type}/{source}/{name}`, `POST .../enable` / `disable` / `reinstall` / `download` |
 | Models | `GET /models` (models.yml overrides) |
 | Secrets | `GET/POST /secrets`, `DELETE /secrets/{name}` |

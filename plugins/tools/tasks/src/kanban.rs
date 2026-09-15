@@ -261,7 +261,7 @@ async fn handle_update(
     }
     // Board: PATCH accepts `board` and MOVES the task between boards. Empty or
     // null means "unchanged" here, so the field is omitted rather than sent as
-    // "" (the server rejects an explicit clear while boards are enabled).
+    // "" (the server rejects an explicit clear: boards are always enabled).
     forward_board(&mut req, args);
     // Server-side field is `workflow`; accept `workflow_id` as legacy alias.
     // Explicit empty string clears the workflow (board default applies).
@@ -516,7 +516,7 @@ pub fn build_tools(pool: &Arc<RwLock<Option<PgPool>>>) -> Vec<McpToolEntry> {
             def: McpToolDef {
                 name: "create_kanban_task".to_string(),
                 description:
-                    "Create a new kanban task. Adds a task to the kanban board with optional body, status, priority, and assignee. When boards are enabled (boards.yml present) the target `board` is REQUIRED and must name an existing board - the API error is returned verbatim (no silent default board)."
+                    "Create a new kanban task. Adds a task to the kanban board with optional body, status, priority, and assignee. Boards are ALWAYS enabled, so the target `board` is REQUIRED and must name an existing board - the API error is returned verbatim (no silent default board)."
                         .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -562,7 +562,7 @@ pub fn build_tools(pool: &Arc<RwLock<Option<PgPool>>>) -> Vec<McpToolEntry> {
                         },
                         "board": {
                             "type": "string",
-                            "description": "Target board name. REQUIRED when boards are enabled (boards.yml present) and must name an existing board; the API error is returned verbatim. When boards are disabled it is stored but inert."
+                            "description": "Target board name. REQUIRED (boards are ALWAYS enabled) and must name an existing board; the API error is returned verbatim. When boards.yml is missing the built-in default board set (main) applies."
                         },
                         "toolset": {
                             "type": "string",
@@ -644,7 +644,7 @@ pub fn build_tools(pool: &Arc<RwLock<Option<PgPool>>>) -> Vec<McpToolEntry> {
                         "template": { "type": "string", "description": "New template file name (without .md)" },
                         "toolset": { "type": "string", "description": "New toolset name" },
                         "plan": { "type": "boolean", "description": "New plan-mode flag" },
-                        "board": { "type": "string", "description": "Move the task to another board. Only sent when non-empty; empty/null means unchanged (the API rejects an explicit clear while boards are enabled)" },
+                        "board": { "type": "string", "description": "Move the task to another board. Only sent when non-empty; empty/null means unchanged (the API rejects an explicit clear: boards are always enabled)" },
                         "profile": {
                             "type": "string",
                             "description": "New profile name"
@@ -818,7 +818,7 @@ mod tests {
     }
 
     /// create: `board` is forwarded verbatim; absent/empty/null is NOT sent, so
-    /// the API's "board is required when boards are enabled" error surfaces.
+    /// the API's "board is required" error surfaces.
     #[test]
     fn create_forwards_board_verbatim_and_only_when_present() {
         let mut req = serde_json::json!({});
@@ -841,7 +841,7 @@ mod tests {
     }
 
     /// update: a board MOVES the task; empty means "unchanged" (the API rejects
-    /// an explicit clear while boards are enabled).
+    /// an explicit clear: boards are always enabled).
     #[test]
     fn update_forwards_board_and_empty_means_unchanged() {
         let mut req = serde_json::json!({});

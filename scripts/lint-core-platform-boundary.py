@@ -239,6 +239,16 @@ KNOWN_EXCEPTIONS = (
             "becomes mandatory config"
         ),
     },
+    {
+        "rule": "R6",
+        "path": "src/mcp/external/config.rs",
+        "reason": (
+            "documented last-resort default of the core-API base URL injected "
+            "into plugin child env (audit V-8 pattern): OMNIAGENT_API_URL wins "
+            "when set; the loopback fallback only applies when the core "
+            "process env carries no URL. Remove if the fallback is dropped"
+        ),
+    },
 )
 
 RULES_EVERY = ("R1", "R2", "R3", "R4", "R5", "R6")

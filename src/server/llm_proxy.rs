@@ -54,8 +54,21 @@ pub(crate) async fn llm_chat_handler(
 
     // Merge-contract guard: a models.yml entry that declares itself
     // plugin-backed whose same-id provider plugin is NOT enabled is a LOUD
-    // error - never a silent fallback to another transport.
-    if let Some(err) = crate::llm::provider_resolution_error(provider_name) {
+    // error - never a silent fallback to another transport. Resolved FRESH
+    // from disk with the SAME merged resolution the providers API uses
+    // (`models_yaml::resolve_provider_metadata` over the enabled provider
+    // plugin metadata), so this LLM path can never diverge from the API: a
+    // metadata cache snapshot taken before the models.yml entry existed still
+    // fails loudly instead of degrading into a generic "provider not found".
+    let resolution = crate::models_yaml::resolve_provider_metadata(
+        &state.data_dir,
+        &crate::llm::PROVIDER_METADATA.read().clone(),
+    );
+    if let Some(err) = resolution
+        .errors
+        .iter()
+        .find(|e| e.provider == *provider_name)
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": err.message })),

@@ -360,6 +360,9 @@ Previous plan:\n{}",
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SubtaskStatus {
     Pending,
+    /// The agent is currently working on this subtask (visibility/progress
+    /// state, not a completion state).
+    Processing,
     Completed,
     Cancelled,
     Error,
@@ -378,6 +381,7 @@ pub fn format_subtask_section(subtasks: &[ThreadSubtask], thread_id: i64) -> Opt
     let mut lines = vec![format!("## Subtasks (Thread #{thread_id})")];
     for (i, s) in subtasks.iter().enumerate() {
         let icon = match s.status {
+            SubtaskStatus::Processing => "🔄",
             SubtaskStatus::Completed => "✅",
             SubtaskStatus::Cancelled => "❌",
             SubtaskStatus::Error => "⚠️",

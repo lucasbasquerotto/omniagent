@@ -1983,7 +1983,7 @@ Previous plan:\n{}",
             let pending_subtasks = match crate::subtask::list_subtasks(&cfg.pool, thread.id).await {
                 Ok(list) => list
                     .into_iter()
-                    .filter(|st| st.status == "pending" || st.status == "in_progress")
+                    .filter(|st| st.is_unfinished())
                     .collect::<Vec<_>>(),
                 Err(_) => Vec::new(),
             };
@@ -2011,6 +2011,8 @@ Previous plan:\n{}",
                     };
                     let feedback = format!(
                         "[Subtask Required] You cannot end this thread while subtasks are still pending. \
+                         Keep the subtask you are working on RIGHT NOW marked `status=\"processing\"` \
+                         (at least one at a time; more is allowed for interdependent subtasks worked in turn). \
                          BEFORE writing your final answer, call `subtasks_manage-subtasks(action=\"update\", subtask_id=N, status=\"completed\")` \
                          for each subtask you've already finished. If any subtask is no longer needed, use status=\"cancelled\".{}\n\n\
                          Remaining unfinished subtasks:\n{}\n\n\
@@ -2098,7 +2100,7 @@ Previous plan:\n{}",
                         match crate::subtask::list_subtasks(&cfg.pool, thread.id).await {
                             Ok(list) => list
                                 .into_iter()
-                                .filter(|st| st.status == "pending" || st.status == "in_progress")
+                                .filter(|st| st.is_unfinished())
                                 .collect::<Vec<_>>(),
                             Err(_) => Vec::new(),
                         };
@@ -2802,13 +2804,11 @@ Previous plan:\n{}",
 
             if calls_since_subtask_management >= 10 {
                 if let Ok(subtasks) = crate::subtask::list_subtasks(&cfg.pool, thread.id).await {
-                    let pending_count = subtasks
-                        .iter()
-                        .filter(|st| st.status == "pending" || st.status == "in_progress")
-                        .count();
+                    let pending_count = subtasks.iter().filter(|st| st.is_unfinished()).count();
                     if pending_count > 0 {
                         let reminder = format!(
                             "[Progress Check] You've made {} tool call rounds without updating your subtasks. \
+                             Keep the subtask you are working on now marked `status=\"processing\"`. \
                              If you've completed any steps, call `subtasks_manage-subtasks(action=\"update\", subtask_id=N, status=\"completed\")` \
                              for each finished subtask now. This keeps progress accurate.",
                             calls_since_subtask_management,

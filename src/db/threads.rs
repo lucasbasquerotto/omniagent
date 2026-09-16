@@ -1317,13 +1317,14 @@ pub async fn self_close_to_done_is_premature(
     thread_has_pending_subtasks(pool, source_thread_id).await
 }
 
-/// True when the thread still has pending/in_progress subtasks (close-out
-/// unfinished). Used to detect premature completion and silent-done states.
+/// True when the thread still has pending/processing (or legacy in_progress)
+/// subtasks (close-out unfinished). Used to detect premature completion and
+/// silent-done states.
 pub async fn thread_has_pending_subtasks(pool: &PgPool, thread_id: i64) -> AppResult<bool> {
     let n: Option<i64> = sql_forge!(
         scalar Option<i64>,
         r#"SELECT COUNT(*) FROM thread_subtasks
-           WHERE thread_id = :thread_id AND status IN ('pending', 'in_progress')"#,
+           WHERE thread_id = :thread_id AND status IN ('pending', 'processing', 'in_progress')"#,
         ( :thread_id = thread_id )
     )
     .fetch_one(pool)

@@ -1482,6 +1482,7 @@ async fn handle_generate_full(
                     let icon = match s.status.as_str() {
                         "completed" => "✅",
                         "cancelled" => "❌",
+                        "processing" | "in_progress" => "🔄",
                         "error" => "⚠️",
                         _ => "⬜",
                     };

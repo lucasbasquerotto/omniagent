@@ -1,7 +1,9 @@
 //! Thread subtasks: types and DB query functions using sql_forge!.
 //!
 //! Each subtask belongs to a thread and tracks a single actionable item
-//! with status: pending, completed, cancelled.
+//! with status: pending, processing, completed, cancelled (plus the
+//! internal `error` state). `processing` marks the subtask the agent is
+//! CURRENTLY working on (visibility/progress state, not a completion state).
 use sql_forge::sql_forge;
 use sqlx::PgPool;
 
@@ -21,11 +23,25 @@ pub struct SubtaskRow {
     pub updated_at: Option<String>,
 }
 
+impl SubtaskRow {
+    /// True while the subtask is still outstanding: `pending` (not started yet),
+    /// `processing` (the one the agent is currently working on) or the legacy
+    /// `in_progress`. The enforcement gates use this so a thread can never close
+    /// while a subtask is still marked `processing`.
+    pub fn is_unfinished(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "pending" | "processing" | "in_progress"
+        )
+    }
+}
+
 /// Summary counts for a thread's subtasks.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SubtaskCounts {
     pub completed_count: i64,
     pub pending_count: i64,
+    pub processing_count: i64,
     pub cancelled_count: i64,
     pub error_count: i64,
     pub total_count: i64,
@@ -36,6 +52,7 @@ pub struct SubtaskCounts {
 struct SubtaskCountRow {
     completed_count: Option<i64>,
     pending_count: Option<i64>,
+    processing_count: Option<i64>,
     cancelled_count: Option<i64>,
     error_count: Option<i64>,
     total_count: Option<i64>,
@@ -155,8 +172,9 @@ pub async fn delete_subtask(pool: &PgPool, subtask_id: i64) -> anyhow::Result<u6
     Ok(result.rows_affected())
 }
 
-/// Get the current (non-cancelled) subtask for a thread: the first pending one
-/// ordered by priority DESC, created_at ASC.
+/// Get the current subtask for a thread: a `processing` subtask when one is
+/// marked (that is the one the agent is focused on), else the first pending
+/// one. Within a status group the order is priority DESC, created_at ASC.
 pub async fn get_current_subtask(
     pool: &PgPool,
     thread_id: i64,
@@ -169,8 +187,8 @@ pub async fn get_current_subtask(
             COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "created_at",
             COALESCE(TO_CHAR(updated_at, 'YYYY-MM-DD"T"HH24' || CHR(58) || 'MI' || CHR(58) || 'SS.US"Z"'), '') AS "updated_at"
         FROM thread_subtasks
-        WHERE thread_id = :thread_id AND status = 'pending'
-        ORDER BY priority DESC, created_at ASC
+        WHERE thread_id = :thread_id AND status IN ('processing', 'pending')
+        ORDER BY (status = 'processing') DESC, priority DESC, created_at ASC
         LIMIT 1
         "#,
         ( :thread_id = thread_id )
@@ -188,7 +206,8 @@ pub async fn get_subtask_counts(pool: &PgPool, thread_id: i64) -> anyhow::Result
         r#"
         SELECT
             COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0)::bigint AS completed_count,
-            COALESCE(SUM(CASE WHEN status = 'pending'   THEN 1 ELSE 0 END), 0)::bigint AS pending_count,
+            COALESCE(SUM(CASE WHEN status = 'pending'    THEN 1 ELSE 0 END), 0)::bigint AS pending_count,
+            COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0)::bigint AS processing_count,
             COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0)::bigint AS cancelled_count,
             COALESCE(SUM(CASE WHEN status = 'error'    THEN 1 ELSE 0 END), 0)::bigint AS error_count,
             COUNT(*)::bigint AS total_count
@@ -203,13 +222,14 @@ pub async fn get_subtask_counts(pool: &PgPool, thread_id: i64) -> anyhow::Result
     Ok(SubtaskCounts {
         completed_count: row.completed_count.unwrap_or(0),
         pending_count: row.pending_count.unwrap_or(0),
+        processing_count: row.processing_count.unwrap_or(0),
         cancelled_count: row.cancelled_count.unwrap_or(0),
         error_count: row.error_count.unwrap_or(0),
         total_count: row.total_count.unwrap_or(0),
     })
 }
 
-/// Cancel ALL pending/in-progress subtasks of a thread. Called on the FAIL
+/// Cancel ALL pending/processing/in-progress subtasks of a thread. Called on the FAIL
 /// path (builtin_fail-thread, validation failures): a failed thread's
 /// remaining subtasks can never be completed by the agent, so they must be
 /// auto-cancelled instead of left dangling (observed: after a fail-thread
@@ -221,7 +241,7 @@ pub async fn cancel_pending_subtasks(pool: &PgPool, thread_id: i64) -> anyhow::R
         r#"
         UPDATE thread_subtasks
         SET status = 'cancelled', updated_at = NOW()
-        WHERE thread_id = :thread_id AND status IN ('pending', 'in_progress')
+        WHERE thread_id = :thread_id AND status IN ('pending', 'processing', 'in_progress')
         "#,
         ( :thread_id = thread_id )
     )
@@ -236,4 +256,31 @@ pub async fn cancel_pending_subtasks(pool: &PgPool, thread_id: i64) -> anyhow::R
         );
     }
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(status: &str) -> SubtaskRow {
+        SubtaskRow {
+            id: 1,
+            thread_id: 1,
+            description: "check the build".to_string(),
+            status: status.to_string(),
+            priority: Some(0),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn processing_pending_and_legacy_in_progress_are_unfinished() {
+        for s in ["pending", "processing", "in_progress"] {
+            assert!(row(s).is_unfinished(), "{s} must count as unfinished");
+        }
+        for s in ["completed", "cancelled", "error"] {
+            assert!(!row(s).is_unfinished(), "{s} must not count as unfinished");
+        }
+    }
 }

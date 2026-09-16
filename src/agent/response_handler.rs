@@ -406,8 +406,9 @@ pub(crate) async fn handle_response(
     // Define final status before potential early return
     let final_status = post_loop_final_status(*force_failed, limit_reached);
 
-    // Post-loop subtask enforcement: if any subtasks remain pending/in_progress
-    // after the tool-calling loop ends (regardless of why it ended), fail the thread.
+    // Post-loop subtask enforcement: if any subtasks remain pending/processing
+    // (or legacy in_progress) after the tool-calling loop ends (regardless of
+    // why it ended), fail the thread.
     // Subtasks must only be marked completed/cancelled by the LLM via manage_subtasks tool.
     // Exception: if the iteration limit was reached, unfinished subtasks are expected
     //: keep the interrupted status rather than downgrading to failed.
@@ -415,7 +416,7 @@ pub(crate) async fn handle_response(
         if let Ok(post_subtasks) = crate::subtask::list_subtasks(&cfg.pool, thread.id).await {
             let unfinished: Vec<_> = post_subtasks
                 .iter()
-                .filter(|st| st.status == "pending" || st.status == "in_progress")
+                .filter(|st| st.is_unfinished())
                 .collect();
             if !unfinished.is_empty() {
                 warn!(

@@ -14,6 +14,15 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Statuses accepted by the subtask tools. `processing` marks the subtask the
+/// agent is CURRENTLY working on (a visibility/progress state, NOT a completion
+/// state); more than one subtask MAY be `processing` when interdependent
+/// subtasks are worked in turn.
+const VALID_STATUSES: [&str; 5] = ["pending", "processing", "completed", "cancelled", "error"];
+
+/// Human-readable status list shared by tool descriptions and error messages.
+const STATUS_LIST: &str = "pending, processing, completed, cancelled, error";
+
 // ---------------------------------------------------------------------------
 // Tool: add_subtask
 // ---------------------------------------------------------------------------
@@ -66,6 +75,7 @@ async fn handle_add(pool: &PgPool, args: &Value, meta: Option<&McpMeta>) -> Resu
         })),
         "completed_count": counts.completed_count,
         "pending_count": counts.pending_count,
+        "processing_count": counts.processing_count,
         "cancelled_count": counts.cancelled_count,
         "error_count": counts.error_count,
         "subtasks": subtasks_json,
@@ -120,6 +130,7 @@ async fn handle_list(
         })),
         "completed_count": counts.completed_count,
         "pending_count": counts.pending_count,
+        "processing_count": counts.processing_count,
         "cancelled_count": counts.cancelled_count,
         "error_count": counts.error_count,
         "subtasks": subtasks_json,
@@ -152,11 +163,12 @@ async fn handle_update(
     let mut updated_any = false;
 
     if let Some(status) = args["status"].as_str() {
-        let valid_statuses = ["pending", "completed", "cancelled", "error"];
+        let valid_statuses = VALID_STATUSES;
         if !valid_statuses.contains(&status) {
             anyhow::bail!(
-                "Invalid status '{}'. Must be one of: pending, completed, cancelled, error",
-                status
+                "Invalid status '{}'. Must be one of: {}",
+                status,
+                STATUS_LIST
             );
         }
         let rows = subtask::update_subtask_status(pool, subtask_id, status).await?;
@@ -208,6 +220,7 @@ async fn handle_update(
         })),
         "completed_count": counts.completed_count,
         "pending_count": counts.pending_count,
+        "processing_count": counts.processing_count,
         "cancelled_count": counts.cancelled_count,
         "error_count": counts.error_count,
         "subtasks": subtasks_json,
@@ -270,6 +283,7 @@ async fn handle_delete(
         })),
         "completed_count": counts.completed_count,
         "pending_count": counts.pending_count,
+        "processing_count": counts.processing_count,
         "cancelled_count": counts.cancelled_count,
         "error_count": counts.error_count,
         "subtasks": subtasks_json,
@@ -308,6 +322,7 @@ async fn handle_get_counts(
         })),
         "completed_count": counts.completed_count,
         "pending_count": counts.pending_count,
+        "processing_count": counts.processing_count,
         "cancelled_count": counts.cancelled_count,
         "error_count": counts.error_count,
     });
@@ -363,11 +378,12 @@ fn parse_manage_action(args: &Value) -> Result<ManageAction> {
                 anyhow::bail!("No fields provided to update. Specify 'status' or 'description'.");
             }
             if let Some(status) = args["status"].as_str() {
-                let valid_statuses = ["pending", "completed", "cancelled", "error"];
+                let valid_statuses = VALID_STATUSES;
                 if !valid_statuses.contains(&status) {
                     anyhow::bail!(
-                        "Invalid status '{}'. Must be one of: pending, completed, cancelled, error",
-                        status
+                        "Invalid status '{}'. Must be one of: {}",
+                        status,
+                        STATUS_LIST
                     );
                 }
             }
@@ -415,6 +431,7 @@ fn counts_json(c: &subtask::SubtaskCounts) -> Value {
     serde_json::json!({
         "completed_count": c.completed_count,
         "pending_count": c.pending_count,
+        "processing_count": c.processing_count,
         "cancelled_count": c.cancelled_count,
         "error_count": c.error_count,
         "total_count": c.total_count,
@@ -672,9 +689,10 @@ async fn main() -> Result<()> {
         McpToolEntry {
             def: McpToolDef {
                 name: "update_subtask".to_string(),
-                description:
-                    "Update a subtask's status and/or description. Status can be: pending, completed, cancelled, error."
-                    .to_string(),
+                description: format!(
+                    "Update a subtask's status and/or description. Status can be: {}.",
+                    STATUS_LIST
+                ),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -682,8 +700,8 @@ async fn main() -> Result<()> {
                         "thread_id": { "type": "integer", "description": "The thread ID the subtask belongs to (default: current thread)" },
                         "status": {
                             "type": "string",
-                            "description": "New status: pending, completed, cancelled, error",
-                            "enum": ["pending", "completed", "cancelled", "error"]
+                            "description": format!("New status: {}", STATUS_LIST),
+                            "enum": VALID_STATUSES
                         },
                         "description": { "type": "string", "description": "New description for the subtask" },
                     },
@@ -713,8 +731,8 @@ async fn main() -> Result<()> {
             def: McpToolDef {
                 name: "get_subtask_counts".to_string(),
                 description:
-                    "Get subtask counts and current subtask for a thread. Returns completed, pending, cancelled, error counts."
-                    .to_string(),
+                    "Get subtask counts and current subtask for a thread. Returns completed, pending, processing, cancelled, error counts."
+                        .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -748,8 +766,8 @@ async fn main() -> Result<()> {
                         "subtask_id": { "type": "integer", "description": "The subtask ID (required for update/delete)" },
                         "status": {
                             "type": "string",
-                            "description": "New status for update: pending, completed, cancelled, error",
-                            "enum": ["pending", "completed", "cancelled", "error"]
+                            "description": format!("New status for update: {}", STATUS_LIST),
+                            "enum": VALID_STATUSES
                         },
                     },
                     "required": ["action"],
@@ -848,6 +866,16 @@ mod manage_action_tests {
         });
         let err = parse_manage_action(&args).unwrap_err();
         assert!(err.to_string().contains("Invalid status"), "{err}");
+    }
+
+    #[test]
+    fn parse_update_processing_status() {
+        let args = serde_json::json!({
+            "action": "update",
+            "subtask_id": 7,
+            "status": "processing",
+        });
+        assert_eq!(parse_manage_action(&args).unwrap(), ManageAction::Update);
     }
 
     #[test]

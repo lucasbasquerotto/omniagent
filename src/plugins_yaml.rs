@@ -802,6 +802,112 @@ fn extract_plugin_key(manifest: &PluginManifest, source: &str, base_path: &str) 
     }
 }
 
+/// Apply a models.yml provider entry's DECLARED fields onto a provider detail
+/// (models.yml precedence: only the fields the entry declares are written, so
+/// a plugin-backed base config survives wherever models.yml stays silent).
+fn apply_models_yml_provider_config(
+    detail: &mut PluginDetail,
+    ov: &crate::models_yaml::ProviderOverride,
+) {
+    if !detail.config.is_object() {
+        detail.config = serde_json::json!({});
+    }
+    let obj = match detail.config.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    if let Some(v) = &ov.api_mode {
+        obj.insert("api_mode".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = &ov.default_base_url {
+        obj.insert("base_url".to_string(), serde_json::json!(v));
+        obj.insert("default_base_url".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = &ov.default_model {
+        obj.insert("default_model".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = &ov.api_key {
+        obj.insert("api_key".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = &ov.models {
+        obj.insert("models".to_string(), serde_json::json!(v));
+        for field in detail.config_schema.iter_mut() {
+            if field.key == "default_model" {
+                field.allowed_values = Some(v.clone());
+            }
+        }
+    }
+    if let Some(v) = &ov.refresh_url {
+        for field in detail.config_schema.iter_mut() {
+            if field.key == "default_model" {
+                field.refresh_url = Some(v.clone());
+            }
+        }
+    }
+    if let Some(headers) = &ov.headers {
+        obj.insert(
+            "headers".to_string(),
+            serde_json::to_value(headers).unwrap_or_else(|_| serde_json::json!({})),
+        );
+    }
+}
+
+/// LOUD error row for a models.yml entry that declares itself plugin-backed
+/// while no provider plugin with that id is enabled (operator contract: never
+/// a silent skip, never a half-merged provider). Provider selectors receive
+/// the provider with status "error" plus the reason in `status_message`.
+fn build_models_yml_error_detail(
+    name: &str,
+    message: &str,
+    ov: &crate::models_yaml::ProviderOverride,
+    data_dir: &str,
+) -> PluginDetail {
+    let manifest = crate::plugin::PluginManifest {
+        tools: Vec::new(),
+        name: name.to_string(),
+        version: "0.1.0".to_string(),
+        plugin_type: crate::plugin::PluginType::Provider,
+        description: Some(message.to_string()),
+        entrypoint: None,
+        capabilities: None,
+        config_schema: vec![crate::plugin::ConfigSchemaField {
+            key: "default_model".to_string(),
+            label: "Default model".to_string(),
+            field_type: crate::plugin::FieldType::Enum,
+            required: false,
+            secret: false,
+            description: Some(format!("Models for {} (models.yml)", name)),
+            default: ov.default_model.clone().map(serde_json::Value::String),
+            allowed_values: ov.models.clone(),
+            min: None,
+            max: None,
+            format: None,
+            refresh_url: ov.refresh_url.clone(),
+            depends_on: None,
+        }],
+        env: std::collections::HashMap::new(),
+        default_base_url: ov.default_base_url.clone(),
+        api_mode: ov.api_mode.clone(),
+        api_modes: None,
+        binary: None,
+    };
+    let mut detail = build_plugin_detail(
+        &manifest,
+        "models.yml",
+        None,
+        Some(name),
+        None,
+        data_dir,
+        false,
+    );
+    detail.status = "error".to_string();
+    detail.status_message = message.to_string();
+    detail.has_source_code = false;
+    detail.needs_build = false;
+    apply_models_yml_provider_config(&mut detail, ov);
+    detail
+}
+
 fn build_plugin_detail(
     manifest: &PluginManifest,
     source: &str,
@@ -1523,6 +1629,24 @@ pub fn list_plugins(data_dir: &str) -> AppResult<Vec<PluginDetail>> {
         }
     }
 
+    merge_models_yml_provider_details(&mut results, data_dir);
+
+    // Sort by name for deterministic ordering
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(results)
+}
+
+/// Merge models.yml providers into the provider rows produced from discovery +
+/// plugins.yml, under the operator merge contract (the SINGLE merge every
+/// consumer uses - provider list API, dashboard selectors, LLM-call path):
+///
+///   - `plugin: true` / `plugin: <name>` (plugin-backed): the same-id provider
+///     plugin MUST be enabled; its detail is the base and every models.yml
+///     field wins. No enabled plugin -> LOUD `error` row (never a silent skip).
+///   - `plugin: false` / absent: models.yml is authoritative and any same-id
+///     provider plugin is IGNORED - the provider is listed exactly once with
+///     the models.yml values.
+fn merge_models_yml_provider_details(results: &mut Vec<PluginDetail>, data_dir: &str) {
     // ── models.yml overlay + plugin-less providers ──
     // models.yml `models` list wins over the plugin's default_model enum for
     // provider selectors (user spec). Apply to every provider detail.
@@ -1536,27 +1660,55 @@ pub fn list_plugins(data_dir: &str) -> AppResult<Vec<PluginDetail>> {
         }
     }
 
-    // Plugin-less providers from models.yml (builtin chat/anthropic support):
-    // synthetic entries so the dashboard provider list + model selectors work
-    // without a plugin on disk or a plugins.yml entry.
+    // models.yml providers merged with the enabled provider plugins under the
+    // operator contract - the SAME single resolution the LLM-call path uses
+    // (`crate::models_yaml::resolve_provider_metadata`):
+    //   - `plugin: true` / `plugin: <name>` (plugin-backed): the same-id
+    //     provider plugin MUST be enabled; its detail is the base and every
+    //     models.yml-declared field wins. No such plugin -> LOUD error row
+    //     (never a silent skip, never a half-merged provider).
+    //   - `plugin: false` / absent: models.yml is authoritative and any same-id
+    //     provider plugin is IGNORED - the provider appears ONCE, sourced from
+    //     models.yml with the models.yml values.
     if let Ok(mfile) = crate::models_yaml::load_models_file(data_dir) {
         for (name, ov) in &mfile.providers {
             if ov.plugin.is_true() {
+                let plugin_name = ov.plugin.plugin_name().unwrap_or(name.as_str());
+                // Merge models.yml into every ENABLED same-id row (a plugin may
+                // be listed from more than one source), then dedupe so the
+                // merged provider appears exactly ONCE.
+                let mut merged_any = false;
+                for r in results
+                    .iter_mut()
+                    .filter(|r| r.name == *name && r.status == "enabled")
+                {
+                    apply_models_yml_provider_config(r, ov);
+                    merged_any = true;
+                }
+                let mut kept = false;
+                results.retain(|r| {
+                    if r.name != *name {
+                        return true;
+                    }
+                    if merged_any && !kept {
+                        kept = true;
+                        return true;
+                    }
+                    false
+                });
+                if !merged_any {
+                    let message = format!(
+                        "provider '{}' is declared plugin-backed in models.yml (plugin: {}) but no provider plugin named '{}' is enabled: enable that provider plugin, or set 'plugin: false' to serve the provider from models.yml with the built-in (code-less) implementation",
+                        name, plugin_name, plugin_name
+                    );
+                    results.push(build_models_yml_error_detail(name, &message, ov, data_dir));
+                }
                 continue;
             }
-            // A plugins.yml entry pointing at a plugin that is NOT on disk
-            // (status "not_found") is a stale/broken reference: the models.yml
-            // plugin-less definition is authoritative and must still surface as
-            // a usable provider (registry listing + selectors). An existing,
-            // working plugin-backed entry wins (plugin first).
-            if results
-                .iter()
-                .any(|r| r.name == *name && r.status == "not_found")
-            {
-                results.retain(|r| !(r.name == *name && r.status == "not_found"));
-            } else if results.iter().any(|r| r.name == *name) {
-                continue;
-            }
+            // Not plugin-backed: models.yml wins outright, so drop every
+            // same-id plugin row (working or stale) and list the models.yml
+            // definition once - the plugin is IGNORED.
+            results.retain(|r| r.name != *name);
             let manifest = crate::plugin::PluginManifest {
                 tools: Vec::new(),
                 name: name.clone(),
@@ -1601,13 +1753,10 @@ pub fn list_plugins(data_dir: &str) -> AppResult<Vec<PluginDetail>> {
             detail.status = "enabled".to_string();
             detail.has_source_code = false;
             detail.needs_build = false;
+            apply_models_yml_provider_config(&mut detail, ov);
             results.push(detail);
         }
     }
-
-    // Sort by name for deterministic ordering
-    results.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(results)
 }
 
 /// Get a single plugin by name and type, combining disk discovery with YAML state.
@@ -2606,6 +2755,190 @@ providers:
                 .get("default_base_url")
                 .and_then(|v| v.as_str()),
             Some("http://127.0.0.1:9099/v1")
+        );
+    }
+    #[test]
+    fn test_models_yml_plugin_backed_without_plugin_is_a_loud_error() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        // plugins.yml declares NO provider at all.
+        std::fs::write(
+            dir.path().join("config").join("plugins.yml"),
+            "platforms:\n  mattermost:\n    enabled: true\n",
+        )
+        .unwrap();
+        // models.yml declares a PLUGIN-BACKED provider whose plugin is missing.
+        std::fs::write(
+            dir.path().join("config").join("models.yml"),
+            r#"providers:
+  broken_backed:
+    plugin: true
+    api_mode: "chat_completions"
+    default_base_url: "http://127.0.0.1:9099/v1"
+    default_model: "backed-model"
+"#,
+        )
+        .unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        let details = list_plugins(&data_dir).unwrap();
+        let rows: Vec<_> = details
+            .iter()
+            .filter(|d| d.name == "broken_backed")
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one error row, never a silent skip: {:?}",
+            details
+                .iter()
+                .map(|d| (&d.name, &d.status))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rows[0].status, "error");
+        assert!(
+            rows[0].status_message.contains("broken_backed")
+                && rows[0].status_message.contains("plugin-backed"),
+            "loud message names the provider + contract: {}",
+            rows[0].status_message
+        );
+    }
+
+    #[test]
+    fn test_models_yml_plugin_backed_merges_config_into_enabled_plugin() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        // An ENABLED provider plugin present on disk (bundled source).
+        let pdir = dir.path().join("plugins").join("providers").join("pp");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("plugin.json"),
+            r#"{
+  "name": "pp",
+  "version": "1.0.0",
+  "type": "provider",
+  "entrypoint": {"command": "target/release/pp", "transport": "stdio"},
+  "config_schema": [{"key": "default_model", "label": "Default model", "type": "enum", "default": "manifest-model"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config").join("plugins.yml"),
+            "providers:\n  pp:\n    enabled: true\n    source: bundled\n    config: {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config").join("models.yml"),
+            r#"providers:
+  pp:
+    plugin: true
+    default_base_url: "https://override.example/v1"
+    default_model: "override-model"
+    models: ["override-model", "second-model"]
+"#,
+        )
+        .unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        let details = list_plugins(&data_dir).unwrap();
+        let rows: Vec<_> = details.iter().filter(|d| d.name == "pp").collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the merged provider appears ONCE (models.yml precedence): {:?}",
+            details
+                .iter()
+                .map(|d| (&d.name, &d.status, &d.source))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows[0].status,
+            "enabled",
+            "rows: {:?}",
+            details
+                .iter()
+                .map(|d| (&d.name, &d.status, &d.source))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows[0]
+                .config
+                .get("default_base_url")
+                .and_then(|v| v.as_str()),
+            Some("https://override.example/v1")
+        );
+        assert_eq!(
+            rows[0].config.get("default_model").and_then(|v| v.as_str()),
+            Some("override-model")
+        );
+        let models = rows[0]
+            .config_schema
+            .iter()
+            .find(|f| f.key == "default_model")
+            .and_then(|f| f.allowed_values.clone());
+        assert_eq!(
+            models,
+            Some(vec![
+                "override-model".to_string(),
+                "second-model".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_models_yml_plugin_false_ignores_same_id_plugin() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        let pdir = dir.path().join("plugins").join("providers").join("pp");
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("plugin.json"),
+            r#"{
+  "name": "pp",
+  "version": "1.0.0",
+  "type": "provider",
+  "entrypoint": {"command": "target/release/pp", "transport": "stdio"},
+  "default_base_url": "https://plugin.example/v1",
+  "config_schema": [{"key": "default_model", "label": "Default model", "type": "enum", "default": "plugin-model"}]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config").join("plugins.yml"),
+            "providers:\n  pp:\n    enabled: true\n    source: bundled\n    config: {}\n",
+        )
+        .unwrap();
+        // plugin: false -> models.yml ONLY; the same-id plugin is IGNORED.
+        std::fs::write(
+            dir.path().join("config").join("models.yml"),
+            r#"providers:
+  pp:
+    plugin: false
+    api_mode: "chat_completions"
+    default_base_url: "https://code-less.example/v1"
+    default_model: "cl-model"
+    models: ["cl-model"]
+"#,
+        )
+        .unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        let details = list_plugins(&data_dir).unwrap();
+        let rows: Vec<_> = details.iter().filter(|d| d.name == "pp").collect();
+        assert_eq!(rows.len(), 1, "provider listed ONCE (plugin ignored)");
+        assert_eq!(rows[0].source.as_deref(), Some("models.yml"));
+        assert_eq!(rows[0].status, "enabled");
+        assert_eq!(
+            rows[0]
+                .config
+                .get("default_base_url")
+                .and_then(|v| v.as_str()),
+            Some("https://code-less.example/v1"),
+            "models.yml config wins, the plugin manifest value never leaks in"
+        );
+        assert_eq!(
+            rows[0].config.get("default_model").and_then(|v| v.as_str()),
+            Some("cl-model")
         );
     }
 

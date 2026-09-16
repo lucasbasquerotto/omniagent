@@ -223,6 +223,24 @@ fn scan_provider_manifests(dirs: &[&str]) -> HashMap<String, ProviderMetadata> {
 pub static PROVIDER_METADATA: Lazy<RwLock<HashMap<String, ProviderMetadata>>> =
     Lazy::new(|| RwLock::new(build_provider_metadata()));
 
+/// LOUD contract errors produced by the merged provider resolution
+/// (`crate::models_yaml::resolve_provider_metadata`): a models.yml entry that
+/// declares itself plugin-backed whose same-id provider plugin is NOT enabled.
+/// Refreshed together with [`PROVIDER_METADATA`] and surfaced by the providers
+/// API (error row) and the LLM paths (failed call with the provider id).
+pub static PROVIDER_RESOLUTION_ERRORS: Lazy<RwLock<Vec<crate::models_yaml::ProviderError>>> =
+    Lazy::new(|| RwLock::new(Vec::new()));
+
+/// The contract error recorded for `provider`, if any (see
+/// [`PROVIDER_RESOLUTION_ERRORS`]).
+pub fn provider_resolution_error(provider: &str) -> Option<crate::models_yaml::ProviderError> {
+    PROVIDER_RESOLUTION_ERRORS
+        .read()
+        .iter()
+        .find(|e| e.provider == provider)
+        .cloned()
+}
+
 /// Re-read all provider manifests from disk and update the static cache.
 /// Call this after enabling, disabling, or installing a provider plugin.
 pub fn refresh_provider_metadata() {
@@ -306,10 +324,12 @@ fn build_provider_metadata() -> HashMap<String, ProviderMetadata> {
             map.insert(name.clone(), meta);
         }
     }
-    // models.yml overrides (config/models.yml): provider-level fields override
-    // plugin metadata; plugin-less providers (builtin chat/anthropic) are added.
-    crate::models_yaml::apply_provider_overrides(&data_dir, &mut map);
-    map
+    // SINGLE merged resolution every consumer uses: enabled provider plugins ∪
+    // models.yml, models.yml taking precedence (plugin-backed entries whose
+    // plugin is not enabled are dropped and recorded as LOUD errors).
+    let resolution = crate::models_yaml::resolve_provider_metadata(&data_dir, &map);
+    *PROVIDER_RESOLUTION_ERRORS.write() = resolution.errors;
+    resolution.metadata
 }
 
 /// Resolve the default base URL for a provider from the plugin metadata.
@@ -1190,6 +1210,16 @@ impl LLMClient {
                 "no LLM provider configured: set settings.yml default_provider or a profile/channel provider"
                     .into(),
             ));
+        }
+
+        // Merge-contract guard (single resolution, every LLM path): a models.yml
+        // entry that declares itself plugin-backed whose same-id provider plugin
+        // is NOT enabled is a LOUD error - never a silent fallback.
+        if let Some(err) = provider_resolution_error(&self.config.provider.0) {
+            return Err(Error::Message(format!(
+                "provider resolution error: {}",
+                err.message
+            )));
         }
 
         // Check if this provider is an external subprocess provider

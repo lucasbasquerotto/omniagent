@@ -77,7 +77,11 @@ pub enum PluginFlag {
 
 impl Default for PluginFlag {
     fn default() -> Self {
-        PluginFlag::Bool(true)
+        // An ABSENT `plugin:` field means the entry is NOT plugin-backed: the
+        // models.yml definition is authoritative and any same-id provider
+        // plugin is IGNORED (operator contract). Plugin-backed entries declare
+        // it explicitly (`plugin: true` or `plugin: <name>`).
+        PluginFlag::Bool(false)
     }
 }
 
@@ -687,66 +691,142 @@ pub fn resolve_extra_headers(
 // Registry overlay + validation
 // ---------------------------------------------------------------------------
 
+/// A models.yml provider entry rejected by the merge contract. It is surfaced
+/// LOUDLY (provider list error row + failed LLM call): never a silent skip and
+/// never a half-merged provider.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProviderError {
+    pub provider: String,
+    pub message: String,
+}
+
+/// The SINGLE merged provider resolution every consumer uses (agent LLM call
+/// path, `/api/plugins` provider list, dashboard selectors):
+///
+/// `enabled provider plugins` ∪ `models.yml providers`, keyed by provider id,
+/// with models.yml precedence:
+///
+/// - `plugin: false` / absent -> the models.yml entry is authoritative and any
+///   same-id provider plugin is IGNORED (its metadata is never merged in);
+/// - plugin-backed (`plugin: true` / `plugin: <name>`) -> the same-id provider
+///   plugin MUST be enabled: its metadata is the base and models.yml wins on
+///   every field it declares. When no such plugin is enabled the entry is an
+///   ERROR (see [`ProviderResolution::errors`]);
+/// - provider ids of enabled plugins that models.yml does not mention are kept
+///   untouched.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderResolution {
+    pub metadata: std::collections::HashMap<String, crate::llm::ProviderMetadata>,
+    pub errors: Vec<ProviderError>,
+}
+
+/// Builtin (code-less) provider metadata derived ONLY from a models.yml entry.
+fn builtin_provider_metadata(name: &str, ov: &ProviderOverride) -> crate::llm::ProviderMetadata {
+    crate::llm::ProviderMetadata {
+        name: name.to_string(),
+        default_base_url: ov.default_base_url.clone().unwrap_or_default(),
+        api_mode: ov
+            .api_mode
+            .clone()
+            .unwrap_or_else(|| "chat_completions".to_string()),
+        api_modes: std::collections::HashMap::new(),
+        default_model: ov.default_model.clone().unwrap_or_default(),
+        supports_reasoning: ov.supports_reasoning.unwrap_or(false),
+        auth_style: ov.auth_style.clone(),
+        api_key_header_name: ov.api_key_header_name.clone(),
+        api_version_header: ov
+            .api_version_header
+            .as_ref()
+            .map(|h| (h.name.clone(), h.value.clone())),
+        thinking_param: ov.thinking_param,
+    }
+}
+
+/// Apply a models.yml entry onto `meta` (models.yml precedence: only fields the
+/// entry declares are touched).
+fn apply_override_fields(meta: &mut crate::llm::ProviderMetadata, ov: &ProviderOverride) {
+    if let Some(v) = &ov.api_mode {
+        meta.api_mode = v.clone();
+    }
+    if let Some(v) = ov.supports_reasoning {
+        meta.supports_reasoning = v;
+    }
+    if let Some(v) = &ov.default_base_url {
+        meta.default_base_url = v.clone();
+    }
+    if let Some(v) = &ov.default_model {
+        meta.default_model = v.clone();
+    }
+    if let Some(v) = &ov.auth_style {
+        meta.auth_style = Some(v.clone());
+    }
+    if let Some(v) = &ov.api_key_header_name {
+        meta.api_key_header_name = Some(v.clone());
+    }
+    if let Some(v) = &ov.api_version_header {
+        meta.api_version_header = Some((v.name.clone(), v.value.clone()));
+    }
+    if let Some(v) = ov.thinking_param {
+        meta.thinking_param = Some(v);
+    }
+}
+
+/// Merge the enabled provider plugins with models.yml (see
+/// [`ProviderResolution`]). `plugin_metadata` holds the metadata of every
+/// ENABLED provider plugin (PROVIDER_METADATA).
+pub fn resolve_provider_metadata(
+    data_dir: &str,
+    plugin_metadata: &std::collections::HashMap<String, crate::llm::ProviderMetadata>,
+) -> ProviderResolution {
+    let mut resolution = ProviderResolution {
+        metadata: plugin_metadata.clone(),
+        errors: Vec::new(),
+    };
+    let Ok(file) = load_models_file(data_dir) else {
+        return resolution;
+    };
+    for (name, ov) in &file.providers {
+        if ov.plugin.is_true() {
+            let plugin_name = ov.plugin.plugin_name().unwrap_or(name.as_str()).to_string();
+            match plugin_metadata.get(&plugin_name) {
+                Some(plugin_meta) => {
+                    let mut meta = plugin_meta.clone();
+                    apply_override_fields(&mut meta, ov);
+                    resolution.metadata.insert(name.clone(), meta);
+                }
+                None => {
+                    resolution.errors.push(ProviderError {
+                        provider: name.clone(),
+                        message: format!(
+                            "provider '{}' is declared plugin-backed in models.yml (plugin: {}) but no provider plugin named '{}' is enabled: enable that provider plugin, or set 'plugin: false' to serve it from models.yml with the built-in (code-less) implementation",
+                            name, plugin_name, plugin_name
+                        ),
+                    });
+                    resolution.metadata.remove(name);
+                }
+            }
+            continue;
+        }
+        // Not plugin-backed: the models.yml definition is authoritative and any
+        // same-id provider plugin is IGNORED (never merged into its metadata).
+        let mut meta = builtin_provider_metadata(name, ov);
+        apply_override_fields(&mut meta, ov);
+        resolution.metadata.insert(name.clone(), meta);
+    }
+    resolution
+}
+
 /// Merge models.yml provider overrides into the provider metadata map.
 ///
-/// - provider-level fields (api_mode, supports_reasoning, default_base_url,
-///   default_model) override the plugin manifest values;
-/// - plugin-less providers (`plugin: false`) are added as builtin
-///   chat_completions/anthropic definitions so they appear in provider
-///   selects and can be used on threads.
+/// Thin wrapper around [`resolve_provider_metadata`] kept for callers/tests that
+/// only need the merged map; use `resolve_provider_metadata` when the LOUD
+/// contract errors must be surfaced.
 pub fn apply_provider_overrides(
     data_dir: &str,
     map: &mut std::collections::HashMap<String, crate::llm::ProviderMetadata>,
 ) {
-    let Ok(file) = load_models_file(data_dir) else {
-        return;
-    };
-    for (name, ov) in &file.providers {
-        let meta = map
-            .entry(name.clone())
-            .or_insert_with(|| crate::llm::ProviderMetadata {
-                name: name.clone(),
-                default_base_url: ov.default_base_url.clone().unwrap_or_default(),
-                api_mode: ov
-                    .api_mode
-                    .clone()
-                    .unwrap_or_else(|| "chat_completions".to_string()),
-                api_modes: std::collections::HashMap::new(),
-                default_model: ov.default_model.clone().unwrap_or_default(),
-                supports_reasoning: ov.supports_reasoning.unwrap_or(false),
-                auth_style: ov.auth_style.clone(),
-                api_key_header_name: ov.api_key_header_name.clone(),
-                api_version_header: ov
-                    .api_version_header
-                    .as_ref()
-                    .map(|h| (h.name.clone(), h.value.clone())),
-                thinking_param: ov.thinking_param,
-            });
-        if let Some(v) = &ov.api_mode {
-            meta.api_mode = v.clone();
-        }
-        if let Some(v) = ov.supports_reasoning {
-            meta.supports_reasoning = v;
-        }
-        if let Some(v) = &ov.default_base_url {
-            meta.default_base_url = v.clone();
-        }
-        if let Some(v) = &ov.default_model {
-            meta.default_model = v.clone();
-        }
-        if let Some(v) = &ov.auth_style {
-            meta.auth_style = Some(v.clone());
-        }
-        if let Some(v) = &ov.api_key_header_name {
-            meta.api_key_header_name = Some(v.clone());
-        }
-        if let Some(v) = &ov.api_version_header {
-            meta.api_version_header = Some((v.name.clone(), v.value.clone()));
-        }
-        if let Some(v) = ov.thinking_param {
-            meta.thinking_param = Some(v);
-        }
-    }
+    let resolution = resolve_provider_metadata(data_dir, map);
+    *map = resolution.metadata;
 }
 
 /// Semantic validation of a models.yml document (provider names, model
@@ -1303,6 +1383,7 @@ providers:
     api_key: "$secret:DEEPSEEK_API_KEY"
     models: ["deepseek-v4-flash"]
   plugin_backed:
+    plugin: true
     api_mode: "anthropic_messages"
     default_base_url: "https://override.example/v1"
 "#,
@@ -1391,5 +1472,166 @@ providers:
         write_models(&dir, "");
         let file = load_models_file(dir.path().to_str().unwrap()).unwrap();
         assert!(file.providers.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Merged provider resolution contract (operator spec): enabled-plugin
+    // providers ∪ models.yml, models.yml precedence, plugin-backed entries
+    // require their plugin (loud error otherwise).
+    // ------------------------------------------------------------------
+
+    const MERGE_YML: &str = r#"providers:
+  code_less:
+    plugin: false
+    api_mode: "chat_completions"
+    default_base_url: "https://code-less.example/v1"
+    default_model: "cl-model"
+  absent_flag:
+    api_mode: "chat_completions"
+    default_base_url: "https://absent.example/v1"
+    default_model: "af-model"
+  plugin_backed_ok:
+    plugin: true
+    api_mode: "anthropic_messages"
+    default_base_url: "https://override.example/v1"
+  plugin_backed_missing:
+    plugin: true
+    default_base_url: "https://missing.example/v1"
+"#;
+
+    fn meta(
+        name: &str,
+        base_url: &str,
+        api_mode: &str,
+        model: &str,
+    ) -> crate::llm::ProviderMetadata {
+        crate::llm::ProviderMetadata {
+            name: name.to_string(),
+            default_base_url: base_url.to_string(),
+            api_mode: api_mode.to_string(),
+            api_modes: std::collections::HashMap::new(),
+            default_model: model.to_string(),
+            supports_reasoning: false,
+            auth_style: None,
+            api_key_header_name: None,
+            api_version_header: None,
+            thinking_param: None,
+        }
+    }
+
+    #[test]
+    fn resolve_provider_metadata_union_and_precedence() {
+        let dir = tmp_dir();
+        write_models(&dir, MERGE_YML);
+        let d = dir.path().to_str().unwrap();
+
+        let mut plugins = std::collections::HashMap::new();
+        plugins.insert(
+            "code_less".to_string(),
+            meta(
+                "code_less",
+                "https://plugin.example/v1",
+                "chat_completions",
+                "plugin-model",
+            ),
+        );
+        plugins.insert(
+            "absent_flag".to_string(),
+            meta(
+                "absent_flag",
+                "https://plugin2.example/v1",
+                "chat_completions",
+                "p2-model",
+            ),
+        );
+        plugins.insert(
+            "plugin_backed_ok".to_string(),
+            meta(
+                "plugin_backed_ok",
+                "https://manifest.example/v1",
+                "chat_completions",
+                "manifest-model",
+            ),
+        );
+        // Enabled provider plugin that models.yml does not mention: kept as-is.
+        plugins.insert(
+            "plugin_only".to_string(),
+            meta(
+                "plugin_only",
+                "https://plugin-only.example/v1",
+                "chat_completions",
+                "po-model",
+            ),
+        );
+
+        let res = resolve_provider_metadata(d, &plugins);
+
+        // plugin: false -> models.yml is authoritative, the same-id plugin is
+        // IGNORED (its base URL / model never leak in).
+        let cl = res.metadata.get("code_less").expect("code_less present");
+        assert_eq!(cl.default_base_url, "https://code-less.example/v1");
+        assert_eq!(cl.default_model, "cl-model");
+        assert!(
+            cl.api_modes.is_empty(),
+            "builtin metadata, not the plugin's"
+        );
+
+        // Absent `plugin:` is NOT plugin-backed (operator contract).
+        let af = res
+            .metadata
+            .get("absent_flag")
+            .expect("absent_flag present");
+        assert_eq!(af.default_base_url, "https://absent.example/v1");
+        assert_eq!(af.default_model, "af-model");
+
+        // Plugin-backed with its plugin enabled: merged, models.yml wins field
+        // by field, unset fields keep the plugin manifest value.
+        let pb = res
+            .metadata
+            .get("plugin_backed_ok")
+            .expect("plugin-backed merged");
+        assert_eq!(pb.default_base_url, "https://override.example/v1");
+        assert_eq!(pb.api_mode, "anthropic_messages");
+        assert_eq!(pb.default_model, "manifest-model");
+
+        // Plugin-only provider untouched, and the union is complete.
+        let po = res.metadata.get("plugin_only").expect("plugin-only kept");
+        assert_eq!(po.default_base_url, "https://plugin-only.example/v1");
+        assert_eq!(res.metadata.len(), 4);
+
+        // Plugin-backed WITHOUT its plugin: LOUD error, provider not resolvable.
+        assert!(!res.metadata.contains_key("plugin_backed_missing"));
+        assert_eq!(res.errors.len(), 1, "one loud error: {:?}", res.errors);
+        let err = &res.errors[0];
+        assert_eq!(err.provider, "plugin_backed_missing");
+        assert!(
+            err.message.contains("plugin-backed") && err.message.contains("plugin_backed_missing"),
+            "loud message names the provider + contract: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_provider_metadata_with_zero_provider_plugins() {
+        let dir = tmp_dir();
+        write_models(&dir, MERGE_YML);
+        let d = dir.path().to_str().unwrap();
+
+        // ZERO provider plugins enabled: every non-plugin-backed models.yml
+        // entry is still a first-class provider, the plugin-backed ones error.
+        let res = resolve_provider_metadata(d, &std::collections::HashMap::new());
+        assert!(res.metadata.contains_key("code_less"));
+        assert!(res.metadata.contains_key("absent_flag"));
+        assert_eq!(res.metadata.len(), 2);
+        let mut errored: Vec<String> = res.errors.iter().map(|e| e.provider.clone()).collect();
+        errored.sort();
+        assert_eq!(errored, vec!["plugin_backed_missing", "plugin_backed_ok"]);
+        for e in &res.errors {
+            assert!(
+                e.message.contains("plugin:"),
+                "hint included: {}",
+                e.message
+            );
+        }
     }
 }

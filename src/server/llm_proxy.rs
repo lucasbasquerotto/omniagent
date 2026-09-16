@@ -52,6 +52,16 @@ pub(crate) async fn llm_chat_handler(
     let provider_name = &body.provider;
     let model_name = &body.model;
 
+    // Merge-contract guard: a models.yml entry that declares itself
+    // plugin-backed whose same-id provider plugin is NOT enabled is a LOUD
+    // error - never a silent fallback to another transport.
+    if let Some(err) = crate::llm::provider_resolution_error(provider_name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err.message })),
+        );
+    }
+
     // Resolve base URL from provider plugin metadata
     let base_url = crate::llm::resolve_default_base_url(provider_name);
 
@@ -64,7 +74,10 @@ pub(crate) async fn llm_chat_handler(
             &crate::plugins_yaml::PluginYamlType::Provider,
         ),
         Ok(Some(_))
-    ) || crate::models_yaml::is_plugin_less(&state.data_dir, provider_name);
+    ) || crate::models_yaml::is_plugin_less(&state.data_dir, provider_name)
+        || crate::llm::PROVIDER_METADATA
+            .read()
+            .contains_key(provider_name);
     if !known {
         return (
             StatusCode::BAD_REQUEST,

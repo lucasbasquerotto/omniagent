@@ -1,5 +1,5 @@
 use crate::agent::config::AgentContext;
-use crate::agent::fail_thread::{engine_transition, RerunKind};
+use crate::agent::fail_thread::{engine_transition, step_thread_owns_status, RerunKind};
 use crate::db::types as queries;
 use crate::db::types::{CreateThreadParams, Thread};
 use crate::workflows::{WorkflowsFile, MODE_ACTION};
@@ -78,6 +78,26 @@ pub async fn update_kanban_status(cfg: &AgentContext, thread: &Thread, final_sta
                 return;
             }
         }
+
+        // MANUAL STATUS CHANGE WINS (operator report 2026-09-14, task
+        // kanban_moving_a_task_to_backlog_must): drop the routing of a step
+        // thread whose task was moved away in the meantime (e.g. review ->
+        // backlog), so the late failure/skip/interrupted terminal cannot
+        // resurrect the task or spawn a fresh role thread. The premature-done
+        // block above is deliberately checked FIRST: it is an invariant, not a
+        // derived transition. `engine_transition` re-checks the same condition
+        // under its row lock (the authoritative guard).
+        if manual_move_blocks_routing(&cfg.pool, task_id, thread.workflow_step.as_deref()).await {
+            tracing::info!(
+                "[workflow] thread #{} (step {:?}) ended '{}' but task {} moved on: manual status change wins, no routing",
+                thread.id,
+                thread.workflow_step,
+                final_status,
+                task_id
+            );
+            return;
+        }
+
         // review_on_fail: a hard-failed executor/tester step goes to review
         // instead of blocked / executor re-run (auto_approve forces the flag
         // off via workflow_policy). Interrupted/skipped keep the existing
@@ -158,10 +178,52 @@ pub async fn update_kanban_status(cfg: &AgentContext, thread: &Thread, final_sta
         return;
     }
 
+    // MANUAL STATUS CHANGE WINS (operator report 2026-09-14, task
+    // kanban_moving_a_task_to_backlog_must): a completed step thread may only
+    // route the task while the task is still parked on the status its step
+    // serves. When the operator moved the task away meanwhile (e.g. review ->
+    // backlog), the late completion must be DROPPED - routing it would
+    // resurrect the task (backlog -> review + a fresh reviewer thread), i.e.
+    // the manual move would not stick.
+    if manual_move_blocks_routing(&cfg.pool, task_id, thread.workflow_step.as_deref()).await {
+        tracing::info!(
+            "[workflow] thread #{} (step {:?}) completed but task {} moved on: manual status change wins, no routing",
+            thread.id,
+            thread.workflow_step,
+            task_id
+        );
+        return;
+    }
+
     // Phase 4: completed agent threads → route through the same matrix used
     // by terminal action-mode threads.
     let errored = last_tool_result_errored(&cfg.pool, thread.id).await;
     route_step_completion(&cfg.pool, &cfg.ctx.data_dir, thread, errored).await;
+}
+
+/// MANUAL STATUS CHANGE WINS: `true` when the task's CURRENT status is not the
+/// status this thread's workflow step serves, i.e. the operator (or any other
+/// status change) moved the task away and the finished thread's DERIVED routing
+/// must be DROPPED instead of applied.
+///
+/// A read error yields `false`: routing then proceeds exactly as it did before
+/// this guard existed (the guard never swallows a transition on a DB hiccup).
+async fn manual_move_blocks_routing(
+    pool: &sqlx::PgPool,
+    task_id: &str,
+    caller_step: Option<&str>,
+) -> bool {
+    match sql_forge!(
+        scalar Option<String>,
+        "SELECT status FROM kanban_tasks WHERE id = :task_id",
+        ( :task_id = task_id )
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(Some(status)) => !step_thread_owns_status(caller_step, &status),
+        _ => false,
+    }
 }
 
 /// Workflow-level routing policy (workflows.yml), resolved for a step.

@@ -525,6 +525,45 @@ pub(crate) fn is_terminal_status(status: &str) -> bool {
     matches!(status, "blocked" | "done")
 }
 
+/// Parked / operator-owned kanban statuses: no workflow thread may move a task
+/// OUT of one of these.
+///
+/// - `backlog` is the operator's parking state (nothing auto-promotes it),
+/// - `todo` is the operator's explicit "queue it now" state (only the
+///   dispatcher promotes `todo` -> `running`),
+/// - `blocked` / `done` are terminal (R4).
+///
+/// Manual status change wins (operator report 2026-09-14): a task the operator
+/// parked must stay parked; a late/derived workflow transition for a thread
+/// that was already in flight must be dropped, never re-applied.
+pub(crate) fn is_parked_status(status: &str) -> bool {
+    matches!(status, "backlog" | "todo" | "blocked" | "done")
+}
+
+/// Does the step thread (`caller_step` = `threads.workflow_step`) still own the
+/// task's CURRENT kanban status, i.e. may it still transition the task?
+///
+/// A workflow thread may only route the task while the task is parked on the
+/// status its own step serves (`running` <-> executor, `testing` <-> tester,
+/// `review` <-> reviewer). A parked/terminal task status never matches, so a
+/// manual move to `backlog`/`todo` (or to any other column) DROPS the in-flight
+/// thread's derived transition instead of resurrecting the task (the reported
+/// bug: review -> backlog, then backlog -> review again + a new reviewer
+/// thread).
+///
+/// A NULL/empty `workflow_step` is the executor step (the F0 default), which
+/// serves the `running` status.
+pub(crate) fn step_thread_owns_status(caller_step: Option<&str>, status: &str) -> bool {
+    if is_parked_status(status) {
+        return false;
+    }
+    let step = match caller_step.unwrap_or("") {
+        "" | "executor" => "running",
+        other => other,
+    };
+    step == status
+}
+
 /// Normalize the tool's RAW `workflow_step` argument to the F-matrix outcome.
 /// STEP keys only: "" | "running" | "testing" | "blocked". Everything else
 /// (incl. `review` and role names) is INVALID → F4.
@@ -940,6 +979,29 @@ pub(crate) async fn engine_transition(
 
     // R4: blocked/done tasks never transition.
     if is_terminal_status(&task.status) {
+        return Ok(None);
+    }
+
+    // MANUAL STATUS CHANGE WINS (operator report 2026-09-14, task
+    // kanban_moving_a_task_to_backlog_must): a step thread may only transition
+    // the task while the task is still parked on the status its OWN step
+    // serves. When the operator moved the task away meanwhile (e.g.
+    // review -> backlog), the finishing thread's derived transition must be
+    // DROPPED: applying it resurrects the task (backlog -> review) and creates
+    // a new reviewer thread, i.e. the manual move does not stick.
+    //
+    // The check runs INSIDE this transaction against the row locked with
+    // FOR UPDATE above, so it serializes with an operator PATCH: either the
+    // PATCH landed first (transition dropped here) or this transaction commits
+    // first (the PATCH then wins last).
+    if !step_thread_owns_status(task.caller_step.as_deref(), &task.status) {
+        tracing::info!(
+            "[workflow] thread #{} (step {:?}) terminal transition dropped: task {} is '{}' (manual status change wins)",
+            thread.id,
+            task.caller_step,
+            task_id,
+            task.status
+        );
         return Ok(None);
     }
 
@@ -1770,6 +1832,172 @@ fn is_terminal_status_allows_active_and_retired_statuses() {
             "status {s:?} must never be terminal"
         );
     }
+}
+
+#[test]
+fn is_parked_status_pins_backlog_todo_and_terminal_statuses() {
+    for s in ["backlog", "todo", "blocked", "done"] {
+        assert!(is_parked_status(s), "status {s:?} must be parked");
+    }
+    for s in ["running", "testing", "review", "ready", ""] {
+        assert!(!is_parked_status(s), "status {s:?} must not be parked");
+    }
+}
+
+/// Regression test for "a manual move to backlog is not overridden by a
+/// pending/derived workflow transition" (operator report 2026-09-14): while
+/// the task is parked (backlog/todo) or terminal, NO step thread owns it, so
+/// engine_transition / route_step_completion must drop the transition.
+#[test]
+fn step_thread_owns_status_rejects_every_parked_or_terminal_target() {
+    for status in ["backlog", "todo", "blocked", "done"] {
+        for step in [
+            None,
+            Some(""),
+            Some("executor"),
+            Some("running"),
+            Some("testing"),
+            Some("review"),
+        ] {
+            assert!(
+                !step_thread_owns_status(step, status),
+                "step {step:?} must not own parked/terminal status {status:?}"
+            );
+        }
+    }
+}
+
+/// The owning step still routes normally (no regression on legitimate
+/// automatic transitions).
+#[test]
+fn step_thread_owns_status_matches_the_serving_step() {
+    assert!(step_thread_owns_status(Some("running"), "running"));
+    assert!(step_thread_owns_status(Some("testing"), "testing"));
+    assert!(step_thread_owns_status(Some("review"), "review"));
+    // NULL / empty workflow_step is the executor step (F0 default).
+    assert!(step_thread_owns_status(None, "running"));
+    assert!(step_thread_owns_status(Some(""), "running"));
+    assert!(step_thread_owns_status(Some("executor"), "running"));
+    // A thread serving another step must not route a task parked elsewhere.
+    assert!(!step_thread_owns_status(Some("review"), "running"));
+    assert!(!step_thread_owns_status(Some("review"), "testing"));
+    assert!(!step_thread_owns_status(Some("testing"), "review"));
+    assert!(!step_thread_owns_status(Some("running"), "testing"));
+}
+
+/// DB-backed regression test for "a manual move to backlog is not overridden
+/// by a pending/derived workflow transition" (operator report 2026-09-14).
+///
+/// Runs against the real dev DB when DATABASE_URL is set and skips cleanly
+/// otherwise (offline/CI without a DB). It only ever touches rows it creates
+/// itself.
+#[tokio::test]
+async fn engine_transition_drops_a_step_transition_for_a_task_moved_to_backlog() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let Ok(db_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&db_url)
+        .await
+        .expect("connect dev db");
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let task_id = format!(
+        "task-backlog-parked-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+
+    // leftovers from a previous crashed run
+    let _ = sqlx::query("DELETE FROM threads WHERE task_id = $1")
+        .bind(&task_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM kanban_history WHERE kanban_task_id = $1")
+        .bind(&task_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM kanban_tasks WHERE id = $1")
+        .bind(&task_id)
+        .execute(&pool)
+        .await;
+
+    // The operator parked the task in 'backlog' ...
+    sqlx::query(
+        "INSERT INTO kanban_tasks (id, title, body, status, priority, channel_id, profile, position, template, plan, workflow_id)
+         VALUES ($1, 'BacklogParked', '', 'backlog', 1, 'kanban', 'test', 0, NULL, false, 'test-wf')",
+    )
+    .bind(&task_id)
+    .execute(&pool)
+    .await
+    .expect("insert kanban task");
+
+    // ... while a reviewer-step thread of that task was still in flight.
+    let thread_id: i64 = sqlx::query_scalar(
+        "INSERT INTO threads (status, cause, channel_id, profile, provider, model, task_id, workflow_step, task_type)
+         VALUES ('processing', 'user', 'kanban', 'test', 'noop', 'noop', $1, 'review', 'kanban')
+         RETURNING id",
+    )
+    .bind(&task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert review thread");
+
+    let thread = crate::db::threads::get_thread_by_id(&pool, thread_id)
+        .await
+        .expect("load thread")
+        .expect("thread exists");
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM threads WHERE task_id = $1")
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count threads");
+
+    // The late terminal of the review thread must be DROPPED (Ok(None)): it
+    // must NOT re-route the parked task and must NOT spawn a fresh reviewer
+    // thread (the reported bug: backlog -> review again seconds later).
+    let result = engine_transition(
+        &pool,
+        std::env::temp_dir().to_str().unwrap(),
+        &thread,
+        RerunKind::Skipped,
+    )
+    .await
+    .expect("engine_transition must not error");
+    assert!(
+        result.is_none(),
+        "a parked (backlog) task must never be transitioned by a step thread, got {result:?}"
+    );
+
+    let status: String = sqlx::query_scalar("SELECT status FROM kanban_tasks WHERE id = $1")
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("re-read status");
+    assert_eq!(status, "backlog", "the manual move to backlog must stick");
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM threads WHERE task_id = $1")
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count threads after");
+    assert_eq!(
+        after, before,
+        "no new thread may be created for a parked task"
+    );
+
+    // cleanup
+    let _ = sqlx::query("DELETE FROM threads WHERE task_id = $1")
+        .bind(&task_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM kanban_history WHERE kanban_task_id = $1")
+        .bind(&task_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM kanban_tasks WHERE id = $1")
+        .bind(&task_id)
+        .execute(&pool)
+        .await;
 }
 
 #[cfg(test)]

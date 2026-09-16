@@ -102,6 +102,42 @@ pub async fn update_kanban_task_status(
     Ok(())
 }
 
+/// Pickup-time workflow status sync (supervisor): set the kanban task to the
+/// status the picked-up workflow step serves.
+///
+/// MANUAL STATUS CHANGE WINS (operator report 2026-09-14, task
+/// kanban_moving_a_task_to_backlog_must): the sync is suppressed for a task
+/// the operator parked (`backlog`/`todo`) or that is terminal (`blocked`/
+/// `done`). A thread that was already claimed when the operator moved the task
+/// must never resurrect the task's status - otherwise moving a review task to
+/// backlog is undone by the pickup of the very thread the move skipped (the
+/// reported bug: task flipped back to `review` seconds after the move).
+///
+/// Returns `true` when the sync was applied, `false` when it was suppressed.
+pub async fn sync_task_status_on_pickup(
+    pool: &PgPool,
+    task_id: &str,
+    step_status: &str,
+) -> AppResult<bool> {
+    let current: Option<String> = sql_forge!(
+        scalar String,
+        "SELECT status FROM kanban_tasks WHERE id = :id",
+        ( :id = task_id )
+    )
+    .fetch_optional(pool)
+    .await?
+    .map(|v| v.to_string());
+
+    // Unknown task (None) or a parked/terminal status: nothing to sync.
+    match current.as_deref() {
+        Some(status) if !crate::agent::fail_thread::is_parked_status(status) => {
+            update_kanban_task_status(pool, task_id, step_status).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 // ── Kanban Goal State (omnidev task 4) ──────────────────────────────────────
 //
 // Durable per-task goal state: phase (active/paused/blocked/complete), a

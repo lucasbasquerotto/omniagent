@@ -589,13 +589,24 @@ async fn channel_handler(cfg: AgentContext, channel_id: String, cancel: Cancella
                         Some("review") => "review",
                         _ => "running",
                         };
-                        if let Err(e) = queries::update_kanban_task_status(&cfg.pool, task_id, target).await {
-                        tracing::warn!(
+                        // Pickup-time status sync. MANUAL STATUS CHANGE WINS: a
+                        // task the operator parked (backlog/todo) or that is
+                        // terminal (blocked/done) is never resurrected by a
+                        // thread that was already claimed when the move landed
+                        // (see db::kanban::sync_task_status_on_pickup).
+                        match queries::sync_task_status_on_pickup(&cfg.pool, task_id, target).await {
+                        Ok(true) => {}
+                        Ok(false) => debug!(
+                        "[workflow] kanban task {} is parked/terminal; pickup status sync to {} suppressed",
+                        task_id,
+                        target
+                        ),
+                        Err(e) => tracing::warn!(
                         "[workflow] Failed to set kanban task {} to {}: {:?}",
                         task_id,
                         target,
                         e
-                        );
+                        ),
                         }
                         if let Err(e) = queries::update_kanban_task_thread_status(&cfg.pool, task_id, "running").await
                         {

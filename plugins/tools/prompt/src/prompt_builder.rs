@@ -86,11 +86,13 @@ thread - a second read returns a '[duplicate read ...]' marker, not content. \
 Trust the injected '=== Context Compacted ===' summary and your notes instead; \
 re-reading dumps is a forbidden anti-loop that wastes iterations.\n\
 13. SUBTASKS: after planning a multi-step task, create one subtask per plan step \
-with the subtasks tool (subtasks__manage_subtasks, action=\"add\"); as you finish \
-each step mark its subtask completed (action=\"update\", subtask_id=N, \
-status=\"completed\"); cancel any subtask that is no longer needed \
-(status=\"cancelled\"); before your final answer, complete or cancel ALL subtasks \
-so none remain pending.\n\
+with the subtasks tool (subtasks__manage_subtasks, action=\"add\"), in the order \
+you will execute them; mark the subtask you are CURRENTLY working on as processing \
+(action=\"update\", subtask_id=N, status=\"processing\") - at least one at a time, \
+more allowed for interdependent subtasks; as you finish each step mark its subtask \
+completed (action=\"update\", subtask_id=N, status=\"completed\"); cancel any \
+subtask that is no longer needed (status=\"cancelled\"); before your final answer, \
+complete or cancel ALL subtasks so none remain pending.\n\
 14. NO-REPETITION + VERIFY-ONCE + NO-PROGRESS STOP: never re-issue a tool call \
 (same tool + same effective arguments/scope) whose result is already in your \
 context or notes when nothing relevant changed in between - including read-only \

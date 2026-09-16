@@ -17,9 +17,7 @@ use mcp_server_util::*;
 use parking_lot::Mutex;
 use serde_json::Value;
 use sql_forge::sql_forge;
-use sqlx::types::chrono::{DateTime, NaiveDate, Utc};
-use sqlx::types::Uuid;
-use sqlx::{Column, FromRow, PgPool, Row, TypeInfo};
+use sqlx::{FromRow, PgPool};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -60,12 +58,16 @@ struct TokenAggRow {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin config - received via MCP configure message, not from env vars
+// Plugin config - received via MCP configure message.
+//
+// Only `omni_dir` is plugin config: the PostgreSQL URL is no longer a plugin
+// config key. search_database delegates to the core read-only DB API and the
+// pool used by the other DB tools is built from the bootstrap DATABASE_URL
+// env var that omniagent injects into this child process.
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Clone)]
 struct Config {
-    database_url: String,
     omni_dir: String,
 }
 
@@ -884,433 +886,71 @@ async fn handle_search_channel_prompts(
 }
 
 // ---------------------------------------------------------------------------
-// Tool: search_database (free-form read-only SELECT) - SQL safety helpers
+// Tool: search_database (free-form read-only SELECT)
+//
+// DELEGATES to the core omniagent read-only DB API (POST /db/query). The guard
+// (SELECT/WITH only, write-keyword rejection, READ ONLY transaction, statement
+// timeout, bounded/spilled result set) lives in core
+// (omniagent/src/db/readonly.rs) - the single source of truth - so this tool
+// and the dashboard cannot drift apart. The plugin therefore owns no SQL
+// guard, no DB config key and no connection for this tool.
 // ---------------------------------------------------------------------------
 
-/// Write/DDL SQL keywords that are forbidden in read-only queries. Matching is
-/// done on whole tokens after stripping comments and string literals.
-const WRITE_KEYWORDS: &[&str] = &[
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "DROP",
-    "ALTER",
-    "CREATE",
-    "TRUNCATE",
-    "GRANT",
-    "REVOKE",
-    "MERGE",
-    "CALL",
-    "COPY",
-    "LOCK",
-    "COMMENT",
-    "SET",
-    "RESET",
-    "BEGIN",
-    "COMMIT",
-    "ROLLBACK",
-    "END",
-    "DO",
-    "VACUUM",
-    "ANALYZE",
-    "REINDEX",
-    "CLUSTER",
-    "NOTIFY",
-    "LISTEN",
-    "UNLISTEN",
-    "PREPARE",
-    "EXECUTE",
-    "DEALLOCATE",
-    "SECURITY",
-    "IMPORT",
-    "REFRESH",
-    "DISCARD",
-    "CHECKPOINT",
-    "DECLARE",
-    "FETCH",
-    "MOVE",
-    "CLOSE",
-    "OPEN",
-    "LOAD",
-];
-
-/// Strips SQL comments and string/identifier literals, replacing their contents
-/// with spaces so keywords inside them can't create false positives (or hide).
-fn strip_sql_literals_and_comments(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-    while i < bytes.len() {
-        if !in_line_comment
-            && !in_block_comment
-            && bytes[i] == b'-'
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b'-'
-        {
-            in_line_comment = true;
-            out.extend_from_slice(b"  ");
-            i += 2;
-            continue;
-        }
-        if !in_line_comment
-            && !in_block_comment
-            && bytes[i] == b'/'
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b'*'
-        {
-            in_block_comment = true;
-            out.extend_from_slice(b"  ");
-            i += 2;
-            continue;
-        }
-        if in_line_comment {
-            if bytes[i] == b'\n' {
-                in_line_comment = false;
-                out.push(b'\n');
-            } else {
-                out.push(b' ');
-            }
-            i += 1;
-            continue;
-        }
-        if in_block_comment {
-            if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                in_block_comment = false;
-                out.extend_from_slice(b"  ");
-                i += 2;
-            } else {
-                out.push(b' ');
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'\'' {
-            out.push(b' ');
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        out.extend_from_slice(b"  ");
-                        i += 2;
-                        continue;
-                    }
-                    out.push(b' ');
-                    i += 1;
-                    break;
-                }
-                out.push(b' ');
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'"' {
-            out.push(b' ');
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                        out.extend_from_slice(b"  ");
-                        i += 2;
-                        continue;
-                    }
-                    out.push(b' ');
-                    i += 1;
-                    break;
-                }
-                out.push(b' ');
-                i += 1;
-            }
-            continue;
-        }
-        // Dollar-quoted string: $tag$ ... $tag$
-        if bytes[i] == b'$' {
-            if let Some(rel) = sql[i + 1..].find('$') {
-                let tag_end = i + 1 + rel;
-                let end_tag = format!("${}$", &sql[i + 1..tag_end]);
-                if let Some(body_rel) = sql[tag_end + 1..].find(&end_tag) {
-                    let abs_end = tag_end + 1 + body_rel + end_tag.len();
-                    out.extend(std::iter::repeat_n(b' ', abs_end - i));
-                    i = abs_end;
-                    continue;
-                }
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+/// Base URL of the core omniagent HTTP API. omniagent injects
+/// `OMNIAGENT_API_URL` into the child env of its built-in tool plugins; the
+/// loopback default keeps a standalone local run working.
+fn core_api_base() -> String {
+    std::env::var("OMNIAGENT_API_URL")
+        .or_else(|_| std::env::var("OMNIAGENT_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+        .trim_end_matches('/')
+        .to_string()
 }
 
-/// Returns the first forbidden keyword found in the cleaned SQL, if any.
-fn find_write_keyword(cleaned: &str) -> Option<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for ch in cleaned.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            cur.push(ch.to_ascii_uppercase());
-        } else if !cur.is_empty() {
-            tokens.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() {
-        tokens.push(cur);
-    }
-    tokens
-        .into_iter()
-        .find(|t| WRITE_KEYWORDS.contains(&t.as_str()))
-}
-
-/// Max rows returned by search_database.
-const MAX_QUERY_ROWS: usize = 1000;
-
-/// Statement timeout (ms) applied to every search_database statement via SET
-/// LOCAL. search_database is for structured aggregations only: message-content
-/// lookups belong to search_messages (tsvector over messages.search_tsv). An
-/// ILIKE '%term%' scan over messages.content has no usable index and costs
-/// ~30 s per call, so this 8 s cap makes that mistake fail fast with a hint
-/// instead of blocking the thread.
-const SEARCH_DB_STATEMENT_TIMEOUT_MS: i64 = 8000;
-
-/// Static SET LOCAL statement run inside the read-only transaction before the
-/// user query. Static on purpose: sqlx only accepts literal-safe SQL here, and
-/// the value is a compile-time constant (never user input).
-const SEARCH_DB_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = 8000";
-
-/// Slow-query log threshold (ms): any search_database statement slower than
-/// this is logged (with its SQL) so costly scans stay visible.
-const SEARCH_DB_SLOW_QUERY_LOG_MS: u128 = 2000;
-
-/// True when a sqlx error text reports a PostgreSQL statement-timeout
-/// cancellation (SQLSTATE 57014, "canceling statement due to statement
-/// timeout").
-fn is_statement_timeout_error(err_text: &str) -> bool {
-    let lower = err_text.to_lowercase();
-    lower.contains("statement timeout") || lower.contains("57014")
-}
-
-/// Hint returned when the statement-timeout guard fires: tells the agent to
-/// use search_messages (tsvector) for content lookups instead of running
-/// ILIKE scans over messages.content.
-fn search_db_timeout_hint() -> String {
-    format!(
-        "search_database query canceled after {SEARCH_DB_STATEMENT_TIMEOUT_MS} ms by the \
-         statement-timeout guard (8 s). If you were searching for message CONTENT, do not \
-         use ILIKE '%..%' over messages.content: that full-table scan has no usable index \
-         and costs ~30 s per call. Use search_messages instead: it searches the \
-         GIN-indexed messages.search_tsv tsvector column and returns in well under 3 s. For \
-         structured aggregations, add a tighter WHERE clause and a LIMIT."
-    )
-}
-
-/// Collapse a SQL statement to one bounded line for slow-query logs.
-fn one_line_sql(sql: &str) -> String {
-    let joined: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    if joined.chars().count() > 200 {
-        let head: String = joined.chars().take(200).collect();
-        format!("{head}...")
-    } else {
-        joined
-    }
-}
-
-/// Decode a single result cell by its PostgreSQL column type so timestamps,
-/// UUIDs, JSONB, bytea and arrays serialize as real values instead of NULL.
-fn decode_column_value(row: &sqlx::postgres::PgRow, i: usize) -> serde_json::Value {
-    let type_name = row.column(i).type_info().name();
-    match type_name {
-        "TIMESTAMPTZ" | "TIMESTAMP" => match row.try_get::<Option<DateTime<Utc>>, _>(i) {
-            Ok(Some(dt)) => serde_json::Value::String(dt.to_rfc3339()),
-            _ => serde_json::Value::Null,
-        },
-        "DATE" => match row.try_get::<Option<NaiveDate>, _>(i) {
-            Ok(Some(d)) => serde_json::Value::String(d.to_string()),
-            _ => serde_json::Value::Null,
-        },
-        "UUID" => match row.try_get::<Option<Uuid>, _>(i) {
-            Ok(Some(u)) => serde_json::Value::String(u.to_string()),
-            _ => serde_json::Value::Null,
-        },
-        "JSONB" | "JSON" => match row.try_get::<Option<serde_json::Value>, _>(i) {
-            Ok(Some(v)) => v,
-            _ => serde_json::Value::Null,
-        },
-        "BYTEA" => match row.try_get::<Option<Vec<u8>>, _>(i) {
-            Ok(Some(b)) => serde_json::Value::String(
-                b.iter()
-                    .map(|byte| format!("{:02x}", byte))
-                    .collect::<String>(),
-            ),
-            _ => serde_json::Value::Null,
-        },
-        // Arrays: PostgreSQL type names start with an underscore.
-        _ if type_name.starts_with('_') => decode_array_value(row, i),
-        // Everything else: try scalar decodes in order of likelihood.
-        _ => {
-            if let Ok(s) = row.try_get::<&str, _>(i) {
-                serde_json::Value::String(s.to_string())
-            } else if let Ok(n) = row.try_get::<i64, _>(i) {
-                serde_json::json!(n)
-            } else if let Ok(n) = row.try_get::<f64, _>(i) {
-                serde_json::json!(n)
-            } else if let Ok(b) = row.try_get::<bool, _>(i) {
-                serde_json::json!(b)
-            } else {
-                row.try_get::<Option<String>, _>(i)
-                    .ok()
-                    .flatten()
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null)
-            }
-        }
-    }
-}
-
-/// Decode a PostgreSQL array column into a JSON array. Tries the common
-/// element types in order; falls back to NULL for exotic element types.
-fn decode_array_value(row: &sqlx::postgres::PgRow, i: usize) -> serde_json::Value {
-    if let Ok(Some(v)) = row.try_get::<Option<Vec<String>>, _>(i) {
-        return serde_json::Value::Array(v.into_iter().map(serde_json::Value::String).collect());
-    }
-    if let Ok(Some(v)) = row.try_get::<Option<Vec<i64>>, _>(i) {
-        return serde_json::Value::Array(v.into_iter().map(|n| serde_json::json!(n)).collect());
-    }
-    if let Ok(Some(v)) = row.try_get::<Option<Vec<f64>>, _>(i) {
-        return serde_json::Value::Array(v.into_iter().map(|n| serde_json::json!(n)).collect());
-    }
-    if let Ok(Some(v)) = row.try_get::<Option<Vec<bool>>, _>(i) {
-        return serde_json::Value::Array(v.into_iter().map(|b| serde_json::json!(b)).collect());
-    }
-    if let Ok(Some(v)) = row.try_get::<Option<Vec<Uuid>>, _>(i) {
-        return serde_json::Value::Array(
-            v.into_iter()
-                .map(|u| serde_json::Value::String(u.to_string()))
-                .collect(),
-        );
-    }
-    if let Ok(Some(v)) = row.try_get::<Option<Vec<DateTime<Utc>>>, _>(i) {
-        return serde_json::Value::Array(
-            v.into_iter()
-                .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
-                .collect(),
-        );
-    }
-    if let Ok(Some(v)) = row.try_get::<Option<Vec<serde_json::Value>>, _>(i) {
-        return serde_json::Value::Array(v);
-    }
-    serde_json::Value::Null
-}
-
-async fn handle_search_database(pool: &PgPool, args: &Value) -> Result<(String, bool)> {
+/// POST the SQL to the core read-only DB API and render the rows exactly like
+/// the previous in-plugin implementation did (pretty JSON array of row
+/// objects), so the tool's output contract is unchanged.
+async fn handle_search_database(args: &Value) -> Result<(String, bool)> {
     let sql_owned = args["sql"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("'sql' is required for search_database operation"))?
         .to_string();
 
-    // ── Read-only enforcement (defense in depth) ──────────────────────────
-    // 1) The statement must START with SELECT or WITH (token-level check).
-    // 2) Write/DDL keywords are rejected ANYWHERE in the statement, after
-    //    stripping comments and string literals. This blocks data-modifying
-    //    CTEs such as `WITH x AS (DELETE FROM messages RETURNING *) SELECT ...`.
-    // 3) `AssertSqlSafe` is a sqlx MARKER type, not a semicolon validator;
-    //    multi-statement SQL is rejected by the extended query protocol.
-    // 4) The statement runs inside an explicit `BEGIN TRANSACTION READ ONLY`.
-    let plain = strip_sql_literals_and_comments(&sql_owned);
-    let first = plain.split_whitespace().next().unwrap_or("").to_uppercase();
-    if first != "SELECT" && first != "WITH" {
-        anyhow::bail!(
-            "Only SELECT (or WITH) statements are allowed (statement must start with SELECT or WITH)."
-        );
-    }
-    if let Some(bad) = find_write_keyword(&plain) {
-        anyhow::bail!(
-            "Query rejected: write/DDL keyword '{bad}' is not allowed in read-only queries."
-        );
-    }
-
-    let mut conn = pool
-        .acquire()
+    let url = format!("{}/db/query", core_api_base());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client for the core DB API: {e}"))?;
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "sql": sql_owned }))
+        .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {e}"))?;
-    sqlx::query("BEGIN TRANSACTION READ ONLY")
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to begin read-only transaction: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Core DB API unreachable at {url}: {e} (the Database page and this tool use the omniagent core API POST /db/query)"
+            )
+        })?;
 
-    // Latency guard (slowness fix #3): SET LOCAL statement_timeout bounds every
-    // single statement to 8 s (transaction-scoped, rolled back with it). An
-    // ILIKE '%term%' scan over messages.content has no usable index and costs
-    // ~30 s per call (verified 2026-09-07); the guard makes that mistake fail
-    // fast with a search_messages hint instead of blocking the thread.
-    sqlx::query(SEARCH_DB_TIMEOUT_SQL)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to set statement timeout: {e}"))?;
-
-    let query_started = std::time::Instant::now();
-
-    let results: Vec<serde_json::Value> = {
-        let rows = match sqlx::query(sqlx::AssertSqlSafe(sql_owned.as_str()))
-            .fetch_all(&mut *conn)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                let err_text = e.to_string();
-                let elapsed_ms = query_started.elapsed().as_millis();
-                if is_statement_timeout_error(&err_text) {
-                    eprintln!(
-                        "[search_database] statement timeout after {elapsed_ms} ms: {}",
-                        one_line_sql(&sql_owned)
-                    );
-                    return Err(anyhow::anyhow!(
-                        "{}\n\nOriginal error: {}",
-                        search_db_timeout_hint(),
-                        err_text
-                    ));
-                }
-                if elapsed_ms > SEARCH_DB_SLOW_QUERY_LOG_MS {
-                    eprintln!(
-                        "[search_database] failed slow query ({elapsed_ms} ms): {}",
-                        one_line_sql(&sql_owned)
-                    );
-                }
-                return Err(anyhow::anyhow!("Query failed: {err_text}"));
-            }
-        };
-
-        let mut json_rows: Vec<serde_json::Value> = Vec::new();
-        for row in &rows {
-            let mut map = serde_json::Map::new();
-            for (i, col) in row.columns().iter().enumerate() {
-                let name = col.name();
-                let value = decode_column_value(row, i);
-                map.insert(name.to_string(), value);
-            }
-            json_rows.push(serde_json::Value::Object(map));
-        }
-        json_rows
-    };
-
-    // Defense in depth: cap the result set regardless of the caller's LIMIT.
-    let results = results.into_iter().take(MAX_QUERY_ROWS).collect::<Vec<_>>();
-
-    sqlx::query("COMMIT")
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to commit read-only transaction: {e}"))?;
-
-    let elapsed_ms = query_started.elapsed().as_millis();
-    if elapsed_ms > SEARCH_DB_SLOW_QUERY_LOG_MS {
-        eprintln!(
-            "[search_database] slow query ({elapsed_ms} ms): {}",
-            one_line_sql(&sql_owned)
-        );
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // Core answers with a structured error body (error_code + reason +
+        // remediation); surface it verbatim instead of a bare status code.
+        return Err(anyhow::anyhow!(
+            "read-only DB API error (HTTP {}): {}",
+            status.as_u16(),
+            text.trim()
+        ));
     }
 
-    let output = serde_json::to_string_pretty(&results)?;
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("Invalid response from the core DB API: {e}"))?;
+    let rows = parsed
+        .get("rows")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    let output = serde_json::to_string_pretty(&rows)?;
     Ok((output, false))
 }
 
@@ -1684,30 +1324,30 @@ async fn main() -> Result<()> {
     // Plugin config - received via MCP configure message
     let config: Arc<Mutex<Config>> = Arc::new(Mutex::new(Config::default()));
 
-    // Shared database pool - populated by configure callback before any tool call
+    // Shared database pool for the DB-backed tools (search_messages,
+    // search_metrics, thread/channel lookups). Built from the bootstrap
+    // DATABASE_URL env var injected by omniagent; search_database itself does
+    // not use this pool (it calls the core read-only DB API).
     let pool: Arc<RwLock<Option<PgPool>>> = Arc::new(RwLock::new(None));
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        if !url.is_empty() {
+            match omniagent::db::connect(&url).await {
+                Ok(p) => {
+                    *pool.write().await = Some(p);
+                    tracing::info!("Search plugin DB pool initialized from DATABASE_URL");
+                }
+                Err(e) => eprintln!(
+                    "[search] DATABASE_URL is set but the database is unreachable ({e}); DB-backed tools will retry per call"
+                ),
+            }
+        }
+    }
 
     // on_configure: called when omniagent sends the resolved plugin config
     let on_configure = {
         let config = config.clone();
-        let pool = pool.clone();
         Some(move |params: Value| {
             let mut cfg = config.lock();
-            if let Some(url) = params.get("database_url").and_then(|v| v.as_str()) {
-                if !url.is_empty() {
-                    cfg.database_url = url.to_string();
-
-                    // Also initialize the database pool
-                    let url_clone = url.to_string();
-                    tokio::task::block_in_place(|| {
-                        let rt = tokio::runtime::Handle::current();
-                        let new_pool = rt
-                            .block_on(omniagent::db::connect(&url_clone))
-                            .expect("Failed to connect to database");
-                        *pool.blocking_write() = Some(new_pool);
-                    });
-                }
-            }
             if let Some(dir) = params.get("omni_dir").and_then(|v| v.as_str()) {
                 if !dir.is_empty() {
                     cfg.omni_dir = dir.to_string();
@@ -1715,7 +1355,7 @@ async fn main() -> Result<()> {
             }
             // Channels.yml data dir - needed by search_channels
             omniagent::channels_yaml::set_data_dir(&cfg.omni_dir);
-            tracing::info!("Search plugin configured");
+            tracing::info!("Search plugin configured (omni_dir)");
         })
     };
 
@@ -1726,13 +1366,10 @@ async fn main() -> Result<()> {
     let search_handler: ToolHandler = Box::new(move |args: Value, _meta: Option<McpMeta>| {
         let p = p_search.clone();
         Box::pin(async move {
-            let guard = p.read().await;
-            let pool = guard
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Database pool not initialized. Configure plugin first.")
-                })?
-                .clone();
+            let pool = match pool_or_err(&p).await {
+                Ok(pool) => pool,
+                Err(e) => return Ok(e),
+            };
             handle_search_messages(&pool, &args).await
         })
     });
@@ -1760,36 +1397,39 @@ async fn main() -> Result<()> {
         })
     });
 
-    // Helper to fetch the shared pool; returns a soft error if not configured.
-    fn pool_or_err(pool: &Arc<RwLock<Option<PgPool>>>) -> Result<PgPool, (String, bool)> {
-        let guard = pool.try_read();
-        match guard {
-            Ok(g) => match g.as_ref() {
-                Some(p) => Ok(p.clone()),
-                None => Err((
-                    "Search database pool not configured. The plugin may need a database_url in its config."
-                        .to_string(),
-                    true,
-                )),
-            },
-            Err(_) => Err((
-                "Search database pool lock poisoned or busy. Retry.".to_string(),
+    // Helper to fetch the shared pool. When it was never initialized (the DB
+    // was unreachable at startup), retry once from the bootstrap DATABASE_URL
+    // env var so a transient startup failure does not permanently disable the
+    // DB-backed tools.
+    async fn pool_or_err(pool: &Arc<RwLock<Option<PgPool>>>) -> Result<PgPool, (String, bool)> {
+        if let Some(p) = pool.read().await.as_ref() {
+            return Ok(p.clone());
+        }
+        let url = std::env::var("DATABASE_URL").unwrap_or_default();
+        if url.is_empty() {
+            return Err((
+                "Database unavailable: DATABASE_URL is not set for this plugin process."
+                    .to_string(),
+                true,
+            ));
+        }
+        match omniagent::db::connect(&url).await {
+            Ok(p) => {
+                *pool.write().await = Some(p.clone());
+                Ok(p)
+            }
+            Err(e) => Err((
+                format!("Database unavailable (DATABASE_URL is set but connect failed): {e}"),
                 true,
             )),
         }
     }
 
     // ── search_database: free-form read-only SELECT ───────────────────────
-    let p_db = pool.clone();
+    // No DB pool: the tool delegates to the core read-only DB API, so it works
+    // even when this plugin has no database connection at all.
     let db_handler: ToolHandler = Box::new(move |args: Value, _meta: Option<McpMeta>| {
-        let p = p_db.clone();
-        Box::pin(async move {
-            let pool = match pool_or_err(&p) {
-                Ok(pool) => pool,
-                Err(e) => return Ok(e),
-            };
-            handle_search_database(&pool, &args).await
-        })
+        Box::pin(async move { handle_search_database(&args).await })
     });
 
     // ── search_thread_messages: full thread retrieval ─────────────────────
@@ -1798,7 +1438,7 @@ async fn main() -> Result<()> {
         Box::new(move |args: Value, meta: Option<McpMeta>| {
             let p = p_tm.clone();
             Box::pin(async move {
-                let pool = match pool_or_err(&p) {
+                let pool = match pool_or_err(&p).await {
                     Ok(pool) => pool,
                     Err(e) => return Ok(e),
                 };
@@ -1812,7 +1452,7 @@ async fn main() -> Result<()> {
         Box::new(move |args: Value, meta: Option<McpMeta>| {
             let p = p_cp.clone();
             Box::pin(async move {
-                let pool = match pool_or_err(&p) {
+                let pool = match pool_or_err(&p).await {
                     Ok(pool) => pool,
                     Err(e) => return Ok(e),
                 };
@@ -1825,7 +1465,7 @@ async fn main() -> Result<()> {
     let channels_handler: ToolHandler = Box::new(move |args: Value, _meta: Option<McpMeta>| {
         let p = p_ch.clone();
         Box::pin(async move {
-            let pool = match pool_or_err(&p) {
+            let pool = match pool_or_err(&p).await {
                 Ok(pool) => pool,
                 Err(e) => return Ok(e),
             };
@@ -1838,7 +1478,7 @@ async fn main() -> Result<()> {
     let metrics_handler: ToolHandler = Box::new(move |args: Value, _meta: Option<McpMeta>| {
         let p = p_m.clone();
         Box::pin(async move {
-            let pool = match pool_or_err(&p) {
+            let pool = match pool_or_err(&p).await {
                 Ok(pool) => pool,
                 Err(e) => return Ok(e),
             };
@@ -2202,93 +1842,27 @@ mod tests {
 }
 
 #[cfg(test)]
-mod search_db_latency_guard_tests {
+mod search_database_delegation_tests {
     use super::*;
 
     #[test]
-    fn timeout_error_text_is_detected() {
-        assert!(is_statement_timeout_error(
-            "error returned from database: canceling statement due to statement timeout"
-        ));
-        assert!(is_statement_timeout_error(
-            "db error: ERROR: canceling statement due to statement timeout\nSQLSTATE 57014"
-        ));
-        assert!(!is_statement_timeout_error(
-            "db error: ERROR: relation \"messages\" does not exist"
-        ));
-        assert!(!is_statement_timeout_error(""));
-    }
-
-    #[test]
-    fn timeout_hint_directs_content_lookups_to_search_messages() {
-        let hint = search_db_timeout_hint();
-        assert!(hint.contains("search_messages"), "hint: {hint}");
-        assert!(hint.contains("messages.content"), "hint: {hint}");
-        assert!(hint.contains("ILIKE"), "hint: {hint}");
-        assert!(hint.contains("tsvector"), "hint: {hint}");
-    }
-
-    #[test]
-    fn timeout_guard_sits_in_5_to_10_second_band() {
+    fn core_api_base_is_normalized() {
+        let base = core_api_base();
+        assert!(!base.is_empty(), "core API base must not be empty");
         assert!(
-            (5000..=10000).contains(&SEARCH_DB_STATEMENT_TIMEOUT_MS),
-            "statement timeout must be 5-10 s, got {SEARCH_DB_STATEMENT_TIMEOUT_MS}"
+            !base.ends_with('/'),
+            "core API base must not end with '/': {base}"
         );
     }
 
-    #[test]
-    fn slow_query_log_threshold_is_about_2_seconds() {
-        assert!(
-            (1500..=3000).contains(&SEARCH_DB_SLOW_QUERY_LOG_MS),
-            "slow threshold ~2 s, got {SEARCH_DB_SLOW_QUERY_LOG_MS}"
-        );
-    }
-
-    #[test]
-    fn one_line_sql_collapses_and_bounds() {
-        let sql = "SELECT count(*)\nFROM messages m\nWHERE m.content ILIKE '%foo%'";
-        assert_eq!(
-            one_line_sql(sql),
-            "SELECT count(*) FROM messages m WHERE m.content ILIKE '%foo%'"
-        );
-        let long = format!("SELECT '{}'", "x".repeat(500));
-        let l2 = one_line_sql(&long);
-        assert!(l2.chars().count() <= 204, "bounded: {}", l2.chars().count());
-        assert!(l2.ends_with("..."));
-    }
-
-    /// End-to-end guard proof against a real PostgreSQL (omnidev dev DB):
-    /// a statement that would take 30 s is canceled at the 8 s statement
-    /// timeout and the tool answers with the search_messages hint. Skips
-    /// cleanly when no DATABASE_URL is set (plain CI without a DB).
     #[tokio::test]
-    async fn timeout_guard_cancels_long_statement_with_hint() {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("skipped: no DATABASE_URL (no live DB in this environment)");
-            return;
-        };
-        let pool = omniagent::db::connect(&url)
+    async fn missing_sql_is_rejected_before_any_http_call() {
+        let err = handle_search_database(&serde_json::json!({}))
             .await
-            .expect("connect to dev database for guard test");
-        let args = serde_json::json!({ "sql": "SELECT pg_sleep(30)" });
-        let started = std::time::Instant::now();
-        let res = handle_search_database(&pool, &args).await;
-        let elapsed_ms = started.elapsed().as_millis();
-        let err = res.expect_err("pg_sleep(30) must be canceled by the 8 s guard");
-        let text = err.to_string();
+            .expect_err("a call without 'sql' must fail fast");
         assert!(
-            text.contains("statement-timeout guard"),
-            "error must mention the guard: {text}"
+            err.to_string().contains("'sql' is required"),
+            "unexpected error: {err}"
         );
-        assert!(
-            text.contains("search_messages"),
-            "error must steer content lookups to search_messages: {text}"
-        );
-        assert!(
-            elapsed_ms < 15_000,
-            "guard must cut the 30 s statement short, took {elapsed_ms} ms"
-        );
-        eprintln!("guard live check: canceled after {elapsed_ms} ms with hint; ok");
-        pool.close().await;
     }
 }

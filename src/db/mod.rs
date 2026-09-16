@@ -7,6 +7,7 @@ pub mod kanban;
 pub mod memory;
 pub mod messages;
 pub mod migrations;
+pub mod readonly;
 pub mod schedule;
 pub mod schema;
 pub mod stats;

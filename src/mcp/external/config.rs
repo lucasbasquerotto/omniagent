@@ -315,6 +315,56 @@ fn manifest_tool_behavior(plugin_dir: &str) -> crate::mcp::behavior::ToolBehavio
     }
 }
 
+/// True when a plugin manifest (`plugin.json`) declares the given tool name.
+fn manifest_declares_tool(plugin_dir: &str, tool: &str) -> bool {
+    let manifest_path = std::path::Path::new(plugin_dir).join("plugin.json");
+    crate::plugin::load_manifest(&manifest_path.to_string_lossy())
+        .map(|m| m.tools.iter().any(|t| t.name == tool))
+        .unwrap_or(false)
+}
+
+/// Base URL of this omniagent instance's own HTTP API, as addressed from a
+/// plugin subprocess (same container => loopback). `OMNIAGENT_API_URL`
+/// overrides it when set.
+pub fn core_api_base_url() -> String {
+    if let Ok(url) = std::env::var("OMNIAGENT_API_URL") {
+        if !url.is_empty() {
+            return url.trim_end_matches('/').to_string();
+        }
+    }
+    let port = std::env::var("OMNIAGENT_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Bootstrap env for a plugin that runs read-only SQL through the CORE API.
+///
+/// The `search` plugin declares `search_database`, whose guard + executor live
+/// in core (`POST /db/query`): the plugin only needs the core API base URL to
+/// delegate. Its OTHER DB-backed tools (search_messages, search_metrics, ...)
+/// still open their own pool, so they need `DATABASE_URL` - which, now that the
+/// plugin no longer declares a `database_url` config key, comes from the core
+/// process environment. Scoped to that manifest so unrelated plugins get no DB
+/// credentials, and never overriding an explicitly configured value.
+fn inject_core_bootstrap_env(srv: &mut McpServerConfig, plugin_dir: &str) {
+    if !manifest_declares_tool(plugin_dir, "search_database") {
+        return;
+    }
+    if !srv.env.contains_key("DATABASE_URL") {
+        if let Ok(url) = std::env::var("DATABASE_URL") {
+            if !url.is_empty() {
+                srv.env.insert("DATABASE_URL".to_string(), url);
+            }
+        }
+    }
+    if !srv.env.contains_key("OMNIAGENT_API_URL") {
+        srv.env
+            .insert("OMNIAGENT_API_URL".to_string(), core_api_base_url());
+    }
+}
+
 /// Process a single plugin directory: handles mcp-config.json or Cargo.toml + plugin.json.
 /// Returns None if the directory doesn't exist or has no valid plugin manifest.
 fn scan_plugin_dir(plugin_dir: &str, data_dir: &str) -> Option<Vec<McpServerConfig>> {
@@ -412,6 +462,10 @@ fn scan_plugin_dir(plugin_dir: &str, data_dir: &str) -> Option<Vec<McpServerConf
         // Apply config_schema defaults from plugin.json (fills missing fields)
         apply_config_schema_defaults(&mut srv.env, &path.to_string_lossy());
 
+        // Bootstrap env (core API base URL + DB URL from the core process env)
+        // for the plugin that declares `search_database`.
+        inject_core_bootstrap_env(&mut srv, &path.to_string_lossy());
+
         servers.push(srv);
         return Some(servers);
     }
@@ -504,6 +558,7 @@ fn scan_plugin_dir(plugin_dir: &str, data_dir: &str) -> Option<Vec<McpServerConf
             }
         }
         apply_config_schema_defaults(&mut srv.env, &plugin_dir_str);
+        inject_core_bootstrap_env(&mut srv, &plugin_dir_str);
         tracing::debug!(
             "Binary/script plugin '{}': synthesized MCP server (command: {:?})",
             dir_name,
@@ -635,6 +690,7 @@ fn scan_plugin_dir(plugin_dir: &str, data_dir: &str) -> Option<Vec<McpServerConf
                     }
                     // Apply config_schema defaults from plugin.json (fills missing fields)
                     apply_config_schema_defaults(&mut srv.env, &path.to_string_lossy());
+                    inject_core_bootstrap_env(&mut srv, &path.to_string_lossy());
 
                     // Set working directory to the plugin directory so relative
                     // args (e.g. ["server.py"]) resolve correctly.

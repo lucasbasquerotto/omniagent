@@ -18,3 +18,5 @@ sql-forge = "0.5.0"
 chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2"
 parking_lot = "0.12"
+# search_database delegates to the core read-only DB API (POST /db/query)
+reqwest = { version = "0.12", features = ["json"] }

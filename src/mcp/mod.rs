@@ -1664,7 +1664,7 @@ pub async fn default_registry(ctx: &mut AppContext) -> McpRegistry {
 
 /// Compute Levenshtein distance between two strings (case-insensitive).
 /// Used for fuzzy-matching unknown tool names to registered tool names.
-fn levenshtein_distance(a: &str, b: &str) -> usize {
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a = a.to_lowercase();
     let b = b.to_lowercase();
     let a_chars: Vec<char> = a.chars().collect();

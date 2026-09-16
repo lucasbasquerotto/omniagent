@@ -12,6 +12,7 @@
 
 pub(crate) mod actions;
 pub(crate) mod channels;
+pub(crate) mod db_query;
 pub(crate) mod hooks;
 pub(crate) mod kanban;
 pub(crate) mod kanban_ids;
@@ -26,6 +27,7 @@ pub(crate) mod schedule;
 mod secrets;
 pub(crate) mod settings;
 pub(crate) mod threads;
+pub(crate) mod tool_errors;
 pub(crate) mod toolsets;
 use crate::error::{AppResult, ErrorContext};
 use axum::{
@@ -243,6 +245,10 @@ pub async fn start_server(config: ServerConfig) -> AppResult<()> {
         .route("/mcp/tools", get(list_mcp_tools_handler))
         .route("/mcp/tools/invalid", get(list_invalid_mcp_tools_handler))
         .route("/mcp/execute", post(execute_mcp_tool_handler))
+        // Core read-only DB API: executed by core directly, so the dashboard
+        // Database page works with NO plugin installed or enabled.
+        .route("/db/query", post(db_query::db_query_handler))
+        .route("/db/tables", get(db_query::db_tables_handler))
         // ── Context preview (section [3] only, no messages written) ──
         .route("/api/context/{channel_name}", get(context_preview_handler))
         // ── Plugin management routes ──
@@ -1284,14 +1290,76 @@ struct McpExecuteRequest {
 /// Stateless: accepts tool name + arguments (+ optional context), returns tool result.
 /// Useful for testing stateless tools like compact_messages and
 /// generate_initial_prompt without needing a channel or database.
+/// Declared tools of CONFIGURED plugins, plus the set of known plugin names.
+///
+/// Feeds the structured "unavailable tool" classification so an unresolved
+/// name is reported as disabled plugin / not installed / unknown instead of a
+/// bare `Unknown tool: X`. Declaration comes from the plugin manifest
+/// (`plugin.json` `tools[]`), falling back to the discovered tool names.
+fn declared_tools(data_dir: &str) -> (Vec<tool_errors::DeclaredTool>, Vec<String>) {
+    let mut declared: Vec<tool_errors::DeclaredTool> = Vec::new();
+    let mut known: Vec<String> = Vec::new();
+    let plugins = match crate::plugins_yaml::list_plugins(data_dir) {
+        Ok(plugins) => plugins,
+        Err(e) => {
+            tracing::warn!("tool-error classifier: cannot list plugins: {e:?}");
+            return (declared, known);
+        }
+    };
+    for plugin in plugins {
+        known.push(plugin.name.clone());
+        if plugin.plugin_type != "tools" && plugin.plugin_type != "tool" {
+            continue;
+        }
+        let mut names = plugin.tool_names.clone();
+        if names.is_empty() {
+            if let Some(arr) = plugin.manifest.get("tools").and_then(|v| v.as_array()) {
+                for tool in arr {
+                    if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        for tool in names {
+            declared.push((plugin.name.clone(), tool, plugin.status.clone()));
+        }
+    }
+    (declared, known)
+}
+
 async fn execute_mcp_tool_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<McpExecuteRequest>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        let failure = tool_errors::name_required();
+        return (StatusCode::BAD_REQUEST, Json(failure.to_json()));
+    }
+
+    // Resolve the tool BEFORE executing. An unknown / unregistered / disabled
+    // tool answers with a structured, plugin-aware error (status + code + tool
+    // + reason + remediation) instead of a raw 502 `Unknown tool: X`.
+    let registry = state.plugin_manager.snapshot_registry().await;
+    if registry.get(&name).is_none() {
+        let registered: Vec<String> = registry.all().iter().map(|t| t.name.clone()).collect();
+        let (declared, known_plugins) = declared_tools(&state.data_dir);
+        let failure = tool_errors::classify(&name, &registered, &declared, &known_plugins);
+        let status = StatusCode::from_u16(failure.status).unwrap_or(StatusCode::NOT_FOUND);
+        tracing::warn!(
+            "mcp/execute: tool '{}' unavailable ({}): {}",
+            name,
+            failure.code,
+            failure.reason
+        );
+        return (status, Json(failure.to_json()));
+    }
+
     let args = body.arguments.unwrap_or(serde_json::json!({}));
     let call = crate::mcp::McpToolCall {
         id: "api-exec".to_string(),
-        name: body.name,
+        name,
         arguments: args,
     };
 
@@ -1333,22 +1401,21 @@ async fn execute_mcp_tool_handler(
     ctx.current_platform
         .get_or_insert_with(|| "cli".to_string());
 
-    match state
-        .plugin_manager
-        .snapshot_registry()
-        .await
-        .execute(&call, ctx)
-        .await
-    {
-        Ok(result) => Json(serde_json::json!({
-            "success": true,
-            "content": result.content,
-            "is_error": result.is_error,
-        })),
-        Err(e) => Json(serde_json::json!({
-            "success": false,
-            "error": e.to_string(),
-        })),
+    match registry.execute(&call, ctx).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "content": result.content,
+                "is_error": result.is_error,
+            })),
+        ),
+        Err(e) => {
+            // Execution failed (status 200 + success:false, unchanged for
+            // existing callers) but the payload is now structured too.
+            let failure = tool_errors::execution_failed(&call.name, &e.to_string());
+            (StatusCode::OK, Json(failure.to_json()))
+        }
     }
 }
 

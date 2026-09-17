@@ -137,13 +137,22 @@ impl<'de> Deserialize<'de> for UsageResult {
         D: serde::Deserializer<'de>,
     {
         let raw = UsageResultRaw::deserialize(deserializer)?;
-        let nested = raw
-            .prompt_tokens_details
-            .and_then(|d| d.cached_tokens.or(d.prompt_cache_hit_tokens));
+        let details = raw.prompt_tokens_details.as_ref();
+        // Every name below denotes the same quantity (cache-hit input tokens),
+        // so keep the MAXIMUM present value: a legacy/flat 0 must not mask the
+        // real nested hit count (thread 2234).
+        let cached_tokens = [
+            raw.cached_tokens,
+            details.and_then(|d| d.cached_tokens),
+            details.and_then(|d| d.prompt_cache_hit_tokens),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
         Ok(UsageResult {
             prompt_tokens: raw.prompt_tokens,
             completion_tokens: raw.completion_tokens,
-            cached_tokens: raw.cached_tokens.or(nested),
+            cached_tokens,
             reasoning_tokens: raw.reasoning_tokens,
         })
     }
@@ -158,6 +167,10 @@ impl<'de> Deserialize<'de> for UsageResult {
 /// - nested `prompt_tokens_details.prompt_cache_hit_tokens` (defensive)
 /// - `cache_read_input_tokens` / `cache_creation_input_tokens` (Anthropic)
 ///
+/// The OpenAI-compatible keys all denote the same quantity (cache-hit input
+/// tokens); the maximum present value wins, so a flat 0 cannot mask a nested
+/// hit count. The Anthropic keys are used only when none of them is present.
+///
 /// Returns `None` when the value is missing or not an object. Missing
 /// numeric fields default to 0 (prompt/completion) or `None` (cache,
 /// reasoning) - identical to the old inline extraction, so behavior for
@@ -171,12 +184,20 @@ pub fn parse_usage(value: &serde_json::Value) -> Option<UsageResult> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
     };
-    let cached = num("cached_tokens")
-        .or_else(|| num("prompt_cache_hit_tokens"))
-        .or_else(|| nested("cached_tokens"))
-        .or_else(|| nested("prompt_cache_hit_tokens"))
-        .or_else(|| num("cache_read_input_tokens"))
-        .or_else(|| num("cache_creation_input_tokens"));
+    // Maximum of the OpenAI-compatible cache keys (same quantity under every
+    // name) so a flat/legacy 0 cannot mask a real nested hit count; the
+    // Anthropic keys are the fallback when none of them is present.
+    let cached = [
+        num("cached_tokens"),
+        num("prompt_cache_hit_tokens"),
+        nested("cached_tokens"),
+        nested("prompt_cache_hit_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .or_else(|| num("cache_read_input_tokens"))
+    .or_else(|| num("cache_creation_input_tokens"));
     if crate::llm::raw_usage_capture_enabled() {
         crate::llm::log_raw_usage(
             value,
@@ -336,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_usage_prefers_flat_over_nested_cached_tokens() {
+    fn parse_usage_takes_max_of_flat_and_nested_cached_tokens() {
         let u = serde_json::json!({
             "prompt_tokens": 100,
             "completion_tokens": 5,
@@ -344,7 +365,35 @@ mod tests {
             "prompt_tokens_details": { "cached_tokens": 64 }
         });
         let parsed = parse_usage(&u).expect("usage object parses");
-        assert_eq!(parsed.cached_tokens, Some(40));
+        assert_eq!(parsed.cached_tokens, Some(64));
+    }
+
+    // Regression (thread 2234, reproduced on the dev stack): the gateway may
+    // send the legacy flat `cached_tokens: 0` default next to the real nested
+    // hit count. The 0 must NOT mask the nested value.
+    #[test]
+    fn parse_usage_flat_zero_does_not_mask_nested_cached_tokens() {
+        let u = serde_json::json!({
+            "prompt_tokens": 91663,
+            "completion_tokens": 12,
+            "total_tokens": 91675,
+            "cached_tokens": 0,
+            "prompt_tokens_details": { "cached_tokens": 80384, "audio_tokens": 0 }
+        });
+        let parsed = parse_usage(&u).expect("usage object parses");
+        assert_eq!(parsed.cached_tokens, Some(80384));
+    }
+
+    #[test]
+    fn usage_result_serde_flat_zero_does_not_mask_nested_cached_tokens() {
+        let json = r#"{
+            "prompt_tokens": 91663,
+            "completion_tokens": 12,
+            "cached_tokens": 0,
+            "prompt_tokens_details": { "cached_tokens": 80384 }
+        }"#;
+        let parsed: UsageResult = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.cached_tokens, Some(80384));
     }
 
     #[test]

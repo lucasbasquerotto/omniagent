@@ -914,6 +914,12 @@ pub fn log_raw_usage(
 ///   native Anthropic path has its own struct, kept here for OpenAI-compatible
 ///   gateways that proxy Anthropic-style usage)
 ///
+/// All of the OpenAI-compatible keys denote the SAME quantity (cache-hit input
+/// tokens), so the MAXIMUM of the present ones wins - a legacy flat
+/// `cached_tokens: 0` default can therefore never mask a real nested hit count
+/// (observed on the dev stack, thread 2234). The Anthropic keys are consulted
+/// only when no OpenAI-compatible cache key was sent.
+///
 /// `prompt_tokens` and `completion_tokens` stay REQUIRED (unchanged behavior).
 /// A response carrying no cache information yields `cached_tokens: None` -
 /// never a wrong 0.
@@ -932,12 +938,23 @@ pub fn usage_from_value(value: &serde_json::Value) -> Result<Usage, String> {
         num("prompt_tokens").ok_or_else(|| "missing field `prompt_tokens`".to_string())?;
     let completion_tokens =
         num("completion_tokens").ok_or_else(|| "missing field `completion_tokens`".to_string())?;
-    let cached_tokens = num("cached_tokens")
-        .or_else(|| num("prompt_cache_hit_tokens"))
-        .or_else(|| nested("cached_tokens"))
-        .or_else(|| nested("prompt_cache_hit_tokens"))
-        .or_else(|| num("cache_read_input_tokens"))
-        .or_else(|| num("cache_creation_input_tokens"));
+    // Every OpenAI-compatible key reports the same quantity (cache-hit input
+    // tokens), so take the MAXIMUM of the ones actually sent instead of the
+    // first present one: a gateway emitting the legacy flat `cached_tokens: 0`
+    // default ALONGSIDE a real nested
+    // `prompt_tokens_details.cached_tokens` must not have its hit count masked
+    // by that 0 (observed on the dev stack, thread 2234).
+    let cached_tokens = [
+        num("cached_tokens"),
+        num("prompt_cache_hit_tokens"),
+        nested("cached_tokens"),
+        nested("prompt_cache_hit_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .or_else(|| num("cache_read_input_tokens"))
+    .or_else(|| num("cache_creation_input_tokens"));
     Ok(Usage {
         prompt_tokens,
         completion_tokens,
@@ -2594,7 +2611,7 @@ mod usage_parse_tests {
     }
 
     #[test]
-    fn usage_prefers_flat_cached_tokens_over_nested() {
+    fn usage_takes_max_of_flat_and_nested_cached_tokens() {
         let json = r#"{
             "prompt_tokens": 100,
             "completion_tokens": 2,
@@ -2602,7 +2619,24 @@ mod usage_parse_tests {
             "prompt_tokens_details": { "cached_tokens": 64 }
         }"#;
         let u: Usage = serde_json::from_str(json).unwrap();
-        assert_eq!(u.cached_tokens, Some(40));
+        assert_eq!(u.cached_tokens, Some(64));
+    }
+
+    // Regression (thread 2234, reproduced on the dev stack): the gateway may
+    // send the legacy flat `cached_tokens: 0` default next to the real nested
+    // hit count. The 0 must NOT mask the nested value.
+    #[test]
+    fn usage_flat_zero_does_not_mask_nested_cached_tokens() {
+        let json = r#"{
+            "prompt_tokens": 91663,
+            "completion_tokens": 12,
+            "total_tokens": 91675,
+            "cached_tokens": 0,
+            "prompt_tokens_details": { "cached_tokens": 80384, "audio_tokens": 0 }
+        }"#;
+        let u: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.prompt_tokens, 91663);
+        assert_eq!(u.cached_tokens, Some(80384));
     }
 
     #[test]

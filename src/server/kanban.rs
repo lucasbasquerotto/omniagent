@@ -493,6 +493,7 @@ struct KanbanTaskRow {
     plan: Option<bool>,
     workflow_id: Option<String>,
     board: Option<String>,
+    thread_status: Option<String>,
     goal_phase: Option<String>,
     goal_blocked_code: Option<String>,
     goal_blocked_message: Option<String>,
@@ -620,6 +621,12 @@ struct KanbanTaskEntry {
     plan: Option<bool>,
     workflow: Option<String>,
     board: Option<String>,
+    /// Live thread status of the task's current workflow step:
+    /// `scheduled` (a thread is queued) or `running` (a thread is processing).
+    /// NULL/empty when the task has no live workflow thread (non-workflow
+    /// tasks, manual review, done/blocked tasks). The dashboard Task Details
+    /// page renders it as a badge and falls back to "No status defined".
+    thread_status: Option<String>,
     goal_phase: Option<String>,
     goal_blocked_code: Option<String>,
     goal_blocked_message: Option<String>,
@@ -824,6 +831,7 @@ fn task_row_to_entry(data_dir: &str, r: KanbanTaskRow) -> KanbanTaskEntry {
             .and_then(|res| res.workflow_id.clone())
             .or_else(|| r.workflow_id.clone()),
         board: r.board,
+        thread_status: r.thread_status,
         tags: r
             .tags_json
             .as_ref()
@@ -992,6 +1000,7 @@ async fn list_tasks_handler(
         SELECT
             id, title, body, status, priority, position, assignee,
             channel_id, profile, archived, template, toolset, plan, workflow_id, board,
+            thread_status,
             goal_phase, goal_blocked_code, goal_blocked_message, goal_max_rounds,
             goal_revision,
             COALESCE((
@@ -1043,6 +1052,7 @@ async fn get_task_handler(
         SELECT
             id, title, body, status, priority, position, assignee,
             channel_id, profile, archived, template, toolset, plan, workflow_id, board,
+            thread_status,
             goal_phase, goal_blocked_code, goal_blocked_message, goal_max_rounds,
             goal_revision,
             COALESCE((
@@ -3755,6 +3765,7 @@ mod tests {
             plan: None,
             workflow_id: Some("wf-x".to_string()),
             board: None,
+            thread_status: Some("running".to_string()),
             goal_phase: None,
             goal_blocked_code: None,
             goal_blocked_message: None,
@@ -3767,6 +3778,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let entry = task_row_to_entry(dir.path().to_str().unwrap(), row);
         assert_eq!(entry.workflow.as_deref(), Some("wf-x"));
+        assert_eq!(entry.thread_status.as_deref(), Some("running"));
     }
 
     #[test]
@@ -3905,6 +3917,7 @@ mod tests {
             plan: None,
             workflow_id: None,
             board: None,
+            thread_status: None,
             goal_phase: None,
             goal_blocked_code: None,
             goal_blocked_message: None,
@@ -3940,6 +3953,7 @@ mod tests {
             plan: None,
             workflow_id: None,
             board: None,
+            thread_status: None,
             goal_phase: None,
             goal_blocked_code: None,
             goal_blocked_message: None,

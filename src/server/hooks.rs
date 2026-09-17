@@ -1,7 +1,9 @@
 //! Hooks CRUD + fire API (event-driven hooks).
 //!
 //! Mirrors the schedule (cron) API, but hooks are triggered by events
-//! (thread_started / thread_finished / new_message) instead of time.
+//! (thread_started / new_message / thread_completed / thread_interrupted /
+//! thread_failed / thread_skipped / thread_merged / thread_terminated)
+//! instead of time.
 //!
 //! Definitions live in `{data_dir}/config/tasks.yml` (`hooks:` key - the
 //! git-tracked source of truth); every handler reads/writes it (parsed fresh

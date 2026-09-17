@@ -104,7 +104,10 @@ pub struct HookDef {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<bool>,
-    /// Event name: thread_started | thread_finished | new_message.
+    /// Event name: thread_started | new_message | thread_completed |
+    /// thread_interrupted | thread_failed | thread_skipped | thread_merged |
+    /// thread_terminated. `thread_finished` was REMOVED (no alias): use
+    /// `thread_terminated` for a catch-all terminal trigger.
     pub event: String,
     /// Scope: global | channel | profile (default global).
     #[serde(default = "default_scope")]
@@ -498,7 +501,7 @@ hooks:
         tasks2.hooks.insert(
             "h1".to_string(),
             HookDef {
-                event: "thread_finished".to_string(),
+                event: "thread_terminated".to_string(),
                 count: 3,
                 scope: "global".to_string(),
                 ..Default::default()

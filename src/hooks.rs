@@ -2,9 +2,19 @@
 //!
 //! Hooks mirror cron schedule jobs but are triggered by events instead of a
 //! time schedule. Supported events:
-//!   - `thread_started`  : a thread is created
-//!   - `thread_finished` : a thread reaches a terminal state
-//!   - `new_message`     : a message is inserted
+//!   - `thread_started`     : a thread is created
+//!   - `new_message`        : a message is inserted
+//!   - `thread_completed`   : a thread terminated successfully
+//!   - `thread_interrupted` : a thread terminated at the iteration limit
+//!   - `thread_failed`      : a thread terminated with an error
+//!   - `thread_skipped`     : a thread was skipped without executing
+//!   - `thread_merged`      : a thread's prompt was merged into another thread
+//!   - `thread_terminated`  : catch-all - a thread reached ANY terminal state;
+//!     fired together with the per-status event above (when the terminal
+//!     status has one) from the same terminal-transition choke point
+//!
+//! The legacy `thread_finished` event was REMOVED (no backward-compat alias):
+//! hooks bound to it must be re-bound to `thread_terminated`.
 //!
 //! Definitions live in `{data_dir}/config/tasks.yml` (`hooks:` key - the
 //! git-tracked source of truth), NOT in the (dormant) `hooks` table. The
@@ -41,8 +51,29 @@ use crate::mcp::{AppContext, McpToolCall};
 // ── Event / scope / mode constants ──────────────────────────────────────────
 
 pub const EVENT_THREAD_STARTED: &str = "thread_started";
-pub const EVENT_THREAD_FINISHED: &str = "thread_finished";
+pub const EVENT_THREAD_COMPLETED: &str = "thread_completed";
+pub const EVENT_THREAD_INTERRUPTED: &str = "thread_interrupted";
+pub const EVENT_THREAD_FAILED: &str = "thread_failed";
+pub const EVENT_THREAD_SKIPPED: &str = "thread_skipped";
+pub const EVENT_THREAD_MERGED: &str = "thread_merged";
+/// Catch-all terminal event: fired for EVERY terminal transition, in addition
+/// to the per-status event (when the terminal status has one).
+pub const EVENT_THREAD_TERMINATED: &str = "thread_terminated";
 pub const EVENT_NEW_MESSAGE: &str = "new_message";
+
+/// The per-status event for a terminal thread status. `system` (init / action
+/// threads) has NO dedicated event: those transitions only fire the catch-all
+/// `thread_terminated`. Unknown statuses return `None`.
+pub fn per_status_event(status: &str) -> Option<&'static str> {
+    match status {
+        "completed" => Some(EVENT_THREAD_COMPLETED),
+        "interrupted" => Some(EVENT_THREAD_INTERRUPTED),
+        "failed" => Some(EVENT_THREAD_FAILED),
+        "skipped" => Some(EVENT_THREAD_SKIPPED),
+        "merged" => Some(EVENT_THREAD_MERGED),
+        _ => None,
+    }
+}
 
 pub const SCOPE_GLOBAL: &str = "global";
 pub const SCOPE_CHANNEL: &str = "channel";
@@ -51,10 +82,15 @@ pub const SCOPE_PROFILE: &str = "profile";
 pub const MODE_AGENTIC: &str = "agentic";
 pub const MODE_ACTION: &str = "action";
 
-pub const VALID_EVENTS: [&str; 3] = [
+pub const VALID_EVENTS: [&str; 8] = [
     EVENT_THREAD_STARTED,
-    EVENT_THREAD_FINISHED,
     EVENT_NEW_MESSAGE,
+    EVENT_THREAD_COMPLETED,
+    EVENT_THREAD_INTERRUPTED,
+    EVENT_THREAD_FAILED,
+    EVENT_THREAD_SKIPPED,
+    EVENT_THREAD_MERGED,
+    EVENT_THREAD_TERMINATED,
 ];
 pub const VALID_SCOPES: [&str; 3] = [SCOPE_GLOBAL, SCOPE_CHANNEL, SCOPE_PROFILE];
 pub const VALID_MODES: [&str; 2] = [MODE_AGENTIC, MODE_ACTION];
@@ -99,14 +135,42 @@ pub fn fire_thread_started(thread_id: i64) {
     );
 }
 
-/// Fire a `thread_finished` event. Never blocks or fails the caller.
-pub fn fire_thread_finished(thread_id: i64) {
-    dispatch(
-        move |engine| async move { engine.handle_event(EVENT_THREAD_FINISHED, thread_id).await },
-    );
+/// Terminal facts delivered with `thread_terminated` / per-status events.
+///
+/// Every value mirrors the thread row as written by the terminal UPDATE
+/// (`complete_thread` / `mark_thread_terminal`): `ended_at`, `iterations` and
+/// the token aggregates are computed by the SAME statement, so the payload
+/// carries the persisted values, not a re-computation.
+#[derive(Debug, Clone, Default)]
+pub struct TerminalInfo {
+    pub status: String,
+    pub ended_at: Option<String>,
+    pub iterations: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub cached_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+/// Fire the terminal lifecycle events of a thread that just reached the
+/// terminal `status`: the per-status event (`thread_completed` /
+/// `thread_interrupted` / `thread_failed` / `thread_skipped` /
+/// `thread_merged`) when the status has one, followed by the catch-all
+/// `thread_terminated`. Never blocks or fails the caller.
+///
+/// Callers must invoke this exactly once per REAL terminal transition (a
+/// no-op `mark_thread_terminal` on an already-terminal thread is not a
+/// transition and must not fire).
+pub fn fire_thread_terminated(thread_id: i64, status: &str) {
+    let status = status.to_string();
+    dispatch(move |engine| async move { engine.handle_terminal_event(thread_id, &status).await });
 }
 
 /// Fire a `new_message` event. Never blocks or fails the caller.
+///
+/// Every runtime path that inserts a message row (incl. the direct-SQL
+/// `INSERT INTO messages` statements outside `db::messages::create_message`)
+/// MUST call this exactly once per inserted message - post-commit for
+/// transactional sites, so the hook handler observes the committed row.
 pub fn fire_new_message(thread_id: i64, message_id: i64) {
     dispatch(move |engine| async move {
         engine
@@ -201,7 +265,44 @@ impl HooksEngine {
         Ok(row)
     }
 
-    /// Resolve the current message id for thread_started / thread_finished
+    /// Load the thread's persisted terminal facts (status, ended_at,
+    /// iterations, token aggregates) as written by the terminal UPDATE.
+    /// Missing thread / missing row values fall back to the caller's status
+    /// with null aggregates.
+    async fn load_terminal_info(&self, thread_id: i64, status: &str) -> AppResult<TerminalInfo> {
+        #[derive(FromRow)]
+        struct TerminalRow {
+            status: Option<String>,
+            ended_at: Option<chrono::DateTime<Utc>>,
+            iterations: Option<i32>,
+            input_tokens: Option<i32>,
+            cached_tokens: Option<i32>,
+            output_tokens: Option<i32>,
+        }
+        let row: Option<TerminalRow> = sqlx::query_as(
+            "SELECT status, ended_at, iterations, input_tokens, cached_tokens, output_tokens \
+             FROM threads WHERE id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(TerminalInfo {
+                status: status.to_string(),
+                ..Default::default()
+            });
+        };
+        Ok(TerminalInfo {
+            status: row.status.unwrap_or_else(|| status.to_string()),
+            ended_at: row.ended_at.map(|ts| ts.to_rfc3339()),
+            iterations: row.iterations.map(i64::from),
+            input_tokens: row.input_tokens.map(i64::from),
+            cached_tokens: row.cached_tokens.map(i64::from),
+            output_tokens: row.output_tokens.map(i64::from),
+        })
+    }
+
+    /// Resolve the current message id for thread_started and the terminal
     /// events: the thread's last message (highest `messages.id`); when the
     /// thread has no messages, the last message id in the DB; None when the
     /// DB has no messages at all.
@@ -239,10 +340,25 @@ impl HooksEngine {
     }
 
     async fn handle_event(&self, event: &str, thread_id: i64) -> AppResult<()> {
-        self.handle_event_with_message(event, thread_id, 0).await
+        self.handle_event_full(event, thread_id, 0, None).await
     }
 
-    /// Shared event pipeline for all three event types.
+    /// Terminal lifecycle pipeline: the per-status event (when the terminal
+    /// status has one) followed by the catch-all `thread_terminated`. Both
+    /// carry the same terminal facts, and each event runs its own
+    /// counter/trigger pass, so a hook bound to either event fires exactly
+    /// once per terminal transition.
+    async fn handle_terminal_event(&self, thread_id: i64, status: &str) -> AppResult<()> {
+        let info = self.load_terminal_info(thread_id, status).await?;
+        if let Some(event) = per_status_event(status) {
+            self.handle_event_full(event, thread_id, 0, Some(info.clone()))
+                .await?;
+        }
+        self.handle_event_full(EVENT_THREAD_TERMINATED, thread_id, 0, Some(info))
+            .await
+    }
+
+    /// Shared event pipeline for all event types.
     ///
     /// 1. Infinite-loop protection: hook-caused threads never trigger events.
     /// 2. Load enabled hooks for the event type.
@@ -254,6 +370,19 @@ impl HooksEngine {
         event: &str,
         thread_id: i64,
         message_id: i64,
+    ) -> AppResult<()> {
+        self.handle_event_full(event, thread_id, message_id, None)
+            .await
+    }
+
+    /// The pipeline body: `terminal` carries the terminal facts for
+    /// `thread_terminated` / per-status events (`None` for every other event).
+    async fn handle_event_full(
+        &self,
+        event: &str,
+        thread_id: i64,
+        message_id: i64,
+        terminal: Option<TerminalInfo>,
     ) -> AppResult<()> {
         let Some(thread) = self.load_event_thread(thread_id).await? else {
             return Ok(()); // thread deleted: nothing to trigger on
@@ -270,8 +399,8 @@ impl HooksEngine {
         }
 
         // `current_message`: new_message events carry the inserted message id;
-        // thread_started / thread_finished resolve the thread's last message
-        // (fallback: the last message id in the DB).
+        // thread_started and the terminal events resolve the thread's last
+        // message (fallback: the last message id in the DB).
         let current_message: Option<i64> = if event == EVENT_NEW_MESSAGE {
             (message_id > 0).then_some(message_id)
         } else {
@@ -289,7 +418,7 @@ impl HooksEngine {
                 continue; // out of scope: ignored by this hook
             };
             if let Err(e) = self
-                .record_and_maybe_trigger(&hook, &key, &thread, current_message)
+                .record_and_maybe_trigger(&hook, &key, &thread, current_message, terminal.as_ref())
                 .await
             {
                 error!(
@@ -310,6 +439,7 @@ impl HooksEngine {
         key: &str,
         thread: &EventThreadRow,
         current_message: Option<i64>,
+        terminal: Option<&TerminalInfo>,
     ) -> AppResult<()> {
         let mut tx = self.pool.begin().await?;
         let counter_row: Option<(String,)> = sqlx::query_as(
@@ -369,6 +499,7 @@ impl HooksEngine {
                 current_message,
                 &thread.channel_id,
                 &thread.profile,
+                terminal,
             );
             if let Err(e) = self.trigger(hook, thread, &event).await {
                 error!(
@@ -812,9 +943,14 @@ pub fn meta_update(
 
 /// Build the event object delivered to a hook's execution target.
 ///
-/// All six keys are ALWAYS present; unknown ids are serialized as `null`:
+/// The six base keys are ALWAYS present; unknown ids are serialized as `null`:
 /// on the first trigger `last_thread` / `last_message` are null; on a
 /// manual fire `current_thread` / `current_message` are null.
+///
+/// When `terminal` is `Some` (the `thread_terminated` / per-status events)
+/// the payload additionally carries `status`, `ended_at`, `iterations` and the
+/// token aggregates `input_tokens` / `cached_tokens` / `output_tokens`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_event(
     last_thread: Option<i64>,
     last_message: Option<i64>,
@@ -822,15 +958,25 @@ pub fn build_event(
     current_message: Option<i64>,
     channel: &str,
     profile: &str,
+    terminal: Option<&TerminalInfo>,
 ) -> Value {
-    json!({
+    let mut event = json!({
         "last_thread": last_thread,
         "last_message": last_message,
         "current_thread": current_thread,
         "current_message": current_message,
         "channel": channel,
         "profile": profile,
-    })
+    });
+    if let Some(t) = terminal {
+        event["status"] = json!(t.status);
+        event["ended_at"] = json!(t.ended_at);
+        event["iterations"] = json!(t.iterations);
+        event["input_tokens"] = json!(t.input_tokens);
+        event["cached_tokens"] = json!(t.cached_tokens);
+        event["output_tokens"] = json!(t.output_tokens);
+    }
+    event
 }
 
 /// Guard: hooks must never be triggered by threads (or messages from
@@ -920,6 +1066,7 @@ pub async fn fire_hook_by_id(
         None,
         &thread_ctx.channel_id,
         &thread_ctx.profile,
+        None,
     );
     engine.trigger(&hook, &thread_ctx, &event).await
 }
@@ -1103,9 +1250,106 @@ mod tests {
     }
 
     #[test]
+    fn valid_events_are_the_eight_lifecycle_events() {
+        // Exactly the 8 lifecycle event names; `thread_finished` is REMOVED
+        // (no backward-compat alias).
+        assert_eq!(VALID_EVENTS.len(), 8);
+        for expected in [
+            "thread_started",
+            "new_message",
+            "thread_completed",
+            "thread_interrupted",
+            "thread_failed",
+            "thread_skipped",
+            "thread_merged",
+            "thread_terminated",
+        ] {
+            assert!(
+                VALID_EVENTS.contains(&expected),
+                "VALID_EVENTS must contain {expected}"
+            );
+        }
+        assert!(
+            !VALID_EVENTS.contains(&"thread_finished"),
+            "thread_finished must be removed from VALID_EVENTS"
+        );
+        // No constant may still spell the legacy name.
+        assert!(!VALID_EVENTS.iter().any(|e| e.contains("finished")));
+    }
+
+    #[test]
+    fn per_status_event_mapping() {
+        assert_eq!(per_status_event("completed"), Some(EVENT_THREAD_COMPLETED));
+        assert_eq!(
+            per_status_event("interrupted"),
+            Some(EVENT_THREAD_INTERRUPTED)
+        );
+        assert_eq!(per_status_event("failed"), Some(EVENT_THREAD_FAILED));
+        assert_eq!(per_status_event("skipped"), Some(EVENT_THREAD_SKIPPED));
+        assert_eq!(per_status_event("merged"), Some(EVENT_THREAD_MERGED));
+        // 'system' (init/action threads) + the legacy name + junk: only the
+        // catch-all thread_terminated fires for those transitions.
+        assert_eq!(per_status_event("system"), None);
+        assert_eq!(per_status_event("thread_finished"), None);
+        assert_eq!(per_status_event(""), None);
+    }
+
+    #[test]
+    fn build_event_terminal_payload() {
+        let info = TerminalInfo {
+            status: "failed".to_string(),
+            ended_at: Some("2026-09-17T20:00:00+00:00".to_string()),
+            iterations: Some(7),
+            input_tokens: Some(1234),
+            cached_tokens: Some(999),
+            output_tokens: Some(321),
+        };
+        let e = build_event(
+            Some(10),
+            Some(20),
+            Some(30),
+            Some(40),
+            "ch",
+            "omni",
+            Some(&info),
+        );
+        assert_eq!(e["status"], json!("failed"));
+        assert_eq!(e["ended_at"], json!("2026-09-17T20:00:00+00:00"));
+        assert_eq!(e["iterations"], json!(7));
+        assert_eq!(e["input_tokens"], json!(1234));
+        assert_eq!(e["cached_tokens"], json!(999));
+        assert_eq!(e["output_tokens"], json!(321));
+        // Base keys survive.
+        assert_eq!(e["current_thread"], json!(30));
+        assert_eq!(e["channel"], json!("ch"));
+        // Unknown terminal values serialize as null, never missing.
+        let e = build_event(
+            None,
+            None,
+            None,
+            None,
+            "ch",
+            "omni",
+            Some(&TerminalInfo::default()),
+        );
+        assert_eq!(e["status"], json!(""));
+        assert_eq!(e["ended_at"], Value::Null);
+        assert_eq!(e["iterations"], Value::Null);
+        assert_eq!(e["input_tokens"], Value::Null);
+    }
+
+    #[test]
     fn build_event_first_trigger() {
         // First trigger: last_* unknown → null; current_* = trigger ids.
-        let e = build_event(None, None, Some(123), Some(456), "mattermost-abc", "omni");
+        let e = build_event(
+            None,
+            None,
+            Some(123),
+            Some(456),
+            "mattermost-abc",
+            "omni",
+            None,
+        );
         assert_eq!(
             e,
             json!({
@@ -1122,7 +1366,15 @@ mod tests {
     #[test]
     fn build_event_subsequent_trigger() {
         // Subsequent trigger: last_* = previous trigger's ids.
-        let e = build_event(Some(100), Some(200), Some(123), Some(456), "ch", "omni");
+        let e = build_event(
+            Some(100),
+            Some(200),
+            Some(123),
+            Some(456),
+            "ch",
+            "omni",
+            None,
+        );
         assert_eq!(e["last_thread"], json!(100));
         assert_eq!(e["last_message"], json!(200));
         assert_eq!(e["current_thread"], json!(123));
@@ -1134,7 +1386,7 @@ mod tests {
     #[test]
     fn manual_fire_event_shape() {
         // Manual fire: no triggering thread/message.
-        let e = build_event(Some(7), Some(8), None, None, "mattermost-x", "omni");
+        let e = build_event(Some(7), Some(8), None, None, "mattermost-x", "omni", None);
         assert_eq!(
             e,
             json!({

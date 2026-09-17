@@ -266,7 +266,8 @@ async fn run_server() -> AppResult<()> {
 
     // Initialize the event-driven Hooks engine (isolated, fire-and-forget):
     // reads hooks from the DB and triggers agentic threads / actions on
-    // thread_started / thread_finished / new_message events.
+    // thread_started / new_message / thread_completed / thread_interrupted /
+    // thread_failed / thread_skipped / thread_merged / thread_terminated.
     hooks::init(hooks::HooksEngine::new(
         pool.clone(),
         data_dir.clone(),

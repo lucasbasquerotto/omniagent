@@ -128,9 +128,13 @@ where
 /// These threads should never be picked up by the executor.
 pub async fn set_thread_system(pool: &PgPool, thread_id: i64) -> AppResult<()> {
     // Single choke point: status + ended_at + terminal=true + iterations.
-    mark_thread_terminal(pool, thread_id, "system").await?;
-    // Event-driven hooks: fire thread_finished (fire-and-forget, isolated).
-    crate::hooks::fire_thread_finished(thread_id);
+    let n = mark_thread_terminal(pool, thread_id, "system").await?;
+    if n > 0 {
+        // Event-driven hooks: a terminal 'system' thread has no per-status
+        // event, so only the catch-all thread_terminated fires
+        // (fire-and-forget, isolated).
+        crate::hooks::fire_thread_terminated(thread_id, "system");
+    }
     Ok(())
 }
 
@@ -139,9 +143,12 @@ pub async fn set_thread_system(pool: &PgPool, thread_id: i64) -> AppResult<()> {
 #[allow(dead_code)]
 pub async fn set_thread_failed(pool: &PgPool, thread_id: i64) -> AppResult<()> {
     // Single choke point: status + ended_at + terminal=true + iterations.
-    mark_thread_terminal(pool, thread_id, "failed").await?;
-    // Event-driven hooks: fire thread_finished (fire-and-forget, isolated).
-    crate::hooks::fire_thread_finished(thread_id);
+    let n = mark_thread_terminal(pool, thread_id, "failed").await?;
+    if n > 0 {
+        // Event-driven hooks: thread_failed + thread_terminated
+        // (fire-and-forget, isolated).
+        crate::hooks::fire_thread_terminated(thread_id, "failed");
+    }
     Ok(())
 }
 
@@ -282,6 +289,10 @@ pub(crate) fn stop_thread_recovery(
 
 pub async fn create_cause_and_set_pending(pool: &PgPool, msg: &MessageNew) -> AppResult<Message> {
     let mut tx = pool.begin().await?;
+    // Event-driven hooks: the seq-0 cause messages of re-scheduled threads are
+    // inserted by direct SQL further down; collect their (thread_id,
+    // message_id) so new_message fires exactly once per row, post-commit.
+    let mut hook_new_messages: Vec<(i64, i64)> = Vec::new();
     let metadata_val: serde_json::Value =
         serde_json::from_str(&msg.metadata.to_string()).unwrap_or_default();
     let saved: MessageDb = sql_forge!(
@@ -459,15 +470,18 @@ pub async fn create_cause_and_set_pending(pool: &PgPool, msg: &MessageNew) -> Ap
                             Some(c) if !is_placeholder_cause_content(&c) => c,
                             _ => format!("Re-run of thread #{} (channel closed)", t.id),
                         };
-                    sql_forge!(
+                    let cause_msg_id: i64 = sql_forge!(
+                        scalar i64,
                         r#"
                         INSERT INTO messages (thread_id, role, content, thread_sequence, msg_type)
                         VALUES (:tid, 'cause', :content, 0, 'cause')
+                        RETURNING id
                         "#,
                         ( :tid = new_id, :content = cause )
                     )
-                    .execute(&mut *tx)
+                    .fetch_one(&mut *tx)
                     .await?;
+                    hook_new_messages.push((new_id, cause_msg_id));
 
                     sql_forge!(
                         "UPDATE kanban_tasks SET thread_status = 'scheduled' WHERE id = :task_id",
@@ -500,8 +514,13 @@ pub async fn create_cause_and_set_pending(pool: &PgPool, msg: &MessageNew) -> Ap
 
     tx.commit().await?;
 
-    // Event-driven hooks: fire new_message for the inserted seq-0 message.
+    // Event-driven hooks: fire new_message for the inserted seq-0 message(s),
+    // post-commit so the handler observes the committed rows: this thread's
+    // cause message plus every re-scheduled thread's cause message.
     crate::hooks::fire_new_message(msg.thread_id, saved.id);
+    for (tid, mid) in hook_new_messages {
+        crate::hooks::fire_new_message(tid, mid);
+    }
 
     saved.try_into()
 }
@@ -890,7 +909,7 @@ pub async fn complete_thread(
     status: &str,
     stats: CompleteThreadStats,
 ) -> AppResult<()> {
-    sql_forge!(
+    let result = sql_forge!(
         r#"        UPDATE threads t
             SET status = :status,
                 input_tokens = CASE WHEN :input_tokens > 0 THEN :input_tokens
@@ -926,8 +945,12 @@ pub async fn complete_thread(
     .execute(pool)
     .await?;
 
-    // Event-driven hooks: fire thread_finished on terminal transition.
-    crate::hooks::fire_thread_finished(thread_id);
+    // Event-driven hooks: the terminal lifecycle events on a REAL transition
+    // (rows_affected == 0 means the thread was already terminal: there is no
+    // transition to announce).
+    if result.rows_affected() > 0 {
+        crate::hooks::fire_thread_terminated(thread_id, status);
+    }
 
     Ok(())
 }
@@ -1005,8 +1028,11 @@ pub async fn skip_channel_threads(pool: &PgPool, channel_id: &str) -> AppResult<
 
     for t in &threads {
         let mut tx = pool.begin().await?;
+        // Event-driven hooks: (thread_id, message_id) pairs of the seq-0 cause
+        // messages inserted below for a re-run thread; fired post-commit.
+        let mut new_msg_ids: Vec<(i64, i64)> = Vec::new();
         // Terminal write: single choke point sets terminal=true with 'skipped'.
-        mark_thread_terminal(&mut *tx, t.id, "skipped").await?;
+        let terminal = mark_thread_terminal(&mut *tx, t.id, "skipped").await?;
 
         if let Some(ref task_id) = t.task_id {
             #[derive(sqlx::FromRow)]
@@ -1068,13 +1094,16 @@ pub async fn skip_channel_threads(pool: &PgPool, channel_id: &str) -> AppResult<
                             Some(c) if !is_placeholder_cause_content(&c) => c,
                             _ => format!("Re-run of thread #{} (channel closed)", t.id),
                         };
-                    sql_forge!(
+                    let cause_msg_id: i64 = sql_forge!(
+                        scalar i64,
                         "INSERT INTO messages (thread_id, role, content, thread_sequence, msg_type)
-                         VALUES (:tid, 'cause', :content, 0, 'cause')",
+                         VALUES (:tid, 'cause', :content, 0, 'cause')
+                         RETURNING id",
                         ( :tid = new_id, :content = cause )
                     )
-                    .execute(&mut *tx)
+                    .fetch_one(&mut *tx)
                     .await?;
+                    new_msg_ids.push((new_id, cause_msg_id));
                     sql_forge!(
                         "UPDATE kanban_tasks SET thread_status = 'scheduled' WHERE id = :task_id",
                         ( :task_id = task_id.as_str() )
@@ -1099,6 +1128,16 @@ pub async fn skip_channel_threads(pool: &PgPool, channel_id: &str) -> AppResult<
             }
         }
         tx.commit().await?;
+
+        // Event-driven hooks (post-commit, fire-and-forget, isolated): the
+        // terminal 'skipped' transition of this thread plus the new_message
+        // events of the seq-0 cause messages inserted above.
+        if terminal > 0 {
+            crate::hooks::fire_thread_terminated(t.id, "skipped");
+        }
+        for (tid, mid) in new_msg_ids {
+            crate::hooks::fire_new_message(tid, mid);
+        }
     }
     Ok(threads.len())
 }
@@ -1198,8 +1237,9 @@ pub async fn skip_thread(pool: &PgPool, thread_id: i64) -> AppResult<u64> {
     let result = mark_thread_terminal(pool, thread_id, "skipped").await?;
 
     if result > 0 {
-        // Event-driven hooks: fire thread_finished on terminal transition.
-        crate::hooks::fire_thread_finished(thread_id);
+        // Event-driven hooks: terminal lifecycle events (thread_skipped +
+        // thread_terminated) on the real transition.
+        crate::hooks::fire_thread_terminated(thread_id, "skipped");
     }
 
     Ok(result)
@@ -1218,9 +1258,12 @@ pub async fn skip_thread(pool: &PgPool, thread_id: i64) -> AppResult<u64> {
 /// keep running against a task that moved away from it.
 ///
 /// Same marker semantics as the existing skip paths: single choke point
-/// `mark_thread_terminal(..., "skipped")`; no hook is fired (the caller
-/// owns the transition - firing thread_finished here could double-route
-/// the workflow). Returns the number of threads skipped.
+/// `mark_thread_terminal(..., "skipped")`. Every REAL transition (the choke
+/// point only touches `NOT terminal` rows, so `rows_affected > 0` is an exact
+/// transition test) additionally fires the terminal lifecycle hook events
+/// (`thread_skipped` + `thread_terminated`), so a thread skipped because its
+/// task moved away from its step is not hook-silent anymore. Returns the
+/// number of threads skipped.
 pub(crate) async fn skip_stale_threads_for_status(
     pool: &PgPool,
     task_id: &str,
@@ -1265,6 +1308,9 @@ pub(crate) async fn skip_stale_threads_for_status(
         if n == 0 {
             continue;
         }
+        // Event-driven hooks: real terminal transition - fire the terminal
+        // lifecycle events (this path used to be hook-silent).
+        crate::hooks::fire_thread_terminated(t.id, "skipped");
         skipped += 1;
         // Audit the skip in kanban history (best-effort, like the existing
         // status-change dispatch skip).
@@ -1937,11 +1983,22 @@ pub async fn skip_all_pending_threads(pool: &PgPool, data_dir: &str) -> AppResul
     .await?;
 
     let mut tx = pool.begin().await?;
+    let mut skipped_ids: Vec<i64> = Vec::new();
     for t in &threads {
         // Terminal write: single choke point sets terminal=true with 'skipped'.
-        mark_thread_terminal(&mut *tx, t.id, "skipped").await?;
+        let n = mark_thread_terminal(&mut *tx, t.id, "skipped").await?;
+        if n > 0 {
+            skipped_ids.push(t.id);
+        }
     }
     tx.commit().await?;
+
+    // Event-driven hooks (post-commit, fire-and-forget, isolated): every thread
+    // this startup pass flipped to terminal 'skipped' emits the terminal
+    // lifecycle events (this path used to be hook-silent).
+    for id in skipped_ids {
+        crate::hooks::fire_thread_terminated(id, "skipped");
+    }
 
     // Unified startup redispatch: every kanban task in a workflow column
     // WITHOUT an active thread gets its role thread re-created (the skipped
@@ -3150,7 +3207,7 @@ pub async fn mark_thread_merged_for_sub_prompt(
 ) -> AppResult<u64> {
     let result = mark_thread_terminal(pool, pending_id, "merged").await?;
     if result > 0 {
-        crate::hooks::fire_thread_finished(pending_id);
+        crate::hooks::fire_thread_terminated(pending_id, "merged");
         #[derive(sqlx::FromRow)]
         struct TaskRow {
             task_id: Option<String>,

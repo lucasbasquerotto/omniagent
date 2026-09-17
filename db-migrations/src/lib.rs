@@ -198,7 +198,9 @@ pub async fn run(pool: &PgPool) -> Result<()> {
         .ok();
     tracing::info!("[migration] Kanban tags tables (kanban_tags, task_tags) added");
 
-    // -- Event-driven Hooks (thread_started / thread_finished / new_message) --
+    // -- Event-driven Hooks (thread_started / new_message / thread_completed /
+    //    thread_interrupted / thread_failed / thread_skipped / thread_merged /
+    //    thread_terminated) --
     // threads.hook_caused marks hook-caused threads so the hooks engine can
     // skip them (infinite-loop protection: hook threads never re-trigger).
     sqlx::query(
@@ -240,14 +242,27 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     .ok();
 
     // Idempotent CHECK constraints (event/scope/mode/count value validation).
+    // The event set is EXTENDED over time (terminal lifecycle events), so the
+    // event constraint is DROPPED and RE-ADDED on every start: CREATE ... IF
+    // NOT EXISTS alone would leave an old, narrower constraint in place.
+    sqlx::query(
+        r#"
+        ALTER TABLE hooks DROP CONSTRAINT IF EXISTS hooks_event_chk;
+        ALTER TABLE hooks ADD CONSTRAINT hooks_event_chk
+            CHECK (event IN ('thread_started', 'new_message', 'thread_completed',
+                             'thread_interrupted', 'thread_failed', 'thread_skipped',
+                             'thread_merged', 'thread_terminated'));
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    // Idempotent CHECK constraints (scope/mode/count value validation).
     sqlx::query(
         r#"
         DO $$
         BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'hooks_event_chk') THEN
-                ALTER TABLE hooks ADD CONSTRAINT hooks_event_chk
-                    CHECK (event IN ('thread_started', 'thread_finished', 'new_message'));
-            END IF;
             IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'hooks_scope_chk') THEN
                 ALTER TABLE hooks ADD CONSTRAINT hooks_scope_chk
                     CHECK (scope IN ('global', 'channel', 'profile'));

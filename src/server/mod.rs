@@ -536,9 +536,15 @@ async fn stop_handler(
     //    Every terminal write funnels through queries::mark_thread_terminal so
     //    the terminal=true invariant holds on the skipped rows.
     let mut skipped = 0u64;
+    let mut skipped_ids: Vec<i64> = Vec::new();
     for row in &threads {
         match queries::mark_thread_terminal(&state.pool, row.id, "skipped").await {
-            Ok(n) => skipped += n,
+            Ok(n) => {
+                skipped += n;
+                if n > 0 {
+                    skipped_ids.push(row.id);
+                }
+            }
             Err(e) => {
                 error!(
                     "Stop: failed to skip thread {} for channel {}: {:?}",
@@ -556,6 +562,13 @@ async fn stop_handler(
         "Stop: skipped {} pending/processing threads for channel {}",
         skipped, channel_id
     );
+
+    // Event-driven hooks: every thread this stop flipped to terminal
+    // 'skipped' emits the terminal lifecycle events (thread_skipped +
+    // thread_terminated), fire-and-forget.
+    for id in skipped_ids {
+        crate::hooks::fire_thread_terminated(id, "skipped");
+    }
 
     // 3. Phase 6b: block the kanban tasks of the skipped threads
     let mut blocked = 0u32;
@@ -756,9 +769,15 @@ async fn close_handler(
     //    Every terminal write funnels through queries::mark_thread_terminal so
     //    the terminal=true invariant holds on the skipped rows.
     let mut skipped = 0u64;
+    let mut skipped_ids: Vec<i64> = Vec::new();
     for row in &threads {
         match queries::mark_thread_terminal(&state.pool, row.id, "skipped").await {
-            Ok(n) => skipped += n,
+            Ok(n) => {
+                skipped += n;
+                if n > 0 {
+                    skipped_ids.push(row.id);
+                }
+            }
             Err(e) => {
                 error!(
                     "Close: failed to skip thread {} for channel {}: {:?}",
@@ -776,6 +795,13 @@ async fn close_handler(
         "Close: skipped {} pending/processing threads for channel {}",
         skipped, channel_id
     );
+
+    // Event-driven hooks: every thread this close flipped to terminal
+    // 'skipped' emits the terminal lifecycle events (thread_skipped +
+    // thread_terminated), fire-and-forget.
+    for id in skipped_ids {
+        crate::hooks::fire_thread_terminated(id, "skipped");
+    }
 
     // 3. Phase 6b: block the kanban tasks of the skipped threads
     let mut blocked = 0u32;

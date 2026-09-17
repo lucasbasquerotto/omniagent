@@ -91,35 +91,19 @@ async fn apply_enable(
 ) -> Response {
     if let Ok(Some(entry)) = plugins_yaml::get_entry(&state.data_dir, &yaml_type, &name) {
         if entry.enabled && entry.source == source {
-            // Already enabled - idempotent no-op: just return the plugin detail.
-            // (Previously this branch force-restarted the plugin, which is the
-            // job of the dedicated /restart endpoint, not /enable.) The
-            // lifecycle queue guarantees this check reads the state left by the
-            // previous operation for this plugin, so a burst of duplicate
-            // enables still performs exactly one start.
-            //
-            // EXCEPT for providers: reload_plugins is the ONLY place that
-            // spawns the provider subprocess, and on a cold stack (fresh
-            // deploy, container restart) the subprocess has not been started
-            // yet - nothing triggers the startup reload. If we return here
-            // without reloading, an enabled provider stays subprocess-less
-            // until some unrelated API call happens to run reload_plugins, and
-            // the first LLM completion falls back to HTTP and fails. Reload is
-            // idempotent for already-running providers (entrypoint unchanged ->
-            // no restart), so it is safe to run it in the idempotent branch.
-            if yaml_type == plugins_yaml::PluginYamlType::Provider {
-                crate::llm::refresh_provider_metadata();
-                if let Err(e) = super::plugins_env::reload_plugins(state.clone()).await {
-                    warn!("Provider reload for '{}' failed: {}", name, e);
-                }
-            }
-            if let Ok(Some(detail)) = plugins_yaml::get_plugin(&state.data_dir, &name, &yaml_type) {
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"success": true, "data": detail})),
-                )
-                    .into_response();
-            }
+            // Already enabled in plugins.yml - that is CONFIG INTENT, not proof
+            // that the plugin is RUNNING: on a cold stack the subprocess may
+            // never have been started (e.g. the remote source was installed
+            // after boot), or it may have died since. Verify and really start
+            // it when needed; a plugin that does not end up running must NEVER
+            // get a green success (2026-09-18). The lifecycle queue
+            // (per-plugin FIFO) guarantees this check reads the state left by
+            // the previous operation, so a burst of duplicate enables still
+            // performs exactly one start for a healthy plugin.
+            return match ensure_plugin_running(&state, &yaml_type, &name).await {
+                Ok(()) => respond_enabled(&state, &yaml_type, &name).await,
+                Err(reason) => fail_enable(&state, &yaml_type, &name, reason).await,
+            };
         }
     }
     let existing_remote = plugins_yaml::get_remote_plugin(&state.data_dir, &yaml_type, &name);
@@ -219,10 +203,9 @@ async fn apply_enable(
                     }
                 }
             }
-            match plugins_yaml::get_plugin(&state.data_dir, &name, &yaml_type) {
-                Ok(Some(detail)) => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": detail}))).into_response(),
-                _ => (StatusCode::OK, Json(serde_json::json!({"success": true, "data": {"name": name, "status": "enabled"}}))).into_response(),
-            }
+            // Final gate: a successful-looking apply above is NOT enough - the
+            // plugin must ACTUALLY be running before we answer with success.
+            respond_enabled(&state, &yaml_type, &name).await
         }
         Err(e) => {
             error!("Failed to enable plugin '{}': {:?}", name, e);
@@ -232,6 +215,67 @@ async fn apply_enable(
             )
         }
     }
+}
+
+/// Success response for an enable, gated on the plugin REALLY running.
+///
+/// Re-verifies the runtime state (MCP registry / platform clients) and turns
+/// the call into a loud failure when the plugin did not start, so a green
+/// "Enabled" answer is only ever produced for a plugin that is actually up.
+async fn respond_enabled(
+    state: &Arc<AppState>,
+    yaml_type: &plugins_yaml::PluginYamlType,
+    name: &str,
+) -> Response {
+    if let Err(reason) = verify_plugin_started(state, yaml_type, name).await {
+        return fail_enable(state, yaml_type, name, reason).await;
+    }
+    match plugins_yaml::get_plugin(&state.data_dir, name, yaml_type) {
+        Ok(Some(mut detail)) => {
+            apply_tool_runtime_status(state, &mut detail).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"success": true, "data": detail})),
+            )
+                .into_response()
+        }
+        _ => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "data": {"name": name, "status": "enabled"}})),
+        )
+            .into_response(),
+    }
+}
+
+/// Failure response for an enable: make the persisted state match reality (the
+/// plugin is NOT running, so it is not enabled) and answer with a non-2xx
+/// carrying the REAL reason. Never a green card for a broken plugin.
+async fn fail_enable(
+    state: &Arc<AppState>,
+    yaml_type: &plugins_yaml::PluginYamlType,
+    name: &str,
+    reason: String,
+) -> Response {
+    if let Err(e) = plugins_yaml::set_enabled(&state.data_dir, yaml_type, name, false) {
+        warn!(
+            "Failed to persist disabled state for plugin '{}': {:?}",
+            name, e
+        );
+    }
+    // Drop the half-started runtime state so the registry can never serve
+    // tools of a plugin that is not enabled.
+    state.plugin_manager.remove_client(name);
+    state.plugin_manager.remove_server_tools(name).await;
+    error!("Plugin '{}' did not start: {}", name, reason);
+    let code = if reason.contains("timed out") {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    error_response(
+        code,
+        format!("plugin '{}' failed to start: {}", name, reason),
+    )
 }
 
 pub(crate) async fn disable_plugin_handler(

@@ -306,3 +306,215 @@ pub(crate) fn sanitize_plugin_name(name: &str) -> String {
     }
     result
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Runtime status: is an ENABLED plugin actually RUNNING?
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `plugins.yml` records the operator's INTENT (enabled: true); it is NOT proof
+// that the plugin process exists. The remote source may have been installed
+// after boot, the subprocess may have died, or the MCP handshake may have
+// failed. The lifecycle handlers (enable/restart) and BOTH read endpoints
+// (GET /api/plugins and GET /api/plugins/{type}/{source}/{name}) go through the
+// helpers below, so the API can never report a broken plugin as "enabled"
+// (2026-09-18: the production memory plugin was listed as enabled while its
+// detail said error, and enabling it returned a green success without starting
+// anything).
+
+/// True when the MCP registry holds at least one tool for `server_name`.
+///
+/// The registry is the runtime source of truth for tool plugins: tools only
+/// appear after a successful spawn + JSON-RPC handshake.
+pub(crate) async fn tool_server_running(state: &Arc<AppState>, server_name: &str) -> bool {
+    let registry = state.plugin_manager.snapshot_registry().await;
+    let all_tools = registry.all();
+    all_tools
+        .iter()
+        .any(|t| t.server_name.as_deref() == Some(server_name))
+}
+
+/// True when a platform plugin has a running client registered.
+pub(crate) async fn platform_plugin_running(state: &Arc<AppState>, name: &str) -> bool {
+    if state.app_context.platforms.read().await.contains_key(name) {
+        return true;
+    }
+    state
+        .platform_restart_signals
+        .lock()
+        .await
+        .contains_key(name)
+}
+
+/// A TRUTHFUL explanation for an enabled tool plugin that registered no tools.
+///
+/// The previous message ("binary may not have compiled successfully") was a
+/// hardcoded guess that was also shown for Python/JS script plugins whose
+/// source was simply not installed yet. Check what is actually on disk.
+pub(crate) async fn mcp_start_failure_reason(data_dir: &str, name: &str) -> String {
+    let dir = data_dir.to_string();
+    let plugin = name.to_string();
+    let has_config = tokio::task::spawn_blocking(move || {
+        crate::mcp::external::config::server_config_exists(&dir, &plugin)
+    })
+    .await
+    .unwrap_or(false);
+
+    if has_config {
+        format!(
+            "the MCP server config for '{}' was found but the process did not initialize (check the omniagent log for the MCP server's own error output)",
+            name
+        )
+    } else {
+        format!(
+            "no startable MCP server config found for '{}': its source is not installed at the configured path (a remote plugin must be downloaded/installed first), or it provides no mcp-config.json/entrypoint",
+            name
+        )
+    }
+}
+
+/// Refresh the live status of tool plugins: fill `tool_names` from the MCP
+/// registry and turn "enabled but nothing running" into a real error carrying a
+/// truthful reason. Shared by the list AND the detail endpoint so both always
+/// agree on a plugin's status.
+pub(crate) async fn apply_tool_runtime_status_all(
+    state: &Arc<AppState>,
+    details: &mut [crate::plugins_yaml::PluginDetail],
+) {
+    // Snapshot the registry once (one cheap clone) and index tools per server.
+    let registry = state.plugin_manager.snapshot_registry().await;
+    let all_tools = registry.all();
+    let mut server_tools: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for tool in all_tools.iter() {
+        if let Some(ref server) = tool.server_name {
+            server_tools
+                .entry(server.clone())
+                .or_default()
+                .push(tool.name.clone());
+        }
+    }
+
+    for detail in details.iter_mut() {
+        if detail.plugin_type != "tool" {
+            continue;
+        }
+        if let Some(names) = server_tools.get(&detail.name) {
+            let mut names = names.clone();
+            names.sort();
+            names.dedup();
+            detail.tool_names = names;
+            continue;
+        }
+        if detail.status == "enabled" {
+            detail.status = "error".to_string();
+            detail.tool_names.clear();
+            detail.status_message = format!(
+                "MCP server failed to start: {}",
+                mcp_start_failure_reason(&state.data_dir, &detail.name).await
+            );
+        }
+    }
+}
+
+/// Single-plugin form of [`apply_tool_runtime_status_all`].
+pub(crate) async fn apply_tool_runtime_status(
+    state: &Arc<AppState>,
+    detail: &mut crate::plugins_yaml::PluginDetail,
+) {
+    apply_tool_runtime_status_all(state, std::slice::from_mut(detail)).await;
+}
+
+/// Verify that a plugin is ACTUALLY running. `Err` carries a real reason.
+pub(crate) async fn verify_plugin_started(
+    state: &Arc<AppState>,
+    yaml_type: &crate::plugins_yaml::PluginYamlType,
+    name: &str,
+) -> Result<(), String> {
+    match yaml_type {
+        crate::plugins_yaml::PluginYamlType::Tool => {
+            if tool_server_running(state, name).await {
+                Ok(())
+            } else {
+                Err(format!(
+                    "MCP server '{}' is not running: {}",
+                    name,
+                    mcp_start_failure_reason(&state.data_dir, name).await
+                ))
+            }
+        }
+        crate::plugins_yaml::PluginYamlType::Platform => {
+            if platform_plugin_running(state, name).await {
+                Ok(())
+            } else {
+                Err(format!(
+                    "platform plugin '{}' is enabled but no running client is registered",
+                    name
+                ))
+            }
+        }
+        // Providers are started by the reload sweep below, whose per-plugin
+        // error list is the verification.
+        crate::plugins_yaml::PluginYamlType::Provider => Ok(()),
+    }
+}
+
+/// Really START a plugin and return a real error string when it did not start.
+pub(crate) async fn start_plugin_now(
+    state: &Arc<AppState>,
+    yaml_type: &crate::plugins_yaml::PluginYamlType,
+    name: &str,
+) -> Result<(), String> {
+    match yaml_type {
+        crate::plugins_yaml::PluginYamlType::Tool => {
+            restart_tool_plugin(state, name).await.map(|_| ())
+        }
+        crate::plugins_yaml::PluginYamlType::Platform => {
+            let what = format!("platform plugin '{}' start", name);
+            crate::plugin::lifecycle::step_timeout(&what, start_platform_plugin(state, name))
+                .await
+                .map(|_| ())
+        }
+        crate::plugins_yaml::PluginYamlType::Provider => {
+            crate::llm::refresh_provider_metadata();
+            match super::plugins_env::reload_plugins(state.clone()).await {
+                Ok((_started, _stopped, errors)) => {
+                    let prefix = format!("{} ", name);
+                    let mine: Vec<String> = errors
+                        .iter()
+                        .filter(|e| e.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    if mine.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "provider '{}' failed to start: {}",
+                            name,
+                            mine.join("; ")
+                        ))
+                    }
+                }
+                Err(e) => Err(format!("provider '{}' reload failed: {}", name, e)),
+            }
+        }
+    }
+}
+
+/// Ensure `name` is running: verify first (a healthy plugin is never needlessly
+/// restarted, so a burst of duplicate enables still performs exactly one start)
+/// and start it for real when it is not running. Providers always take the
+/// start path because the reload sweep is the only thing that spawns them and
+/// that sweep is itself idempotent.
+pub(crate) async fn ensure_plugin_running(
+    state: &Arc<AppState>,
+    yaml_type: &crate::plugins_yaml::PluginYamlType,
+    name: &str,
+) -> Result<(), String> {
+    if *yaml_type != crate::plugins_yaml::PluginYamlType::Provider
+        && verify_plugin_started(state, yaml_type, name).await.is_ok()
+    {
+        return Ok(());
+    }
+    start_plugin_now(state, yaml_type, name).await?;
+    verify_plugin_started(state, yaml_type, name).await
+}

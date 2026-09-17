@@ -149,6 +149,19 @@ pub fn load_servers_config(data_dir: &str) -> Vec<McpServerConfig> {
     all_servers
 }
 
+/// True when a startable MCP server config exists for `server_name`.
+///
+/// Used to give a TRUTHFUL reason when an enabled tool plugin registered no
+/// tools: either its config/source is absent (a remote plugin that was never
+/// downloaded/installed) or the config is present and the process itself
+/// failed. The old code always blamed compilation, which is wrong for script
+/// plugins (Python/JS) and sent operators down the wrong path.
+pub fn server_config_exists(data_dir: &str, server_name: &str) -> bool {
+    load_servers_config(data_dir)
+        .iter()
+        .any(|c| c.name == server_name)
+}
+
 /// Scan `plugins/tools/` subdirectories for `mcp-config.json` files: SOURCE-AWARE.
 ///
 /// Instead of blindly scanning all directories, this reads `plugins.yml` to

@@ -649,49 +649,28 @@ pub async fn run(pool: &PgPool) -> Result<()> {
     tracing::info!(
         "[migration] Terminal status invariant: threads backfilled + CHECK constraint chk_thread_terminal_status added"
     );
-
-    // ── Goal state machine (durable phase + typed blocked reason + round cap) ──
-    // Per-task goal state (omnidev task 4): goal_phase
-    // (active/paused/blocked/complete), a stable machine-routable
-    // goal_blocked_code (kebab-case) + human goal_blocked_message, an optional
-    // goal_max_rounds cap, and a CAS revision counter (goal_revision). All
-    // columns are NULL except goal_revision (NOT NULL DEFAULT 0) - a task with
-    // NULL goal_phase has no goal state (zero behavior change for tasks that
-    // never use goals). Goals are strictly per-task state: the sequential
-    // per-channel dispatch model (threads.status gate in kanban_dispatch.rs)
-    // is untouched.
-    sqlx::query("ALTER TABLE kanban_tasks ADD COLUMN IF NOT EXISTS goal_phase TEXT")
+    // -- Removed: per-task goal state (goal_phase et al.) --------------------
+    // Dispatch is status-gated (only status = 'todo' AND archived = false is
+    // ever dispatched) and the status-change -> thread lifecycle never read
+    // goal state, so the per-task goal columns were redundant (operator
+    // decision, 2026-09-17: status alone drives thread lifecycle and
+    // dispatch). Idempotent DROPs clean up databases created while the goal
+    // state machine existed (safe to run on every startup).
+    sqlx::query("ALTER TABLE kanban_tasks DROP CONSTRAINT IF EXISTS chk_kanban_tasks_goal_phase")
         .execute(pool)
         .await
         .ok();
-    sqlx::query("ALTER TABLE kanban_tasks ADD COLUMN IF NOT EXISTS goal_blocked_code TEXT")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE kanban_tasks ADD COLUMN IF NOT EXISTS goal_blocked_message TEXT")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query("ALTER TABLE kanban_tasks ADD COLUMN IF NOT EXISTS goal_max_rounds INT")
-        .execute(pool)
-        .await
-        .ok();
-    sqlx::query(
-        "ALTER TABLE kanban_tasks ADD COLUMN IF NOT EXISTS goal_revision INT NOT NULL DEFAULT 0",
-    )
-    .execute(pool)
-    .await
-    .ok();
-    // goal_phase CHECK (idempotent DO block, matching the
-    // chk_kanban_tasks_thread_status pattern).
-    sqlx::query(
-        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_kanban_tasks_goal_phase') THEN ALTER TABLE kanban_tasks ADD CONSTRAINT chk_kanban_tasks_goal_phase CHECK (goal_phase IS NULL OR goal_phase IN ('active', 'paused', 'blocked', 'complete')); END IF; END $$;",
-    )
-    .execute(pool)
-    .await
-    .ok();
+    for stmt in [
+        "ALTER TABLE kanban_tasks DROP COLUMN IF EXISTS goal_phase",
+        "ALTER TABLE kanban_tasks DROP COLUMN IF EXISTS goal_blocked_code",
+        "ALTER TABLE kanban_tasks DROP COLUMN IF EXISTS goal_blocked_message",
+        "ALTER TABLE kanban_tasks DROP COLUMN IF EXISTS goal_max_rounds",
+        "ALTER TABLE kanban_tasks DROP COLUMN IF EXISTS goal_revision",
+    ] {
+        sqlx::query(stmt).execute(pool).await.ok();
+    }
     tracing::info!(
-        "[migration] Schema v8: goal state columns (kanban_tasks.goal_phase/goal_blocked_code/goal_blocked_message/goal_max_rounds/goal_revision) + chk_kanban_tasks_goal_phase CHECK"
+        "[migration] Dropped kanban_tasks goal state columns + chk_kanban_tasks_goal_phase CHECK (dispatch is status-gated)"
     );
 
     // -- Data migration: unify schedule/cron identity on a single name ------

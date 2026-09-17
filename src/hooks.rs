@@ -391,7 +391,7 @@ impl HooksEngine {
     ) -> AppResult<Option<i64>> {
         match hook.mode.as_str() {
             MODE_ACTION => {
-                self.run_action(hook, event).await?;
+                self.run_action(hook, thread, event).await?;
                 Ok(None)
             }
             _ => self.run_agentic(hook, thread, event).await,
@@ -490,8 +490,16 @@ impl HooksEngine {
     }
 
     /// Action mode: resolve the action from actions.yml and execute it via the
-    /// plugin registry (non-agentic, mirrors cron direct-action mode).
-    async fn run_action(&self, hook: &HookRow, event: &Value) -> AppResult<()> {
+    /// plugin registry, then persist the 3-message action thread (seq-0 cause,
+    /// seq-1 action with FULL logs + real duration, seq-2 summary with the
+    /// short text + real duration) and deliver it to the platform exactly like
+    /// agentic thread messages.
+    async fn run_action(
+        &self,
+        hook: &HookRow,
+        thread: &EventThreadRow,
+        event: &Value,
+    ) -> AppResult<()> {
         let action_id = hook.action_id.clone().unwrap_or_default();
         if action_id.trim().is_empty() {
             return Err(Error::Message(format!(
@@ -509,8 +517,34 @@ impl HooksEngine {
         } else {
             tool_call.arguments = json!({ "event": event });
         }
+
+        // Channel resolution (mirrors run_agentic): hook's explicit channel ->
+        // triggering thread's channel -> default_hook_channel -> ''.
+        let channel_id = hook
+            .channel_id
+            .as_deref()
+            .filter(|c| !c.trim().is_empty() && crate::channels_yaml::exists(c.trim()))
+            .map(str::to_string)
+            .or_else(|| {
+                (!thread.channel_id.trim().is_empty()
+                    && crate::channels_yaml::exists(&thread.channel_id))
+                .then(|| thread.channel_id.clone())
+            })
+            .or_else(|| crate::channels_yaml::resolve_default_channel(None, "default_hook_channel"))
+            .unwrap_or_default();
+        let profile = hook
+            .profile
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| thread.profile.clone());
+
+        // Real action time: measured around the tool execution, like agentic
+        // threads measure their processing time.
         let snapshot = self.plugin_manager.snapshot_registry().await;
-        match snapshot.execute(&tool_call, self.app_context.clone()).await {
+        let action_started = std::time::Instant::now();
+        let exec_result = snapshot.execute(&tool_call, self.app_context.clone()).await;
+        let duration_ms = action_started.elapsed().as_millis() as i64;
+        let (output, is_error) = match exec_result {
             Ok(result) => {
                 if result.is_error {
                     warn!(
@@ -523,13 +557,126 @@ impl HooksEngine {
                         hook.name, hook.id, tool_call.name
                     );
                 }
-                Ok(())
+                (result.content, result.is_error)
             }
-            Err(e) => Err(Error::Message(format!(
-                "action '{}' execution failed: {}",
-                action_id, e
-            ))),
+            Err(e) => {
+                let msg = format!("action '{}' execution failed: {}", action_id, e);
+                error!("[hooks] {}", msg);
+                (msg, true)
+            }
+        };
+
+        // Persist the 3-message contract: seq-0 cause (msg_type='hook'),
+        // seq-1 action (full logs, real duration), seq-2 summary (short,
+        // real duration). The thread is hook_caused so it never re-triggers
+        // hooks (infinite-loop protection), and terminal immediately.
+        let ts = Utc::now().timestamp_millis();
+        let external_id = format!("hook:{}:{}", hook.id, ts);
+        let (thread, cause_msg) = queries::create_thread_with_cause(
+            &self.pool,
+            &self.data_dir,
+            "system",
+            &channel_id,
+            &profile,
+            queries::ThreadCauseParams {
+                provider: None,
+                model: None,
+                task_id: None,
+                schedule_task_id: None,
+                toolset: hook.toolset.clone(),
+                content: hook.name.clone(),
+                external_id: Some(external_id),
+                parent_external_id: None,
+                metadata: json!({
+                    "hook_id": hook.id,
+                    "hook_name": hook.name,
+                    "hook_event": hook.event,
+                    "mode": "action",
+                    "action_id": action_id,
+                    "is_error": is_error,
+                }),
+                msg_type: "hook".to_string(),
+                msg_subtype: Some(hook.name.clone()),
+                task_plan: None,
+                template: hook.template.clone(),
+                workflow_id: None,
+                workflow_step: None,
+                hook_caused: true,
+            },
+        )
+        .await?;
+
+        let spec = crate::action_flow::ActionRunSpec {
+            name: &hook.name,
+            action_id: &action_id,
+            output: &output,
+            duration_ms,
+            is_error,
+        };
+        let seq1_external_id = format!("hook:{}:{}:result", hook.id, ts);
+        let seq_metadata = json!({
+            "hook_id": hook.id,
+            "is_error": is_error,
+            "action_id": action_id,
+        });
+        let (action_saved, summary_saved) = match crate::action_flow::persist_action_messages(
+            &self.pool,
+            &thread,
+            &spec,
+            seq1_external_id,
+            seq_metadata,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[hooks] Failed to persist action messages: {:?}", e);
+                if is_error {
+                    queries::set_thread_failed(&self.pool, thread.id).await?;
+                } else {
+                    queries::set_thread_system(&self.pool, thread.id).await?;
+                }
+                return Ok(());
+            }
+        };
+
+        if is_error {
+            queries::set_thread_failed(&self.pool, thread.id).await?;
+            info!(
+                "[hooks] Created failure thread {} for action hook '{}' ({})",
+                thread.id, hook.name, hook.id
+            );
+        } else {
+            queries::set_thread_system(&self.pool, thread.id).await?;
+            info!(
+                "[hooks] Created result thread {} for action hook '{}' ({})",
+                thread.id, hook.name, hook.id
+            );
         }
+
+        // Deliver the 3 messages to the platform (seq-0 cause, seq-1 action,
+        // seq-2 summary) + terminal reaction, like agentic threads.
+        let channel = if channel_id.is_empty() {
+            None
+        } else {
+            queries::find_channel_by_id(&self.pool, &channel_id)
+                .await
+                .ok()
+                .flatten()
+        };
+        crate::action_flow::deliver_action_thread(
+            &self.app_context,
+            &self.pool,
+            &thread,
+            &cause_msg,
+            channel.as_ref(),
+            &action_saved,
+            &summary_saved,
+            is_error,
+        )
+        .await;
+
+        Ok(())
     }
 }
 

@@ -130,6 +130,7 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
             let outcome = create_action_thread(
                 ctx.pool,
                 ctx.data_dir,
+                ctx.app_context,
                 ctx.task_id,
                 &title,
                 body.as_deref(),
@@ -139,9 +140,13 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
                 ctx.workflow_id,
                 ctx.step,
                 ctx.role,
-                ctx.action_id,
-                &format!("Action execution failed: {}", e),
-                true,
+                &crate::action_flow::ActionRunSpec {
+                    name: ctx.action_id,
+                    action_id: ctx.action_id,
+                    output: &format!("Action execution failed: {}", e),
+                    duration_ms: 0,
+                    is_error: true,
+                },
             )
             .await?;
             return Ok(outcome);
@@ -155,9 +160,13 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
 
     // Execute the tool first, then persist the thread with the result
     // (mirrors scheduler::handle_action_mode). Snapshot the registry under
-    // the lock; tokio::sync::RwLockReadGuard is Send.
+    // the lock; tokio::sync::RwLockReadGuard is Send. Real action time is
+    // measured around the tool execution, like agentic threads.
     let snapshot = ctx.plugin_manager.snapshot_registry().await;
-    match snapshot.execute(&tool_call, ctx.app_context.clone()).await {
+    let action_started = std::time::Instant::now();
+    let exec_result = snapshot.execute(&tool_call, ctx.app_context.clone()).await;
+    let duration_ms = action_started.elapsed().as_millis() as i64;
+    match exec_result {
         Ok(result) => {
             let is_error = result.is_error;
             if is_error {
@@ -174,6 +183,7 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
             create_action_thread(
                 ctx.pool,
                 ctx.data_dir,
+                ctx.app_context,
                 ctx.task_id,
                 &title,
                 body.as_deref(),
@@ -183,9 +193,13 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
                 ctx.workflow_id,
                 ctx.step,
                 ctx.role,
-                ctx.action_id,
-                &result.content,
-                is_error,
+                &crate::action_flow::ActionRunSpec {
+                    name: ctx.action_id,
+                    action_id: ctx.action_id,
+                    output: &result.content,
+                    duration_ms,
+                    is_error,
+                },
             )
             .await
         }
@@ -197,6 +211,7 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
             create_action_thread(
                 ctx.pool,
                 ctx.data_dir,
+                ctx.app_context,
                 ctx.task_id,
                 &title,
                 body.as_deref(),
@@ -206,9 +221,13 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
                 ctx.workflow_id,
                 ctx.step,
                 ctx.role,
-                ctx.action_id,
-                &format!("Action execution failed: {}", e),
-                true,
+                &crate::action_flow::ActionRunSpec {
+                    name: ctx.action_id,
+                    action_id: ctx.action_id,
+                    output: &format!("Action execution failed: {}", e),
+                    duration_ms,
+                    is_error: true,
+                },
             )
             .await
         }
@@ -219,6 +238,7 @@ pub(crate) async fn run_action_step(ctx: ActionStepCtx<'_>) -> AppResult<ActionS
 async fn create_action_thread(
     pool: &PgPool,
     data_dir: &str,
+    app_context: &AppContext,
     task_id: &str,
     title: &str,
     body: Option<&str>,
@@ -228,9 +248,7 @@ async fn create_action_thread(
     workflow_id: Option<&str>,
     step: &str,
     role: &str,
-    action_id: &str,
-    result_content: &str,
-    is_error: bool,
+    spec: &crate::action_flow::ActionRunSpec<'_>,
 ) -> AppResult<ActionStepOutcome> {
     let content = match body.map(str::trim).filter(|b| !b.is_empty()) {
         Some(body) => format!("{title}\n\n{body}"),
@@ -270,7 +288,7 @@ async fn create_action_thread(
             errored: existing.status == "failed",
         });
     }
-    let (thread, _cause_msg) = match queries::create_thread_with_cause(
+    let (thread, cause_msg) = match queries::create_thread_with_cause(
         pool,
         data_dir,
         "system",
@@ -290,8 +308,8 @@ async fn create_action_thread(
                 "kanban_task_title": title,
                 "mode": "action",
                 "role": role,
-                "action_id": action_id,
-                "is_error": is_error,
+                "action_id": spec.action_id,
+                "is_error": spec.is_error,
             }),
             msg_type: "kanban".to_string(),
             msg_subtype: Some(task_id.to_string()),
@@ -343,54 +361,80 @@ async fn create_action_thread(
         }
     };
 
-    // Persist the tool result as a seq-1 message (role='agent',
-    // msg_type='tool-result' with metadata.is_error) so the action outcome is
-    // auditable and `last_tool_result_errored` sees the correct signal.
-    let result_msg = queries::MessageNew {
-        thread_id: thread.id,
-        role: "agent".to_string(),
-        content: result_content.to_string(),
-        thread_sequence: 1,
-        external_id: Some(format!("kanban-action:{}:{}:{}:result", task_id, step, ts)),
-        metadata: serde_json::json!({
-            "kanban_task_id": task_id,
-            "is_error": is_error,
-        }),
-        embedding: None,
-        summary_text: None,
-        is_summary: false,
-        original_thread_id: None,
-        msg_type: "tool-result".to_string(),
-        msg_subtype: None,
-        iteration_number: 0,
-        duration_ms: 0,
-        token_usage: serde_json::json!({}),
+    // Persist the 3-message contract: seq-1 (action, full logs, real
+    // duration) + seq-2 (summary, short with the real duration).
+    let seq1_external_id = format!("kanban-action:{}:{}:{}:result", task_id, step, ts);
+    let seq_metadata = serde_json::json!({
+        "kanban_task_id": task_id,
+        "is_error": spec.is_error,
+        "action_id": spec.action_id,
+    });
+    let (action_saved, summary_saved) = match crate::action_flow::persist_action_messages(
+        pool,
+        &thread,
+        spec,
+        seq1_external_id,
+        seq_metadata,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[kanban-action] Failed to persist action messages: {:?}", e);
+            // Terminal write through the single choke point so the thread
+            // is never left dangling; outcome is still recorded.
+            if spec.is_error {
+                queries::set_thread_failed(pool, thread.id).await?;
+            } else {
+                queries::set_thread_system(pool, thread.id).await?;
+            }
+            return Ok(ActionStepOutcome {
+                thread_id: thread.id,
+                errored: spec.is_error,
+            });
+        }
     };
-    if let Err(e) = queries::create_message(pool, &result_msg).await {
-        warn!(
-            "[kanban-action] Failed to persist action result message: {:?}",
-            e
-        );
-    }
 
     // Terminal write through the single choke point: system (success) or
     // failed (error). The agent loop never picks this thread up.
-    if is_error {
+    if spec.is_error {
         queries::set_thread_failed(pool, thread.id).await?;
         info!(
             "[kanban-action] Created failure thread {} for task {} step '{}' (action {})",
-            thread.id, task_id, step, action_id
+            thread.id, task_id, step, spec.action_id
         );
     } else {
         queries::set_thread_system(pool, thread.id).await?;
         info!(
             "[kanban-action] Created result thread {} for task {} step '{}' (action {})",
-            thread.id, task_id, step, action_id
+            thread.id, task_id, step, spec.action_id
         );
     }
 
+    // Deliver the 3 messages to the platform (seq-0 cause, seq-1 action,
+    // seq-2 summary) + terminal reaction, exactly like agentic threads.
+    let channel = if channel_id.is_empty() {
+        None
+    } else {
+        queries::find_channel_by_id(pool, channel_id)
+            .await
+            .ok()
+            .flatten()
+    };
+    crate::action_flow::deliver_action_thread(
+        app_context,
+        pool,
+        &thread,
+        &cause_msg,
+        channel.as_ref(),
+        &action_saved,
+        &summary_saved,
+        spec.is_error,
+    )
+    .await;
+
     Ok(ActionStepOutcome {
         thread_id: thread.id,
-        errored: is_error,
+        errored: spec.is_error,
     })
 }

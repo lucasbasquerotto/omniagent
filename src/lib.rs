@@ -4,6 +4,7 @@
     dead_code,
     reason = "lib items may be consumed by main bin or MCP server binaries"
 )]
+pub mod action_flow;
 pub mod agent;
 pub mod boards;
 pub mod channels_yaml;

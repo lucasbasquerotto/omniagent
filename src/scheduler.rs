@@ -478,11 +478,17 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
             let thread_id = create_action_thread(ActionThreadCtx {
                 pool: ctx.pool,
                 data_dir: ctx.data_dir,
+                app_context: ctx.app_context,
                 job: ctx.job,
                 now: ctx.now,
                 display_name: ctx.display_name,
-                result_content: &msg,
-                is_error: true,
+                spec: &crate::action_flow::ActionRunSpec {
+                    name: ctx.display_name,
+                    action_id: "",
+                    output: &msg,
+                    duration_ms: 0,
+                    is_error: true,
+                },
                 cause: ctx.cause,
             })
             .await
@@ -507,11 +513,17 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
             let thread_id = create_action_thread(ActionThreadCtx {
                 pool: ctx.pool,
                 data_dir: ctx.data_dir,
+                app_context: ctx.app_context,
                 job: ctx.job,
                 now: ctx.now,
                 display_name: ctx.display_name,
-                result_content: &msg,
-                is_error: true,
+                spec: &crate::action_flow::ActionRunSpec {
+                    name: ctx.display_name,
+                    action_id: &action_id,
+                    output: &msg,
+                    duration_ms: 0,
+                    is_error: true,
+                },
                 cause: ctx.cause,
             })
             .await
@@ -533,10 +545,14 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
     // This avoids the executor picking up a pending thread before it's terminal.
     // Snapshot the registry under the lock; tokio::sync::RwLockReadGuard is Send.
     let mcp_snapshot = ctx.plugin_manager.snapshot_registry().await;
-    match mcp_snapshot
+    // Real action time: measured around the tool execution, the same way
+    // agentic threads measure their processing time.
+    let action_started = std::time::Instant::now();
+    let action_result = mcp_snapshot
         .execute(&tool_call, ctx.app_context.clone())
-        .await
-    {
+        .await;
+    let duration_ms = action_started.elapsed().as_millis() as i64;
+    match action_result {
         Ok(result) => {
             let is_error = result.is_error;
 
@@ -552,11 +568,17 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
                 match create_action_thread(ActionThreadCtx {
                     pool: ctx.pool,
                     data_dir: ctx.data_dir,
+                    app_context: ctx.app_context,
                     job: ctx.job,
                     now: ctx.now,
                     display_name: ctx.display_name,
-                    result_content: &result.content,
-                    is_error,
+                    spec: &crate::action_flow::ActionRunSpec {
+                        name: ctx.display_name,
+                        action_id: &action_id,
+                        output: &result.content,
+                        duration_ms,
+                        is_error,
+                    },
                     cause: ctx.cause,
                 })
                 .await
@@ -593,11 +615,17 @@ async fn execute_action_mode(ctx: ActionModeCtx<'_>) -> ActionRunOutcome {
             let thread_id = match create_action_thread(ActionThreadCtx {
                 pool: ctx.pool,
                 data_dir: ctx.data_dir,
+                app_context: ctx.app_context,
                 job: ctx.job,
                 now: ctx.now,
                 display_name: ctx.display_name,
-                result_content: &err_content,
-                is_error: true,
+                spec: &crate::action_flow::ActionRunSpec {
+                    name: ctx.display_name,
+                    action_id: &action_id,
+                    output: &err_content,
+                    duration_ms,
+                    is_error: true,
+                },
                 cause: ctx.cause,
             })
             .await
@@ -637,61 +665,29 @@ fn action_first_message(display_name: &str) -> String {
     display_name.to_string()
 }
 
-/// Type of the terminal result message: a failure is typed 'error' so a failed
-/// run is visible as a failure wherever thread/message types are read;
-/// a success stays 'tool-result' (the existing contract for tool output).
-fn action_result_msg_type(is_error: bool) -> &'static str {
-    if is_error {
-        "error"
-    } else {
-        "tool-result"
-    }
-}
-
-/// Content of the terminal result message: a success states the success
-/// explicitly (the tool output is kept as evidence); an error carries the
-/// ACTUAL error text, never a generic "run failed".
-fn action_result_content(display_name: &str, is_error: bool, output: &str) -> String {
-    let detail = output.trim();
-    if is_error {
-        if detail.is_empty() {
-            format!(
-                "Action '{}' FAILED (no error text was returned).",
-                display_name
-            )
-        } else {
-            format!("Action '{}' FAILED: {}", display_name, detail)
-        }
-    } else if detail.is_empty() {
-        format!("Action '{}' completed successfully.", display_name)
-    } else {
-        format!(
-            "Action '{}' completed successfully.\n\n{}",
-            display_name, detail
-        )
-    }
-}
-
 /// Context for `create_action_thread`: groups 8 params to stay under clippy's 7-arg limit.
 struct ActionThreadCtx<'a> {
     pool: &'a PgPool,
     data_dir: &'a str,
+    app_context: &'a AppContext,
     job: &'a CronJobDueRow,
     now: &'a DateTime<Utc>,
     display_name: &'a str,
-    result_content: &'a str,
-    is_error: bool,
+    spec: &'a crate::action_flow::ActionRunSpec<'a>,
     cause: &'a str,
 }
 
-/// Create a system/user thread with the action result saved as a message.
-///
-/// One atomic backfill path: the thread is created WITH its seq-0 message
-/// (msg_type='cron', msg_subtype = cron job name, content = the action name)
-/// and the seq-1 terminal result message is appended immediately after, so a
-/// reader never sees a thread with half the contract (silent error runs call
-/// this only at the END, once the outcome is known). The thread is then marked
-/// terminal (system for success, failed for error).
+/// Create a system/user thread with the action result saved as the 3-message
+/// contract: seq-0 cause (msg_type='cron', msg_subtype = cron job name,
+/// content = the action name), seq-1 action message (msg_type='action',
+/// msg_subtype = action_id, FULL logs, real duration) and seq-2 summary
+/// (msg_type='summary', short summary with the real duration). One atomic
+/// backfill path: the thread is created WITH its seq-0 message and the
+/// seq-1/seq-2 messages are appended immediately after, so a reader never
+/// sees a thread with half the contract (silent error runs call this only at
+/// the END, once the outcome is known). The thread is then marked terminal
+/// (system for success, failed for error) and the three messages are
+/// delivered to the platform exactly like agentic thread messages.
 async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
     // Resolve the channel the same way as the agentic mode path
     // explicit channel -> default_schedule_channel -> '' (fail-with-record).
@@ -726,7 +722,7 @@ async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
     let first_message = action_first_message(ctx.display_name);
 
     // Create the thread with the given cause and a seq-0 cause message (msg_type='cron')
-    let (thread, _cause_msg) = queries::create_thread_with_cause(
+    let (thread, cause_msg) = queries::create_thread_with_cause(
         ctx.pool,
         ctx.data_dir,
         ctx.cause,
@@ -761,51 +757,66 @@ async fn create_action_thread(ctx: ActionThreadCtx<'_>) -> AppResult<i64> {
     )
     .await?;
 
-    // Save the terminal result as a seq-1 message: a success states the success
-    // (msg_type='tool-result', with the output kept as evidence), a failure is
-    // typed 'error' and carries the actual error text.
-    let result_content = action_result_content(ctx.display_name, ctx.is_error, ctx.result_content);
-    let result_msg = queries::MessageNew {
-        thread_id: thread.id,
-        role: "agent".to_string(),
-        content: result_content,
-        thread_sequence: 1,
-        external_id: Some(format!(
-            "cron:{}:{}:result",
-            ctx.job.id,
-            ctx.now.timestamp()
-        )),
-        metadata: serde_json::json!({
-            "cron_job_id": ctx.job.id,
-            "is_error": ctx.is_error,
-        }),
-        embedding: None,
-        summary_text: None,
-        is_summary: false,
-        original_thread_id: None,
-        msg_type: action_result_msg_type(ctx.is_error).to_string(),
-        msg_subtype: None,
-        iteration_number: 0,
-        duration_ms: ctx.is_error as i32,
-        token_usage: serde_json::json!({}),
-    };
-    if let Err(e) = queries::create_message(ctx.pool, &result_msg).await {
-        tracing::warn!("[scheduler] Failed to persist cron result message: {:?}", e);
-    }
+    // Save the seq-1 (action, full logs) and seq-2 (summary, short with the
+    // real duration) messages of the 3-message contract.
+    let seq1_external_id = format!("cron:{}:{}:result", ctx.job.id, ctx.now.timestamp());
+    let seq_metadata = serde_json::json!({
+        "cron_job_id": ctx.job.id,
+        "is_error": ctx.spec.is_error,
+        "action_id": ctx.spec.action_id,
+    });
+    match crate::action_flow::persist_action_messages(
+        ctx.pool,
+        &thread,
+        ctx.spec,
+        seq1_external_id,
+        seq_metadata,
+    )
+    .await
+    {
+        Ok((action_saved, summary_saved)) => {
+            // Mark thread as terminal (system for success, failed for error)
+            if ctx.spec.is_error {
+                queries::set_thread_failed(ctx.pool, thread.id).await?;
+                info!(
+                    "[cron-action] Created failure thread {} for action schedule '{}'",
+                    thread.id, ctx.display_name
+                );
+            } else {
+                queries::set_thread_system(ctx.pool, thread.id).await?;
+                info!(
+                    "[cron-action] Created result thread {} for action schedule '{}'",
+                    thread.id, ctx.display_name
+                );
+            }
 
-    // Mark thread as terminal (system for success, failed for error)
-    if ctx.is_error {
-        queries::set_thread_failed(ctx.pool, thread.id).await?;
-        info!(
-            "[cron-action] Created failure thread {} for action schedule '{}'",
-            thread.id, ctx.display_name
-        );
-    } else {
-        queries::set_thread_system(ctx.pool, thread.id).await?;
-        info!(
-            "[cron-action] Created result thread {} for action schedule '{}'",
-            thread.id, ctx.display_name
-        );
+            // Deliver the 3 messages to the platform (seq-0 cause, seq-1
+            // action, seq-2 summary) + terminal reaction, like agentic threads.
+            crate::action_flow::deliver_action_thread(
+                ctx.app_context,
+                ctx.pool,
+                &thread,
+                &cause_msg,
+                channel.as_ref(),
+                &action_saved,
+                &summary_saved,
+                ctx.spec.is_error,
+            )
+            .await;
+        }
+        Err(e) => {
+            // The run outcome is still recorded; the thread stays terminal
+            // with just its cause message.
+            tracing::warn!(
+                "[scheduler] Failed to persist cron action messages: {:?}",
+                e
+            );
+            if ctx.spec.is_error {
+                queries::set_thread_failed(ctx.pool, thread.id).await?;
+            } else {
+                queries::set_thread_system(ctx.pool, thread.id).await?;
+            }
+        }
     }
 
     Ok(thread.id)
@@ -1781,41 +1792,6 @@ mod tests {
     fn test_action_first_message_is_the_action_name() {
         assert_eq!(action_first_message("daily-backup"), "daily-backup");
         assert!(!action_first_message("daily-backup").starts_with("Cron:"));
-    }
-
-    #[test]
-    fn test_result_message_type_is_error_on_failure() {
-        assert_eq!(action_result_msg_type(false), "tool-result");
-        assert_eq!(action_result_msg_type(true), "error");
-    }
-
-    #[test]
-    fn test_success_result_content_states_success_and_keeps_output() {
-        let c = action_result_content("daily-backup", false, "exit_code: 0\nbackup written");
-        assert!(c.starts_with("Action 'daily-backup' completed successfully."));
-        assert!(
-            c.contains("backup written"),
-            "tool output must stay as evidence: {c}"
-        );
-    }
-
-    #[test]
-    fn test_error_result_content_carries_the_error_text() {
-        let c = action_result_content("daily-backup", true, "connection refused (exit_code 1)");
-        assert!(c.contains("FAILED"));
-        assert!(
-            c.contains("connection refused (exit_code 1)"),
-            "the actual error text must be in the message: {c}"
-        );
-    }
-
-    #[test]
-    fn test_result_content_never_empty_even_with_empty_output() {
-        assert_eq!(
-            action_result_content("job", false, "   "),
-            "Action 'job' completed successfully."
-        );
-        assert!(action_result_content("job", true, "").contains("FAILED"));
     }
 
     #[test]

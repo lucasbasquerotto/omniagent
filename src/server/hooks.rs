@@ -299,7 +299,13 @@ async fn list_hooks_handler(
         let def = &tasks.hooks[key];
         let channel = tasks_yaml::resolve_channel_id(&state.pool, def.channel.as_deref()).await;
         let counter = counters.get(key).cloned().unwrap_or_else(default_counter);
-        data.push(HookResponse::from_def(key, def, channel, counter, &state.data_dir));
+        data.push(HookResponse::from_def(
+            key,
+            def,
+            channel,
+            counter,
+            &state.data_dir,
+        ));
     }
     ok_json(data)
 }
@@ -322,7 +328,13 @@ async fn get_hook_handler(
         Some(def) => {
             let channel = tasks_yaml::resolve_channel_id(&state.pool, def.channel.as_deref()).await;
             let counter = load_counter(&state.pool, &id).await;
-            ok_json(HookResponse::from_def(&id, def, channel, counter, &state.data_dir))
+            ok_json(HookResponse::from_def(
+                &id,
+                def,
+                channel,
+                counter,
+                &state.data_dir,
+            ))
         }
         None => err_json(StatusCode::NOT_FOUND, "Hook not found"),
     }

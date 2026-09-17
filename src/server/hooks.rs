@@ -71,6 +71,7 @@ struct HookResponse {
     mode: String,
     prompt: Option<String>,
     action_id: Option<String>,
+    action_name: Option<String>,
     profile: Option<String>,
     channel: Option<String>,
     plan: Option<bool>,
@@ -87,8 +88,19 @@ impl HookResponse {
         def: &HookDef,
         channel: Option<String>,
         counter: serde_json::Value,
+        data_dir: &str,
     ) -> Self {
         let plan = def.plan();
+        // Mirror the schedule API: action_name carries the action's
+        // description from the actions registry (actions.yml), so the
+        // dashboard can render `action: <key>` with the description as the
+        // hover title without an extra lookup.
+        let action_name = def.action.as_deref().and_then(|a| {
+            super::actions::load_actions(data_dir)
+                .actions
+                .get(a)
+                .and_then(|act| act.description.clone())
+        });
         Self {
             id: key.to_string(),
             name: key.to_string(),
@@ -100,6 +112,7 @@ impl HookResponse {
             mode: def.mode(),
             prompt: def.prompt.clone(),
             action_id: def.action.clone(),
+            action_name,
             profile: def.profile.clone(),
             channel,
             plan,
@@ -286,7 +299,7 @@ async fn list_hooks_handler(
         let def = &tasks.hooks[key];
         let channel = tasks_yaml::resolve_channel_id(&state.pool, def.channel.as_deref()).await;
         let counter = counters.get(key).cloned().unwrap_or_else(default_counter);
-        data.push(HookResponse::from_def(key, def, channel, counter));
+        data.push(HookResponse::from_def(key, def, channel, counter, &state.data_dir));
     }
     ok_json(data)
 }
@@ -309,7 +322,7 @@ async fn get_hook_handler(
         Some(def) => {
             let channel = tasks_yaml::resolve_channel_id(&state.pool, def.channel.as_deref()).await;
             let counter = load_counter(&state.pool, &id).await;
-            ok_json(HookResponse::from_def(&id, def, channel, counter))
+            ok_json(HookResponse::from_def(&id, def, channel, counter, &state.data_dir))
         }
         None => err_json(StatusCode::NOT_FOUND, "Hook not found"),
     }

@@ -843,15 +843,107 @@ pub struct CompletionRequest {
 }
 
 /// Token usage statistics returned by the provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Deserialize` is implemented manually (see [`usage_from_value`]) instead of
+/// derived: the OpenAI-standard cache-hit field is a NESTED object
+/// (`usage.prompt_tokens_details.cached_tokens`), which a flat serde alias
+/// cannot reach. Gateways such as opencode-go report DeepSeek prefix-cache hits
+/// only that way, so a derived parser silently dropped them and the threads
+/// table recorded `cached_tokens: null` (reported symptom, 2026-09-17).
+#[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
-    #[serde(default)]
-    #[serde(alias = "prompt_cache_hit_tokens")]
     pub cached_tokens: Option<u32>,
-    #[serde(default)]
     pub reasoning_tokens: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let usage = usage_from_value(&value).map_err(serde::de::Error::custom)?;
+        if raw_usage_capture_enabled() {
+            log_raw_usage(&value, Some(usage.prompt_tokens), usage.cached_tokens);
+        }
+        Ok(usage)
+    }
+}
+
+/// Diagnostics switch for the raw provider `usage` object (opencode-go cache
+/// investigation): set `OMNI_LLM_RAW_USAGE=1` to log, at WARN level, the exact
+/// `usage` JSON every provider returns. Off by default so normal logs stay
+/// clean. The object holds token counters only - never credentials.
+pub fn raw_usage_capture_enabled() -> bool {
+    matches!(
+        std::env::var("OMNI_LLM_RAW_USAGE"),
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")
+    )
+}
+
+/// Log a raw provider `usage` object together with the values the parser
+/// extracted from it (see [`raw_usage_capture_enabled`]). Logging both makes
+/// the wire shape and the resulting counters verifiable in one line: a nested
+/// `prompt_tokens_details.cached_tokens` must surface as a non-zero
+/// `parsed_cached_tokens`.
+pub fn log_raw_usage(
+    value: &serde_json::Value,
+    prompt_tokens: Option<u32>,
+    cached_tokens: Option<u32>,
+) {
+    tracing::warn!(
+        target: "omniagent::llm",
+        raw_usage = %value,
+        parsed_prompt_tokens = prompt_tokens,
+        parsed_cached_tokens = cached_tokens,
+        "[llm] raw provider usage object (OMNI_LLM_RAW_USAGE=1)"
+    );
+}
+
+/// Parse a provider `usage` object into [`Usage`], accepting every cache-hit
+/// field shape seen in the wild:
+///
+/// - flat `cached_tokens` (OpenAI-compatible passthrough)
+/// - flat `prompt_cache_hit_tokens` (DeepSeek official API field name)
+/// - nested `prompt_tokens_details.cached_tokens` (OpenAI standard; the shape
+///   the opencode-go gateway uses for DeepSeek models)
+/// - nested `prompt_tokens_details.prompt_cache_hit_tokens` (defensive)
+/// - `cache_read_input_tokens` / `cache_creation_input_tokens` (Anthropic; the
+///   native Anthropic path has its own struct, kept here for OpenAI-compatible
+///   gateways that proxy Anthropic-style usage)
+///
+/// `prompt_tokens` and `completion_tokens` stay REQUIRED (unchanged behavior).
+/// A response carrying no cache information yields `cached_tokens: None` -
+/// never a wrong 0.
+pub fn usage_from_value(value: &serde_json::Value) -> Result<Usage, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "usage is not a JSON object".to_string())?;
+    let num = |k: &str| obj.get(k).and_then(|v| v.as_u64()).map(|v| v as u32);
+    let nested = |k: &str| {
+        obj.get("prompt_tokens_details")
+            .and_then(|d| d.get(k))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+    };
+    let prompt_tokens =
+        num("prompt_tokens").ok_or_else(|| "missing field `prompt_tokens`".to_string())?;
+    let completion_tokens =
+        num("completion_tokens").ok_or_else(|| "missing field `completion_tokens`".to_string())?;
+    let cached_tokens = num("cached_tokens")
+        .or_else(|| num("prompt_cache_hit_tokens"))
+        .or_else(|| nested("cached_tokens"))
+        .or_else(|| nested("prompt_cache_hit_tokens"))
+        .or_else(|| num("cache_read_input_tokens"))
+        .or_else(|| num("cache_creation_input_tokens"));
+    Ok(Usage {
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+        reasoning_tokens: num("reasoning_tokens"),
+    })
 }
 
 /// A tool call requested by the LLM.
@@ -2466,14 +2558,81 @@ mod usage_parse_tests {
 
     #[test]
     fn usage_missing_cache_fields_yields_none() {
-        // The observed opencode-go gateway usage omits cache fields entirely:
-        // cached_tokens must be None (never a wrong number) - the threads
-        // table then records 0, which is exactly the reported symptom.
+        // A response with NO cache information must parse to cached_tokens=None
+        // (never a wrong number) - the threads table then records 0.
         let json = r#"{"prompt_tokens": 250000, "completion_tokens": 1000}"#;
         let u: Usage = serde_json::from_str(json).unwrap();
         assert_eq!(u.prompt_tokens, 250000);
         assert_eq!(u.completion_tokens, 1000);
         assert_eq!(u.cached_tokens, None);
+    }
+
+    // Regression (thread 2234): the opencode-go gateway reports DeepSeek cache
+    // hits as the OpenAI-standard NESTED `prompt_tokens_details.cached_tokens`.
+    #[test]
+    fn usage_parses_nested_openai_prompt_tokens_details_cached_tokens() {
+        let json = r#"{
+            "prompt_tokens": 91663,
+            "completion_tokens": 2076,
+            "prompt_tokens_details": { "cached_tokens": 80384 }
+        }"#;
+        let u: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.prompt_tokens, 91663);
+        assert_eq!(u.completion_tokens, 2076);
+        assert_eq!(u.cached_tokens, Some(80384));
+    }
+
+    #[test]
+    fn usage_parses_nested_prompt_cache_hit_tokens() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 2,
+            "prompt_tokens_details": { "prompt_cache_hit_tokens": 64 }
+        }"#;
+        let u: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.cached_tokens, Some(64));
+    }
+
+    #[test]
+    fn usage_prefers_flat_cached_tokens_over_nested() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 2,
+            "cached_tokens": 40,
+            "prompt_tokens_details": { "cached_tokens": 64 }
+        }"#;
+        let u: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.cached_tokens, Some(40));
+    }
+
+    #[test]
+    fn usage_nested_details_without_cached_tokens_yields_none() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 2,
+            "prompt_tokens_details": { "audio_tokens": 0 }
+        }"#;
+        let u: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.cached_tokens, None);
+    }
+
+    #[test]
+    fn usage_parses_anthropic_cache_read_input_tokens() {
+        let json = r#"{
+            "prompt_tokens": 1500,
+            "completion_tokens": 25,
+            "cache_read_input_tokens": 1200,
+            "cache_creation_input_tokens": 300
+        }"#;
+        let u: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(u.cached_tokens, Some(1200));
+    }
+
+    #[test]
+    fn usage_value_requires_prompt_and_completion_tokens() {
+        assert!(usage_from_value(&serde_json::json!({"completion_tokens": 1})).is_err());
+        assert!(usage_from_value(&serde_json::json!({"prompt_tokens": 1})).is_err());
+        assert!(usage_from_value(&serde_json::json!("nope")).is_err());
     }
 }
 

@@ -45,6 +45,7 @@ pub struct ThreadsQueryParams {
     pub status: Option<String>,
     pub cause: Option<String>,
     pub channel: Option<String>,
+    pub profile: Option<String>,
     pub id: Option<i64>,
     pub parent_id: Option<i64>,
     pub limit: Option<i64>,
@@ -196,12 +197,14 @@ async fn list_threads_handler(
           AND (:status = '' OR t.status = ANY(string_to_array(:status, ',')))
           AND (:cause = '' OR t.cause = :cause)
           AND (:channel_id = '' OR t.channel_id = :channel_id)
+          AND (:profile = '' OR t.profile = :profile)
           AND (:id = 0::bigint OR t.id = :id)
           AND (:parent_id = 0::bigint OR t.parent_id = :parent_id)
         "#,
         ( :status = &status,
           :cause = &cause,
           :channel_id = params.channel.as_deref().unwrap_or(""),
+          :profile = params.profile.as_deref().unwrap_or(""),
           :id = params.id.unwrap_or(0),
           :parent_id = params.parent_id.unwrap_or(0) )
     )
@@ -239,6 +242,7 @@ async fn list_threads_handler(
               AND (:status = '' OR t.status = ANY(string_to_array(:status, ',')))
               AND (:cause = '' OR t.cause = :cause)
               AND (:channel_id = '' OR t.channel_id = :channel_id)
+              AND (:profile = '' OR t.profile = :profile)
               AND (:id = 0::bigint OR t.id = :id)
               AND (:parent_id = 0::bigint OR t.parent_id = :parent_id)
             ORDER BY t.id DESC
@@ -306,6 +310,7 @@ async fn list_threads_handler(
         ( :status = &status,
           :cause = &cause,
           :channel_id = params.channel.as_deref().unwrap_or(""),
+          :profile = params.profile.as_deref().unwrap_or(""),
           :id = params.id.unwrap_or(0),
           :parent_id = params.parent_id.unwrap_or(0),
           :limit_val = limit,

@@ -29,6 +29,7 @@ pub(crate) mod response_hygiene;
 pub mod summary_trigger;
 pub mod task_registry;
 pub(crate) mod terminal_summary;
+pub mod token_usage;
 pub(crate) mod tool_result_pruner;
 
 use parking_lot::RwLock;

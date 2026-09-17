@@ -3,6 +3,7 @@ use crate::agent::context_builder::PromptParts;
 use crate::agent::context_compactor::{compact_oldest_segment, should_force_compact};
 use crate::agent::helpers;
 use crate::agent::response_handler::handle_response;
+use crate::agent::token_usage;
 use crate::agent::tool_result_pruner::{is_context_length_error, prune_messages, PruneParams};
 use crate::db::types as queries;
 use crate::db::types::{Channel, Message, MessageNew, Thread};
@@ -1594,6 +1595,50 @@ Previous plan:\n{}",
                         dump_entries
                     ),
                 );
+        }
+
+        // ── Live token-usage telemetry (token_usage_budget / percent) ──
+        // DISABLED unless token_usage_telemetry_percent > 0 AND
+        // token_usage_budget > 0: with percent 0 (or empty/unset, both parsed
+        // to 0) NO `=== Token Usage ===` block is ever appended to the prompt.
+        // Enabled: per-thread cumulative provider-reported usage =
+        // SUM(messages.token_usage); at every threshold crossing one FROZEN
+        // USER-role block is APPENDED at the very tail. Nothing is ever
+        // removed or rewritten, so between crossings the array keeps a
+        // byte-identical prefix that rides the provider prefix cache and a
+        // crossing only extends the tail. Informational only - it never
+        // enforces a limit and does not interact with the compaction budgets.
+        if token_usage::telemetry_enabled(
+            cfg_snapshot.token_usage_budget,
+            cfg_snapshot.token_usage_telemetry_percent,
+        ) {
+            match crate::db::threads::aggregate_thread_token_usage(&cfg.pool, thread.id).await {
+                Ok((input_tokens, cached_tokens, output_tokens)) => {
+                    let cumulative = token_usage::TokenUsageTotals {
+                        input_tokens: input_tokens.max(0) as u64,
+                        output_tokens: output_tokens.max(0) as u64,
+                        cached_tokens: cached_tokens.max(0) as u64,
+                    };
+                    let appended = token_usage::append_usage_blocks(
+                        &mut messages,
+                        &cumulative,
+                        cfg_snapshot.token_usage_budget,
+                        cfg_snapshot.token_usage_telemetry_percent,
+                    );
+                    if appended > 0 {
+                        info!(
+                            "[telemetry] token usage block(s) appended: {} (cumulative {} tokens, budget {}, step {}%)",
+                            appended,
+                            cumulative.total(),
+                            cfg_snapshot.token_usage_budget,
+                            cfg_snapshot.token_usage_telemetry_percent,
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "[telemetry] token usage aggregation failed, skipping telemetry block: {e}"
+                ),
+            }
         }
 
         // ── Optional: insert prompt message before LLM call ──

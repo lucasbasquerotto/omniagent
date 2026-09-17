@@ -211,6 +211,8 @@ fn write_settings_file(data_dir: &str, vars: &HashMap<String, String>) -> Result
             vec![
                 "prompt_token_budget_hard",
                 "prompt_token_budget_soft",
+                "token_usage_budget",
+                "token_usage_telemetry_percent",
                 "prompt_compact_messages_tool",
                 "prompt_generate_tool",
                 "prompt_log_level",
@@ -614,6 +616,26 @@ fn get_all_setting_definitions() -> Vec<(String, SettingMeta)> {
                 default: Some("120000".into()),
             },
         ),
+        (
+            "token_usage_budget".into(),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Live in-prompt token-usage telemetry budget: provider-reported CUMULATIVE token usage per thread that the `=== Token Usage ===` prompt block refers to (0 = disabled; informational only - it never enforces a limit and does not affect compaction)".into(),
+                options: None,
+                readonly: false,
+                default: Some("0".into()),
+            },
+        ),
+        (
+            "token_usage_telemetry_percent".into(),
+            SettingMeta {
+                field_type: "number".into(),
+                description: "Telemetry granularity in percent of token_usage_budget: a frozen `=== Token Usage ===` block is appended to the prompt tail at 10 %, 20 %, ... (default 10, clamped to 1..=100). 0 or empty DISABLES telemetry completely: no block is ever appended.".into(),
+                options: None,
+                readonly: false,
+                default: Some("10".into()),
+            },
+        ),
         // ── Group 2 settings ──
         (
             "platform_max_spawn_retries".into(),
@@ -673,6 +695,8 @@ fn categorize_settings(defs: Vec<(String, String, SettingMeta)>) -> Vec<SettingC
             | "prompt_log_level"
             | "prompt_token_budget_hard"
             | "prompt_token_budget_soft"
+            | "token_usage_budget"
+            | "token_usage_telemetry_percent"
             | "memory_max_chars"
             | "sub_prompt_max_chars"
             | "sub_prompt_iteration_percent" => "prompt",
@@ -818,6 +842,8 @@ fn writable_setting_keys() -> std::collections::HashSet<&'static str> {
         "prompt_log_level",
         "prompt_token_budget_hard",
         "prompt_token_budget_soft",
+        "token_usage_budget",
+        "token_usage_telemetry_percent",
         "sub_prompt_max_chars",
         "sub_prompt_iteration_percent",
         "platform_max_spawn_retries",
@@ -1262,6 +1288,8 @@ mod tests {
         for (name, expected_default) in [
             ("prompt_token_budget_hard", "200000"),
             ("prompt_token_budget_soft", "120000"),
+            ("token_usage_budget", "0"),
+            ("token_usage_telemetry_percent", "10"),
         ] {
             let meta = by_name
                 .get(name)
@@ -1272,7 +1300,12 @@ mod tests {
         }
 
         let keys = writable_setting_keys();
-        for name in ["prompt_token_budget_hard", "prompt_token_budget_soft"] {
+        for name in [
+            "prompt_token_budget_hard",
+            "prompt_token_budget_soft",
+            "token_usage_budget",
+            "token_usage_telemetry_percent",
+        ] {
             assert!(keys.contains(name), "{name} must be writable");
         }
 

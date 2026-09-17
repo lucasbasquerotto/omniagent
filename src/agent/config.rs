@@ -160,6 +160,21 @@ pub struct AgentConfig {
     /// Default: 120000.
     pub token_budget_soft: usize,
 
+    /// Live in-prompt token-usage telemetry budget (global setting
+    /// `token_usage_budget`): the provider-reported CUMULATIVE token usage a
+    /// thread may reach before the `=== Token Usage ===` telemetry block
+    /// reports it as 100 %. 0 (the default) disables the feature.
+    /// Informational only - it never enforces anything and does not interact
+    /// with `prompt_token_budget_hard`/`soft` (which drive compaction).
+    pub token_usage_budget: u64,
+    /// Telemetry granularity (global setting `token_usage_telemetry_percent`):
+    /// percentage steps of `token_usage_budget` at which a frozen
+    /// `=== Token Usage ===` block is appended to the prompt tail
+    /// (10 -> blocks at 10 %, 20 %, ...). Default 10, clamped to 1..=100.
+    /// 0 - or empty/blank/missing, which also parse to 0 - means DISABLED:
+    /// no telemetry block is ever appended to the prompt, at any time.
+    pub token_usage_telemetry_percent: u32,
+
     // When to insert prompts as messages (msg_type: "prompt") into the messages table.
     /// - "off": never insert
     /// - "first": insert the first LLM call's prompt only (default)
@@ -316,6 +331,16 @@ impl AgentConfig {
             token_budget_soft: get("prompt_token_budget_soft", "120000")
                 .parse()
                 .unwrap_or(120000),
+            // Live token-usage telemetry: 0 budget disables the feature;
+            // percent 0 (explicit or empty/blank) disables it too - no
+            // `=== Token Usage ===` block is ever appended. A positive
+            // percent is clamped to 1..=100.
+            token_usage_budget: get("token_usage_budget", "0").parse().unwrap_or(0),
+            token_usage_telemetry_percent: get("token_usage_telemetry_percent", "10")
+                .trim()
+                .parse()
+                .unwrap_or(0)
+                .min(100),
 
             prompt_log_level: get("prompt_log_level", "first"),
 
@@ -432,6 +457,16 @@ impl AgentConfig {
             token_budget_soft: get("prompt_token_budget_soft", "120000")
                 .parse()
                 .unwrap_or(120000),
+            // Live token-usage telemetry: 0 budget disables the feature;
+            // percent 0 (explicit or empty/blank) disables it too - no
+            // `=== Token Usage ===` block is ever appended. A positive
+            // percent is clamped to 1..=100.
+            token_usage_budget: get("token_usage_budget", "0").parse().unwrap_or(0),
+            token_usage_telemetry_percent: get("token_usage_telemetry_percent", "10")
+                .trim()
+                .parse()
+                .unwrap_or(0)
+                .min(100),
 
             prompt_log_level: get("prompt_log_level", "first"),
 
@@ -507,6 +542,8 @@ mod tests {
             sub_prompt_iteration_percent: 50,
             token_budget_hard: 200000,
             token_budget_soft: 120000,
+            token_usage_budget: 0,
+            token_usage_telemetry_percent: 0,
             prompt_log_level: "first".to_string(),
             tool_bg_secs: 30,
             database_url: "postgres://localhost:***@host:5432/db".to_string(),
@@ -580,6 +617,8 @@ mod tests {
             sub_prompt_iteration_percent: 0,
             token_budget_hard: 0,
             token_budget_soft: 0,
+            token_usage_budget: 1_000_000,
+            token_usage_telemetry_percent: 10,
             prompt_log_level: String::new(),
             tool_bg_secs: 0,
             database_url: "postgres://localhost:5432/omniagent".to_string(),

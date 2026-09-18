@@ -518,3 +518,35 @@ pub(crate) async fn ensure_plugin_running(
     start_plugin_now(state, yaml_type, name).await?;
     verify_plugin_started(state, yaml_type, name).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (task_omnidev_memory_plugin_remote_python_fix_the, 2026-09-18):
+    /// the reason reported for an enabled tool plugin that registered no tools
+    /// must be TRUTHFUL. The old hardcoded guess ("binary may not have compiled
+    /// successfully") was wrong for Python/JS script plugins whose remote source
+    /// was simply not installed yet, and it sent operators down the wrong path
+    /// in production.
+    #[tokio::test]
+    async fn missing_mcp_config_reason_is_truthful_and_never_a_compile_guess() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+
+        let reason = mcp_start_failure_reason(&data_dir, "tester-missing-server").await;
+
+        assert!(
+            reason.contains("no startable MCP server config found for 'tester-missing-server'"),
+            "must say the source/config is not installed, got: {reason}"
+        );
+        assert!(
+            reason.contains("must be downloaded/installed first"),
+            "must point at the real remote-plugin remedy, got: {reason}"
+        );
+        assert!(
+            !reason.contains("binary may not have compiled"),
+            "the old compilation guess must be gone, got: {reason}"
+        );
+    }
+}

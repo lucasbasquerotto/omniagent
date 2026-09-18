@@ -161,6 +161,21 @@ pub async fn task_toolset(pool: &PgPool, task_id: &str) -> AppResult<Option<Stri
     Ok(row.and_then(|r| r.0))
 }
 
+/// The board (`kanban_tasks.board`) a kanban task belongs to; `None` when the
+/// task does not exist or defines no board.
+///
+/// Used as the BOARD tier of the toolset chain when an unresolved
+/// `threads.toolset` id must be attributed to the level that defined it
+/// (`toolset 'foo' defined by board 'omnidev' ...`).
+pub async fn task_board(pool: &PgPool, task_id: &str) -> AppResult<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT board FROM kanban_tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|r| r.0))
+}
+
 /// Fetch a single kanban task row by id.
 pub async fn get_kanban_task(pool: &PgPool, task_id: &str) -> AppResult<Option<KanbanTaskDb>> {
     let rows = sql_forge!(

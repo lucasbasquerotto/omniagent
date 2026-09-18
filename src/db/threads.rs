@@ -92,6 +92,13 @@ where
             profile: Some(profile),
             channel_id: Some(channel_id),
             task: Some((task_owner, p.toolset.clone())),
+            // BOARD tier: NOT read again here - for kanban callers
+            // `p.toolset` already carries the RESOLVED task → board value of
+            // `resolution::resolve_task_defaults_with_toolset` (the single
+            // resolution point every dispatcher path uses), and the board tier
+            // sits ABOVE channel/profile, exactly where the resolved value is
+            // applied. Re-reading boards.yml here would duplicate that lookup.
+            board: None,
             workflow_id: p.workflow_id.as_deref(),
             workflow_step: p.workflow_step.as_deref(),
         })
@@ -1533,7 +1540,10 @@ pub(crate) async fn create_kanban_step_thread(
     //     created and IMMEDIATELY terminated as 'failed' with a clear Error
     //     message (mirrors the no-channel failure path in
     //     create_thread_with_cause).
-    let resolved = match crate::resolution::resolve_task_defaults(
+    // The TOOLSET pair (task → board) is part of the SAME resolution, so
+    // dispatch, fail-routing rework/retest threads and status-change dispatch
+    // all see the identical value (never a shallow read of the raw column).
+    let resolved = match crate::resolution::resolve_task_defaults_with_toolset(
         data_dir,
         &crate::resolution::TaskFallbackFields {
             board: task.board.as_deref(),
@@ -1542,6 +1552,10 @@ pub(crate) async fn create_kanban_step_thread(
             profile: task.profile.as_deref(),
             plan: task.plan,
             template: task.template.as_deref(),
+        },
+        &crate::resolution::TaskToolsetSource {
+            task_id: Some(task.id.as_str()),
+            toolset: task.toolset.as_deref(),
         },
     ) {
         Ok(r) => r,
@@ -1721,7 +1735,9 @@ pub(crate) async fn create_kanban_step_thread(
         msg_subtype: Some(task.id.clone()),
         task_plan: plan,
         template: resolved_template,
-        toolset: task.toolset.clone(),
+        // Toolset: the RESOLVED task → board value from
+        // resolve_task_defaults_with_toolset (never the raw column).
+        toolset: resolved.toolset.as_ref().map(|r| r.id.clone()),
         workflow_id: workflow_id.clone(),
         workflow_step: Some(status.to_string()),
         hook_caused: false,

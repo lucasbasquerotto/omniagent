@@ -5,7 +5,7 @@
 //! one on this chain (highest priority first):
 //!
 //! ```text
-//! workflow_role > workflow > task > channel > profile
+//! workflow_role > workflow > task > board > channel > profile
 //! ```
 //!
 //! * no level defines a toolset  -> ALL tools are allowed (`None`);
@@ -223,6 +223,9 @@ pub enum ToolsetLevel {
     Workflow,
     /// The kanban task / schedule entry / hook task that caused the thread.
     Task,
+    /// The kanban BOARD of a board-based task (`boards.yml` `toolset`). Sits
+    /// BETWEEN the task and the channel tier.
+    Board,
     /// The channel the thread runs in.
     Channel,
     /// The profile the thread runs as.
@@ -236,6 +239,7 @@ impl ToolsetLevel {
             ToolsetLevel::WorkflowRole => "workflow_role",
             ToolsetLevel::Workflow => "workflow",
             ToolsetLevel::Task => "task",
+            ToolsetLevel::Board => "board",
             ToolsetLevel::Channel => "channel",
             ToolsetLevel::Profile => "profile",
         }
@@ -248,6 +252,7 @@ impl ToolsetLevel {
             ToolsetLevel::WorkflowRole => format!("workflow role '{owner}'"),
             ToolsetLevel::Workflow => format!("workflow '{owner}'"),
             ToolsetLevel::Task => format!("task '{owner}'"),
+            ToolsetLevel::Board => format!("board '{owner}'"),
             ToolsetLevel::Channel => format!("channel '{owner}'"),
             ToolsetLevel::Profile => format!("profile '{owner}'"),
         }
@@ -283,6 +288,7 @@ pub struct ToolsetLevels {
     pub workflow_role: Option<(String, Option<String>)>,
     pub workflow: Option<(String, Option<String>)>,
     pub task: Option<(String, Option<String>)>,
+    pub board: Option<(String, Option<String>)>,
     pub channel: Option<(String, Option<String>)>,
     pub profile: Option<(String, Option<String>)>,
 }
@@ -290,18 +296,19 @@ pub struct ToolsetLevels {
 impl ToolsetLevels {
     /// Every level in priority order.
     #[allow(clippy::type_complexity)]
-    fn ordered(&self) -> [(ToolsetLevel, &Option<(String, Option<String>)>); 5] {
+    fn ordered(&self) -> [(ToolsetLevel, &Option<(String, Option<String>)>); 6] {
         [
             (ToolsetLevel::WorkflowRole, &self.workflow_role),
             (ToolsetLevel::Workflow, &self.workflow),
             (ToolsetLevel::Task, &self.task),
+            (ToolsetLevel::Board, &self.board),
             (ToolsetLevel::Channel, &self.channel),
             (ToolsetLevel::Profile, &self.profile),
         ]
     }
 }
 
-/// First-match resolution over the five levels.
+/// First-match resolution over the six levels.
 ///
 /// Returns the highest-priority DEFINED toolset. A blank id counts as
 /// undefined (defensive: an empty YAML scalar must never mean "no tools").
@@ -330,6 +337,9 @@ pub fn resolve(levels: &ToolsetLevels) -> Option<ToolsetRef> {
 /// * `task` is the value the caller resolved from its own store (kanban task
 ///   column, `tasks.yml` schedule entry, hook definition) together with the
 ///   owner label used in error messages;
+/// * `board` is the `(board name, toolset id)` candidate of the kanban board
+///   the task belongs to (`boards.yml` `toolset`); `None` for producers that
+///   have no board (schedules, hooks, external messages);
 /// * `workflow_step` selects the workflow ROLE (executor/tester/reviewer).
 ///
 /// A missing or unreadable config file degrades to "this level defines
@@ -341,6 +351,8 @@ pub struct ThreadToolsetSources<'a> {
     pub channel_id: Option<&'a str>,
     /// `(owner label, toolset id)` for the task / schedule / hook level.
     pub task: Option<(String, Option<String>)>,
+    /// `(board name, toolset id)` for the BOARD level (kanban boards).
+    pub board: Option<(String, Option<String>)>,
     pub workflow_id: Option<&'a str>,
     pub workflow_step: Option<&'a str>,
 }
@@ -355,6 +367,7 @@ pub fn resolve_for_thread(sources: &ThreadToolsetSources<'_>) -> Option<ToolsetR
             .workflow_id
             .and_then(|wf_id| workflow_level(sources.data_dir, wf_id)),
         task: sources.task.clone(),
+        board: sources.board.clone(),
         channel: sources
             .channel_id
             .and_then(|cid| channel_level(sources.data_dir, cid)),
@@ -382,6 +395,20 @@ pub fn workflow_role_level(
 pub fn workflow_level(data_dir: &str, workflow_id: &str) -> Option<(String, Option<String>)> {
     let workflow = crate::workflows::WorkflowsFile::load_workflow(data_dir, workflow_id).ok()??;
     Some((workflow_id.to_string(), workflow.toolset.clone()))
+}
+
+/// Board-level toolset from `boards.yml`: `(board name, toolset id)`. `None`
+/// when the board name is blank or not in the effective board set. A board
+/// that defines no toolset still returns `Some((name, None))` - that level is
+/// then simply skipped by [`resolve`], exactly like the other levels.
+pub fn board_level(data_dir: &str, board: &str) -> Option<(String, Option<String>)> {
+    let name = board.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let config = crate::boards::load_boards_config(data_dir).ok()?;
+    let def = config.board(name)?;
+    Some((name.to_string(), def.toolset.clone()))
 }
 
 /// Channel-level toolset from `channels.yml`.
@@ -578,6 +605,116 @@ toolsets:
         let r = resolve(&l).expect("resolved");
         assert_eq!(r.id, "empty_set");
         assert_eq!(r.level, ToolsetLevel::WorkflowRole);
+    }
+
+    #[test]
+    fn resolve_board_tier_sits_between_task_and_channel() {
+        // board beats channel + profile.
+        let l = ToolsetLevels {
+            task: level("task_1", None),
+            board: level("omnidev", Some("b_set")),
+            channel: level("telegram", Some("c_set")),
+            profile: level("omni", Some("p_set")),
+            ..Default::default()
+        };
+        let r = resolve(&l).expect("resolved");
+        assert_eq!(r.id, "b_set");
+        assert_eq!(r.level, ToolsetLevel::Board);
+        assert_eq!(r.owner, "omnidev");
+        assert_eq!(r.describe(), "toolset 'b_set' defined by board 'omnidev'");
+
+        // task beats board.
+        let l = ToolsetLevels {
+            task: level("task_1", Some("t_set")),
+            board: level("omnidev", Some("b_set")),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&l).expect("resolved").id, "t_set");
+
+        // workflow beats board.
+        let l = ToolsetLevels {
+            workflow: level("wf", Some("w_set")),
+            board: level("omnidev", Some("b_set")),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&l).expect("resolved").id, "w_set");
+
+        // workflow_role beats board.
+        let l = ToolsetLevels {
+            workflow_role: level("executor", Some("r_set")),
+            board: level("omnidev", Some("b_set")),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&l).expect("resolved").id, "r_set");
+
+        // A board present but UNDEFINED (None id) never wins.
+        let l = ToolsetLevels {
+            board: level("omnidev", None),
+            channel: level("telegram", Some("c_set")),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&l).expect("resolved").id, "c_set");
+
+        // A blank board id is treated as undefined.
+        let l = ToolsetLevels {
+            board: level("omnidev", Some("  ")),
+            profile: level("omni", Some("p_set")),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&l).expect("resolved").id, "p_set");
+    }
+
+    #[test]
+    fn board_level_reads_boards_yml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        write_toolsets(dir.path(), SAMPLE);
+        std::fs::write(
+            dir.path().join("config").join("boards.yml"),
+            "boards:\n  omnidev:\n    channel: omnidev\n    toolset: two_tools\n  bare:\n    channel: omnidev\n",
+        )
+        .expect("write boards.yml");
+
+        assert_eq!(
+            board_level(&data_dir, "omnidev"),
+            Some(("omnidev".to_string(), Some("two_tools".to_string())))
+        );
+        // A board without a toolset still yields the level (skipped by resolve).
+        assert_eq!(
+            board_level(&data_dir, "bare"),
+            Some(("bare".to_string(), None))
+        );
+        // Unknown / blank board -> no level at all.
+        assert_eq!(board_level(&data_dir, "nope"), None);
+        assert_eq!(board_level(&data_dir, "  "), None);
+
+        // resolve_for_thread honours the board tier when task/channel define none.
+        let resolved = resolve_for_thread(&ThreadToolsetSources {
+            data_dir: &data_dir,
+            profile: Some("omni"),
+            channel_id: Some("telegram"),
+            task: Some(("task_1".to_string(), None)),
+            board: board_level(&data_dir, "omnidev"),
+            workflow_id: None,
+            workflow_step: None,
+        })
+        .expect("board tier resolves");
+        assert_eq!(resolved.id, "two_tools");
+        assert_eq!(resolved.level, ToolsetLevel::Board);
+        assert_eq!(resolved.owner, "omnidev");
+
+        // An undefined board-level id fails loudly naming the board.
+        let err = check_ref(
+            &data_dir,
+            &ToolsetRef {
+                id: "missing_set".to_string(),
+                level: ToolsetLevel::Board,
+                owner: "omnidev".to_string(),
+            },
+        )
+        .expect_err("undefined board toolset must fail");
+        assert!(err.contains("toolset 'missing_set'"), "message: {err}");
+        assert!(err.contains("defined by board 'omnidev'"), "message: {err}");
     }
 
     #[test]

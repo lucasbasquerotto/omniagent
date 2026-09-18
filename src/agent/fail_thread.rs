@@ -242,6 +242,7 @@ struct ReviewTaskRow {
     profile: Option<String>,
     plan: Option<bool>,
     board: Option<String>,
+    toolset: Option<String>,
 }
 
 /// Apply a MANUAL/API review decision to a kanban task. This is the shared
@@ -285,7 +286,7 @@ pub async fn manual_review_decision(
 
     let task: Option<ReviewTaskRow> = sql_forge!(
         ReviewTaskRow,
-        "SELECT status, workflow_id, CAST(workflow_state AS text) AS workflow_state, channel_id, profile, plan, board
+        "SELECT status, workflow_id, CAST(workflow_state AS text) AS workflow_state, channel_id, profile, plan, board, toolset
          FROM kanban_tasks WHERE id = :task_id FOR UPDATE",
         ( :task_id = task_id )
     )
@@ -313,7 +314,7 @@ pub async fn manual_review_decision(
     // workflow_id/channel_id/profile/plan - the board (boards.yml) supplies
     // the effective values. Fail-loud on invalid boards (mirrors
     // create_kanban_step_thread semantics).
-    let resolved = crate::resolution::resolve_task_defaults(
+    let resolved = crate::resolution::resolve_task_defaults_with_toolset(
         data_dir,
         &crate::resolution::TaskFallbackFields {
             board: task.board.as_deref(),
@@ -322,6 +323,10 @@ pub async fn manual_review_decision(
             profile: task.profile.as_deref(),
             plan: task.plan,
             template: None,
+        },
+        &crate::resolution::TaskToolsetSource {
+            task_id: Some(task_id),
+            toolset: task.toolset.as_deref(),
         },
     )
     .map_err(err_str)?;
@@ -402,7 +407,9 @@ pub async fn manual_review_decision(
                 workflow_id: resolved.workflow_id.clone(),
                 workflow_step: Some(step.to_string()),
                 template,
-                toolset: None,
+                // Rework/retest threads carry the SAME resolved toolset as
+                // dispatch (task → board), so they run with it identically.
+                toolset: resolved.toolset.as_ref().map(|r| r.id.clone()),
                 hook_caused: false,
             },
         )
@@ -1351,7 +1358,14 @@ pub(crate) async fn engine_transition(
                 workflow_id: wf_id.map(str::to_string),
                 workflow_step: Some(step.to_string()),
                 template,
-                toolset: None,
+                // Toolset: the rework/retest thread of a board-based task runs
+                // with the SAME resolved toolset as the failed parent thread
+                // (`threads.toolset` was resolved ONCE at creation via
+                // `resolution::resolve_task_defaults_with_toolset`, which
+                // includes the BOARD tier) - board tasks never lose their
+                // toolset on fail-routing, and a role/workflow toolset of the
+                // re-run step still wins over it (first-match, higher tier).
+                toolset: thread.toolset.clone(),
                 hook_caused: false,
             },
         )

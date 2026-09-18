@@ -3074,6 +3074,19 @@ async fn upsert_board_handler(
     if key.is_empty() {
         return err_json(StatusCode::BAD_REQUEST, "board name cannot be empty");
     }
+    // BOARD-tier toolset: the id must exist in config/toolsets.yml - reject at
+    // SAVE time (a board is config, and an undefined id would otherwise make
+    // every task on the board fail at execution).
+    if let Some(ts) = body
+        .toolset
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        if let Err(err) = crate::toolsets::tools_for(&state.data_dir, ts) {
+            return err_json(StatusCode::BAD_REQUEST, &format!("board '{key}': {err}"));
+        }
+    }
     let mut file = match load_boards_file(&state) {
         Ok(file) => file,
         Err(err) => {

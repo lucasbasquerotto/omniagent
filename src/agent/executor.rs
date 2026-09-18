@@ -263,20 +263,33 @@ pub async fn process_thread(
         Some(id) => match crate::toolsets::load_map(&cfg.ctx.data_dir).get(id) {
             Some(tools) => Some(tools.clone()),
             None => {
+                // BOARD tier: the kanban task's board (`threads.task_id` →
+                // `kanban_tasks.board` → `boards.yml` `toolset`), so the
+                // re-resolution below names `board '<name>'` when the board
+                // defined the unresolved id.
+                let board = match thread.task_id.as_deref() {
+                    Some(tid) => crate::db::kanban::task_board(&cfg.pool, tid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|name| crate::toolsets::board_level(&cfg.ctx.data_dir, &name)),
+                    None => None,
+                };
                 let resolved =
                     crate::toolsets::resolve_for_thread(&crate::toolsets::ThreadToolsetSources {
                         data_dir: &cfg.ctx.data_dir,
                         profile: Some(thread.profile.as_str()),
                         channel_id: Some(thread.channel_id.as_str()),
                         task: None,
+                        board,
                         workflow_id: workflow_id.as_deref(),
                         workflow_step: workflow_step.as_deref(),
                     });
                 // Name the LEVEL that defined the unresolved id. The
                 // re-resolution above covers the workflow_role / workflow /
-                // channel / profile levels; when it yields a DIFFERENT id the
-                // value can only come from the TASK level, so name the exact
-                // task (kanban task column or tasks.yml schedule entry).
+                // board / channel / profile levels; when it yields a DIFFERENT
+                // id the value can only come from the TASK level, so name the
+                // exact task (kanban task column or tasks.yml schedule entry).
                 let mut source = resolved.filter(|r| r.id == id).map(|r| r.describe());
                 if source.is_none() {
                     if let Some(task_id) = thread.task_id.as_deref() {

@@ -36,6 +36,7 @@
 //!     workflow: omniagent-dev
 //!     plan: true
 //!     template: ...                        # optional
+//!     toolset: my-toolset                  # optional (config/toolsets.yml)
 //!     priority: 3                          # optional
 //! ```
 //!
@@ -48,8 +49,9 @@ use std::path::{Path, PathBuf};
 
 /// A board's default execution options - the same option set a kanban task
 /// can carry (kanban_tasks: channel_id, profile, workflow_id, plan,
-/// template, priority). Each field is optional; resolution falls through
-/// to the next level (Channel / Global Settings) when a field is absent.
+/// template, priority) plus the BOARD tier of the toolset chain. Each field
+/// is optional; resolution falls through to the next level (Channel / Global
+/// Settings) when a field is absent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BoardConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,6 +64,13 @@ pub struct BoardConfig {
     pub plan: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+    /// Toolset id (`config/toolsets.yml`) contributed by this BOARD. It is the
+    /// fourth tier of the first-match chain
+    /// `workflow_role > workflow > task > board > channel > profile`: it wins
+    /// over the channel/profile tiers and loses to the task/workflow tiers.
+    /// Unset/empty contributes nothing (all tools allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
 }
@@ -376,6 +385,34 @@ boards:
         assert_eq!(b.profile.as_deref(), Some("omni"));
         assert_eq!(b.workflow.as_deref(), Some("omniagent-dev"));
         assert_eq!(b.plan, Some(true));
+    }
+
+    #[test]
+    fn board_toolset_round_trips() {
+        let yaml = "boards:\n  omnidev:\n    channel: omnidev\n    toolset: my-toolset\n";
+        let file = BoardsFile::from_yaml(yaml).expect("parse");
+        assert_eq!(
+            file.boards
+                .get("omnidev")
+                .and_then(|b| b.toolset.as_deref()),
+            Some("my-toolset")
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config").join("boards.yml");
+        file.save(&path).expect("save");
+        let loaded = BoardsFile::load(&path).expect("load");
+        assert_eq!(
+            loaded
+                .boards
+                .get("omnidev")
+                .and_then(|b| b.toolset.as_deref()),
+            Some("my-toolset")
+        );
+        // A board with no toolset omits the key entirely (no noise).
+        let mut bare = BoardsFile::default();
+        bare.upsert("main", BoardConfig::default());
+        let text = bare.to_yaml().expect("serialize");
+        assert!(!text.contains("toolset"), "no toolset key expected: {text}");
     }
 
     #[test]

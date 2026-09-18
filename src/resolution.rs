@@ -51,6 +51,21 @@ pub struct TaskFallbackFields<'a> {
     pub template: Option<&'a str>,
 }
 
+/// The kanban TASK-tier toolset inputs, resolved together with the fallback
+/// fields ONCE at load: the raw `kanban_tasks.toolset` column plus the task id
+/// used as the owner label of the TASK tier in fail-loud messages.
+///
+/// Kept OUT of [`TaskFallbackFields`] so callers that never run the toolset
+/// chain (and the fallback-only tests) stay untouched; pass it through
+/// [`resolve_task_defaults_with_toolset`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskToolsetSource<'a> {
+    /// `kanban_tasks.id` - owner label of the TASK tier.
+    pub task_id: Option<&'a str>,
+    /// `kanban_tasks.toolset` - the TASK tier candidate.
+    pub toolset: Option<&'a str>,
+}
+
 /// Effective kanban-task execution options, resolved ONCE at load.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedTaskDefaults {
@@ -66,6 +81,18 @@ pub struct ResolvedTaskDefaults {
     pub plan: Option<bool>,
     /// Effective thread template (task → board).
     pub template: Option<String>,
+    /// Effective TASK-chain toolset candidate (task → board), carrying the
+    /// LEVEL and owner that defined it (`Task` + task id, or `Board` + board
+    /// name) so an undefined id fails loudly naming the exact level
+    /// (`toolset 'foo' defined by board 'omnidev' is not defined in
+    /// config/toolsets.yml`). `None` = neither the task nor its board defines a
+    /// toolset; the CHANNEL and PROFILE tiers - which sit BELOW the board tier -
+    /// are applied at thread creation by `crate::toolsets::resolve_for_thread`,
+    /// together with the higher-priority workflow_role / workflow tiers.
+    ///
+    /// The full first-match chain is
+    /// `workflow_role > workflow > task > board > channel > profile`.
+    pub toolset: Option<crate::toolsets::ToolsetRef>,
 }
 
 /// Load a single channel definition from `{data_dir}/config/channels.yml`.
@@ -98,6 +125,23 @@ fn channel_def_from(data_dir: &str, name: &str) -> Option<ChannelDef> {
 pub fn resolve_task_defaults(
     data_dir: &str,
     task: &TaskFallbackFields<'_>,
+) -> Result<ResolvedTaskDefaults, String> {
+    resolve_task_defaults_with_toolset(data_dir, task, &TaskToolsetSource::default())
+}
+
+/// [`resolve_task_defaults`] with the kanban TASK-tier toolset inputs.
+///
+/// The toolset is resolved from the pair `kanban task → board` (the TASK tier
+/// wins over the BOARD tier) with the defining level and owner preserved, so
+/// every consumer - dispatch, fail-routing rework/retest threads and
+/// status-change dispatch - sees the identical result and never shallow-reads
+/// the raw `kanban_tasks.toolset` column. This is the entry point the kanban
+/// callers use; [`resolve_task_defaults`] is the same resolver for callers that
+/// have no task tier (their toolset is then the BOARD tier only).
+pub fn resolve_task_defaults_with_toolset(
+    data_dir: &str,
+    task: &TaskFallbackFields<'_>,
+    toolset: &TaskToolsetSource<'_>,
 ) -> Result<ResolvedTaskDefaults, String> {
     let board_cfg = crate::boards::task_board(data_dir, task.board)?;
 
@@ -157,12 +201,41 @@ pub fn resolve_task_defaults(
                 .filter(|s| !s.is_empty())
         });
 
+    // toolset: task → board. The TASK tier wins over the BOARD tier; both sit
+    // ABOVE the channel/profile tiers, which thread creation applies below
+    // (crate::toolsets::resolve_for_thread). A blank id counts as unset (an
+    // empty YAML scalar must never mean "no tools"). The defining level +
+    // owner are preserved for the fail-loud message.
+    let toolset = match toolset.toolset.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => Some(crate::toolsets::ToolsetRef {
+            id: id.to_string(),
+            level: crate::toolsets::ToolsetLevel::Task,
+            owner: toolset
+                .task_id
+                .map(str::trim)
+                .filter(|owner| !owner.is_empty())
+                .unwrap_or("task")
+                .to_string(),
+        }),
+        None => board_cfg
+            .as_ref()
+            .and_then(|b| b.toolset.as_deref())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| crate::toolsets::ToolsetRef {
+                id: id.to_string(),
+                level: crate::toolsets::ToolsetLevel::Board,
+                owner: task.board.map(str::trim).unwrap_or("").to_string(),
+            }),
+    };
+
     Ok(ResolvedTaskDefaults {
         workflow_id,
         channel_id,
         profile,
         plan,
         template,
+        toolset,
     })
 }
 
@@ -848,6 +921,155 @@ mod template_chain_tests {
             plan: None,
             template,
         }
+    }
+
+    fn toolset_src<'a>(
+        task_id: Option<&'a str>,
+        toolset: Option<&'a str>,
+    ) -> TaskToolsetSource<'a> {
+        TaskToolsetSource { task_id, toolset }
+    }
+
+    #[test]
+    fn toolset_board_supplies_when_task_defines_none() {
+        // Gate: the BOARD tier is used when the task (and therefore the
+        // higher-priority task level) defines no toolset.
+        let dir = data_dir(
+            "toolset-board-only",
+            Some("boards:\n  omnidev:\n    channel: kanban\n    toolset: board-ts\n"),
+            None,
+            None,
+        );
+        let r = resolve_task_defaults_with_toolset(
+            &dir,
+            &fields(Some("omnidev"), None),
+            &toolset_src(Some("task_1"), None),
+        )
+        .expect("valid board");
+        let ts = r.toolset.expect("board toolset resolved");
+        assert_eq!(ts.id, "board-ts");
+        assert_eq!(ts.level, crate::toolsets::ToolsetLevel::Board);
+        assert_eq!(ts.owner, "omnidev", "owner label is the board name");
+        assert_eq!(
+            ts.describe(),
+            "toolset 'board-ts' defined by board 'omnidev'"
+        );
+    }
+
+    #[test]
+    fn toolset_task_beats_board() {
+        let dir = data_dir(
+            "toolset-task-over-board",
+            Some("boards:\n  omnidev:\n    channel: kanban\n    toolset: board-ts\n"),
+            None,
+            None,
+        );
+        let r = resolve_task_defaults_with_toolset(
+            &dir,
+            &fields(Some("omnidev"), None),
+            &toolset_src(Some("task_1"), Some("task-ts")),
+        )
+        .expect("valid board");
+        let ts = r.toolset.expect("task toolset resolved");
+        assert_eq!(ts.id, "task-ts");
+        assert_eq!(ts.level, crate::toolsets::ToolsetLevel::Task);
+        assert_eq!(ts.owner, "task_1");
+    }
+
+    #[test]
+    fn toolset_unset_everywhere_is_none() {
+        // Nothing set -> no restriction at all (all tools allowed).
+        let dir = data_dir(
+            "toolset-none",
+            Some("boards:\n  omnidev:\n    channel: kanban\n"),
+            None,
+            None,
+        );
+        let r = resolve_task_defaults_with_toolset(
+            &dir,
+            &fields(Some("omnidev"), None),
+            &toolset_src(Some("task_1"), None),
+        )
+        .expect("valid board");
+        assert_eq!(r.toolset, None);
+        // The plain entry point (no task tier known) agrees.
+        let plain =
+            resolve_task_defaults(&dir, &fields(Some("omnidev"), None)).expect("valid board");
+        assert_eq!(plain.toolset, None);
+        // Blank ids count as unset (never "no tools").
+        let blank = resolve_task_defaults_with_toolset(
+            &dir,
+            &fields(Some("omnidev"), None),
+            &toolset_src(Some("task_1"), Some("  ")),
+        )
+        .expect("valid board");
+        assert_eq!(blank.toolset, None);
+    }
+
+    #[test]
+    fn toolset_invalid_board_id_is_surfaced_with_board_level() {
+        // An id that is NOT in config/toolsets.yml is never silently dropped:
+        // the resolved ref keeps the BOARD level + board name, so the executor
+        // fails the thread loudly naming BOTH the id and the level.
+        let dir = data_dir(
+            "toolset-invalid-board",
+            Some("boards:\n  omnidev:\n    channel: kanban\n    toolset: nope-ts\n"),
+            None,
+            None,
+        );
+        let r = resolve_task_defaults_with_toolset(
+            &dir,
+            &fields(Some("omnidev"), None),
+            &toolset_src(Some("task_1"), None),
+        )
+        .expect("valid board");
+        let ts = r.toolset.expect("board toolset resolved");
+        assert_eq!(ts.id, "nope-ts");
+        let err = crate::toolsets::check_ref(&dir, &ts).expect_err("undefined toolset id");
+        assert!(err.contains("toolset 'nope-ts'"), "{err}");
+        assert!(err.contains("board 'omnidev'"), "{err}");
+    }
+
+    #[test]
+    fn toolset_board_beats_channel_and_profile_tiers() {
+        // The board tier sits ABOVE channel/profile: the standard thread
+        // resolution picks the board id even when lower tiers define one.
+        let dir = data_dir(
+            "toolset-board-over-channel",
+            Some("boards:\n  omnidev:\n    channel: kanban\n    toolset: board-ts\n"),
+            Some("channels:\n  kanban:\n    profile: omni\n    toolset: channel-ts\n"),
+            Some("profiles:\n  omni:\n    toolset: profile-ts\n"),
+        );
+        std::fs::write(
+            std::path::Path::new(&dir)
+                .join("config")
+                .join("toolsets.yml"),
+            "toolsets:\n  board-ts: [p1__t1]\n  channel-ts: [p1__t1]\n  profile-ts: [p1__t1]\n",
+        )
+        .unwrap();
+        let r = resolve_task_defaults_with_toolset(
+            &dir,
+            &fields(Some("omnidev"), None),
+            &toolset_src(Some("task_1"), None),
+        )
+        .expect("valid board");
+        let ts = r.toolset.expect("board toolset resolved");
+        // The TASK tier defines NOTHING here (the resolution already returned
+        // the BOARD tier), so the first match must be the board id - proving
+        // board > channel/profile in the real thread chain.
+        let resolved =
+            crate::toolsets::resolve_for_thread(&crate::toolsets::ThreadToolsetSources {
+                data_dir: &dir,
+                profile: Some("omni"),
+                channel_id: Some("kanban"),
+                task: None,
+                board: Some((ts.owner.clone(), Some(ts.id.clone()))),
+                workflow_id: None,
+                workflow_step: None,
+            })
+            .expect("board tier wins");
+        assert_eq!(resolved.id, "board-ts");
+        assert_eq!(resolved.level, crate::toolsets::ToolsetLevel::Board);
     }
 
     #[test]

@@ -38,7 +38,7 @@ fn build_dynamic_identity(tool_names: &[String]) -> String {
         tool_names.join(", ")
     };
 
-    format!("You are OmniAgent: precise, efficient, autonomous. Your tools: {tool_list}. Use minimum roundtrips. If a tool fails, move on: don't retry more than twice. HONESTY RULE: if you cannot complete the task, your final summary MUST clearly state that you gave up and why, and what remains undone - NEVER claim the task was completed unless every requested step was actually done and verified. CLEAR/DELETE DIRECTIVES: for an explicit clear/delete/set request, never report done or 'no change applied' until you have EXECUTED the change and VERIFIED the observable end state on the target environment the request names (the item is gone there, via its own API/DB/UI); 'no change applied' is valid only when you can prove the requested end state already holds. NEVER end a turn with only thinking and no action: a response with no tool call is treated as the end of the task, so every turn MUST end with either tool calls or a final answer. If you have finished thinking, immediately emit your next tool call or your final answer - never stop after reasoning alone.")
+    format!("You are OmniAgent: precise, efficient, autonomous. Your tools: {tool_list}. Use minimum roundtrips. If a tool fails, move on: don't retry more than twice. HONESTY RULE: never claim a success you did not verify. If you cannot complete the task, do NOT end with a normal final summary - call the builtin `core__fail_thread` tool and pass the COMPLETE final summary (what was done, what remains undone, why it is blocked) as its `reason` argument: the reason becomes the thread's last Error-type message, so fail = last message = summary. A plain final summary must never wrap an incomplete task - it looks like success and leaves the thread `completed`, while fail-thread ends the thread FAILED and lets the kanban workflow route the failure. Never write a summary message AFTER the fail call (the thread is already terminated and it is lost). CLEAR/DELETE DIRECTIVES: for an explicit clear/delete/set request, never report done or 'no change applied' until you have EXECUTED the change and VERIFIED the observable end state on the target environment the request names (the item is gone there, via its own API/DB/UI); 'no change applied' is valid only when you can prove the requested end state already holds. NEVER end a turn with only thinking and no action: a response with no tool call is treated as the end of the task, so every turn MUST end with either tool calls or a final answer. If you have finished thinking, immediately emit your next tool call or your final answer - never stop after reasoning alone.")
 }
 
 const TOOL_GUIDANCE: &str = "TOOL USE RULES (fail the task if you violate these):\n\
@@ -102,7 +102,14 @@ git rev-parse showing local == origin/main) and move on; never re-verify an \
 unchanged state. If you catch yourself repeating the same checks with no state \
 change and no progress, STOP exploring and produce your final report of what is \
 done and what remains. Repeated no-progress read-only calls are blocked by the \
-engine and will not re-execute.";
+engine and will not re-execute.\n\
+15. GIVE UP LOUDLY: if you cannot complete the task, do NOT finish with a normal \
+final summary - call the builtin `core__fail_thread` tool with the COMPLETE final \
+summary as its `reason` argument (what was done, what remains undone, why it is \
+blocked); the reason becomes the thread's last Error-type message, so fail = last \
+message = summary. A plain final summary must never wrap an incomplete task: it \
+looks like success and leaves the thread `completed`, while fail-thread ends the \
+thread FAILED and lets the kanban workflow route the failure.";
 
 fn build_active_profile_hint(profile_name: &str) -> String {
     format!("Active profile: {profile_name}.")
@@ -521,6 +528,31 @@ mod tests {
         assert!(
             guidance.contains("verify ONCE"),
             "tool guidance must carry verify-once wording"
+        );
+    }
+
+    #[test]
+    fn tool_guidance_mandates_fail_thread_on_give_up() {
+        // 2026-09-18 (threads 2254-2257): a give-up must call core__fail_thread,
+        // never end with a normal final summary that looks like success.
+        let store = MemoryStore::new(".");
+        let sections = build_system_prompt_sections(
+            &store,
+            "mattermost",
+            None,
+            None,
+            "omni",
+            &[],
+            &PromptBuilderConfig::default(),
+        );
+        let guidance = &sections[1].2;
+        assert!(
+            guidance.contains("15. GIVE UP LOUDLY"),
+            "tool guidance must carry the give-up-loudly rule"
+        );
+        assert!(
+            guidance.contains("core__fail_thread"),
+            "tool guidance must name the fail-thread tool"
         );
     }
 

@@ -609,6 +609,41 @@ mod clear_delete_directive_tests {
             "clear/delete clause must demand execute + verify end state on the target"
         );
     }
+    #[test]
+    fn identity_mandates_fail_thread_on_give_up() {
+        // 2026-09-18 (task_omnidev_honesty_rule_in_the_system_prompt, threads
+        // 2254-2257): a give-up MUST call core__fail_thread; a plain final
+        // summary must never wrap an incomplete task because it looks like
+        // success and leaves the thread `completed`. Pinned so the identity
+        // copies cannot silently drift back to the old wording.
+        let store = MemoryStore::new(".");
+        let sections = build_system_prompt_sections(
+            &store,
+            "mattermost",
+            None,
+            None,
+            "omni",
+            &[],
+            &PromptBuilderConfig::default(),
+        );
+        let identity = &sections[0].2;
+        assert!(
+            identity.contains("HONESTY RULE: never claim a success you did not verify"),
+            "identity must carry the new HONESTY RULE opening"
+        );
+        assert!(
+            identity.contains("core__fail_thread"),
+            "identity must name the core__fail_thread tool a give-up has to call"
+        );
+        assert!(
+            identity.contains("Never write a summary message AFTER the fail call"),
+            "identity must forbid a summary message after the fail call"
+        );
+        assert!(
+            !identity.contains("your final summary MUST clearly state"),
+            "the old give-up wording (plain final summary) must be gone"
+        );
+    }
 }
 
 #[cfg(test)]

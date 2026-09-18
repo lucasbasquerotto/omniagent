@@ -23,6 +23,7 @@ pub(crate) mod models;
 pub(crate) mod overview;
 pub(crate) mod platforms;
 pub(crate) mod profiles;
+pub(crate) mod prompt_api;
 pub(crate) mod schedule;
 mod secrets;
 pub(crate) mod settings;
@@ -71,8 +72,7 @@ use crate::agent::config::AgentConfig;
 use crate::agent::kanban_updater::transition_with_comment;
 use crate::agent::plugin_manager::PluginManager;
 use crate::db::types as queries;
-use crate::llm::{ChatMessage, CompletionRequest, LLMClient};
-use crate::mcp::{AppContext, McpToolCall};
+use crate::mcp::AppContext;
 use parking_lot::RwLock;
 
 mod diagnostic;
@@ -237,10 +237,10 @@ pub async fn start_server(config: ServerConfig) -> AppResult<()> {
         .route("/open/{channel_id}", post(open_handler))
         .route("/open/{channel_id}", get(open_handler))
         .route("/status/{channel_id}", get(status_handler))
-        .route("/prompt/{channel_name}", get(prompt_handler))
+        .route("/prompt/{channel_name}", get(prompt_api::prompt_handler))
         .route(
             "/prompt-preview/{channel_name}",
-            post(prompt_preview_handler),
+            post(prompt_api::prompt_preview_handler),
         )
         .route("/mcp/tools", get(list_mcp_tools_handler))
         .route("/mcp/tools/invalid", get(list_invalid_mcp_tools_handler))
@@ -250,7 +250,10 @@ pub async fn start_server(config: ServerConfig) -> AppResult<()> {
         .route("/db/query", post(db_query::db_query_handler))
         .route("/db/tables", get(db_query::db_tables_handler))
         // ── Context preview (section [3] only, no messages written) ──
-        .route("/api/context/{channel_name}", get(context_preview_handler))
+        .route(
+            "/api/context/{channel_name}",
+            get(prompt_api::context_preview_handler),
+        )
         // ── Plugin management routes ──
         .route("/api/plugins/ping", get(|| async { "pong" }))
         // ── Models (config/models.yml) API ──
@@ -922,342 +925,6 @@ async fn status_handler(
     }
 }
 
-/// Show the system prompt for a channel, using `<<<prompt>>>` as the
-/// placeholder for where the user's actual message would go.
-async fn prompt_handler(
-    Path(channel_name): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let channel = match queries::get_channel_by_name(&state.pool, &channel_name).await {
-        Ok(Some(ch)) => Some(ch),
-        Ok(None) => {
-            // Channel not found: build system prompt using the default profile
-            None
-        }
-        Err(e) => {
-            error!("Failed to look up channel '{}': {:?}", channel_name, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            );
-        }
-    };
-
-    let profile_name = match channel.as_ref() {
-        Some(ch) if !ch.current_profile.is_empty() => &ch.current_profile,
-        _ => &state.default_profile,
-    };
-
-    let profile_path = format!("{}/profiles/{}", state.data_dir, profile_name);
-    let memory_path = std::path::Path::new(&profile_path).join("MEMORY.md");
-    let memory_raw = if memory_path.exists() {
-        std::fs::read_to_string(memory_path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let _platform = channel
-        .as_ref()
-        .and_then(|c| c.platform.as_deref())
-        .unwrap_or("");
-    let tool_names: Vec<String> = state
-        .plugin_manager
-        .snapshot_registry()
-        .await
-        .all()
-        .iter()
-        .map(|t| t.name.clone())
-        .collect();
-    let mut segments: Vec<String> = Vec::new();
-
-    // Stable tier: simple identity + tool guidance
-    let tool_list = if tool_names.is_empty() {
-        String::new()
-    } else {
-        tool_names.join(", ")
-    };
-    segments.push(format!("You are OmniAgent: precise, efficient, autonomous. Your tools: {tool_list}. Use minimum roundtrips. If a tool fails, move on: don't retry more than twice. HONESTY RULE: never claim a success you did not verify. If you cannot complete the task, do NOT end with a normal final summary - call the builtin `core__fail_thread` tool and pass the COMPLETE final summary (what was done, what remains undone, why it is blocked) as its `reason` argument: the reason becomes the thread's last Error-type message, so fail = last message = summary. A plain final summary must never wrap an incomplete task - it looks like success and leaves the thread `completed`, while fail-thread ends the thread FAILED and lets the kanban workflow route the failure. Never write a summary message AFTER the fail call (the thread is already terminated and it is lost). CLEAR/DELETE DIRECTIVES: for an explicit clear/delete/set request, never report done or 'no change applied' until you have EXECUTED the change and VERIFIED the observable end state on the target environment the request names (the item is gone there, via its own API/DB/UI); 'no change applied' is valid only when you can prove the requested end state already holds."));
-    segments.push(format!("Active profile: {profile_name}."));
-
-    // Volatile tier: memory placeholder
-    let separator = "═".repeat(3);
-    let mut locked_entries: Vec<String> = Vec::new();
-
-    if !memory_raw.is_empty() {
-        locked_entries.push(format!(
-            "{}\n## MEMORY (your personal notes)\n{}\n\n<<memory>>",
-            separator, separator
-        ));
-    }
-
-    if !locked_entries.is_empty() {
-        let locked_content = locked_entries.join("\n\n");
-        segments.push(format!(
-            "═══ LOCKED INSTRUCTIONS (FOLLOW EXACTLY) ═══\n{}",
-            locked_content
-        ));
-    }
-
-    let template = segments.join("\n\n");
-    (StatusCode::OK, template)
-}
-
-// ── Prompt preview endpoint ──
-
-#[derive(Deserialize)]
-struct PromptPreviewRequest {
-    prompt: String,
-    plan: bool,
-}
-
-#[derive(Serialize)]
-#[allow(dead_code)]
-struct PromptPreviewResponse {
-    system_prompt: String,
-    messages: Vec<serde_json::Value>,
-    plan: Option<bool>,
-}
-
-async fn prompt_preview_handler(
-    Path(channel_name): Path<String>,
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<PromptPreviewRequest>,
-) -> impl IntoResponse {
-    let channel = match queries::get_channel_by_name(&state.pool, &channel_name).await {
-        Ok(Some(ch)) => Some(ch),
-        Ok(None) => {
-            // Channel not found: build system prompt using the default profile
-            None
-        }
-        Err(e) => {
-            error!("Failed to look up channel '{}': {:?}", channel_name, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Database error: {}", e) })),
-            );
-        }
-    };
-
-    let profile_name = match channel.as_ref() {
-        Some(ch) if !ch.current_profile.is_empty() => &ch.current_profile,
-        _ => &state.default_profile,
-    };
-
-    let profile_path = format!("{}/profiles/{}", state.data_dir, profile_name);
-    let memories_dir = std::path::Path::new(&profile_path).join("memories");
-    let memory_raw = if memories_dir.join("MEMORY.md").exists() {
-        std::fs::read_to_string(memories_dir.join("MEMORY.md")).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let platform = channel
-        .as_ref()
-        .and_then(|c| c.platform.as_deref())
-        .unwrap_or("");
-    let tool_names: Vec<String> = state
-        .plugin_manager
-        .snapshot_registry()
-        .await
-        .all()
-        .iter()
-        .map(|t| t.name.clone())
-        .collect();
-    let tool_list = if tool_names.is_empty() {
-        String::new()
-    } else {
-        tool_names.join(", ")
-    };
-    let system_prompt = format!(
-        "You are OmniAgent: precise, efficient, autonomous. Your tools: {tool_list}. Use minimum roundtrips. If a tool fails, move on: don't retry more than twice. HONESTY RULE: never claim a success you did not verify. If you cannot complete the task, do NOT end with a normal final summary - call the builtin `core__fail_thread` tool and pass the COMPLETE final summary (what was done, what remains undone, why it is blocked) as its `reason` argument: the reason becomes the thread's last Error-type message, so fail = last message = summary. A plain final summary must never wrap an incomplete task - it looks like success and leaves the thread `completed`, while fail-thread ends the thread FAILED and lets the kanban workflow route the failure. Never write a summary message AFTER the fail call (the thread is already terminated and it is lost). CLEAR/DELETE DIRECTIVES: for an explicit clear/delete/set request, never report done or 'no change applied' until you have EXECUTED the change and VERIFIED the observable end state on the target environment the request names (the item is gone there, via its own API/DB/UI); 'no change applied' is valid only when you can prove the requested end state already holds.\n\nActive profile: {profile_name}.\n\n{}",
-        if !memory_raw.is_empty() { format!("## MEMORY (your personal notes)\n{memory_raw}") } else { String::new() }
-    );
-
-    let mut messages = vec![serde_json::json!({ "role": "system", "content": &system_prompt })];
-
-    // ── Build the [3] Context section using the same logic as the agent ──
-    // Uses the latest thread in the channel (if any) with the preview prompt
-    // as the cause content, so the context reflects what would actually be
-    // assembled when a real message is processed.
-    if let Some(ch) = &channel {
-        if let Ok(Some(latest)) = queries::get_latest_seq0_message(&state.pool, &ch.id).await {
-            if let Ok(Some(tid)) = queries::get_message_thread(&state.pool, latest.id).await {
-                let profile_registry = crate::profile::ProfileRegistry::new(&state.data_dir);
-                let _prof = profile_registry
-                    .get(profile_name)
-                    .cloned()
-                    .unwrap_or_else(|| crate::profile::Profile::default(profile_name));
-
-                // Use the prompt tool for context (same tool the agent uses)
-                let context_text = call_prompt_context(
-                    &state.plugin_manager,
-                    &state.app_context,
-                    profile_name,
-                    platform,
-                    &body.prompt,
-                    tid,
-                    &ch.id,
-                )
-                .await;
-
-                if !context_text.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": format!("=== Additional Context ===\n{}", context_text)
-                    }));
-                }
-            }
-        }
-    }
-
-    // Add user prompt
-    messages.push(serde_json::json!({ "role": "cause", "content": body.prompt }));
-
-    let plan = if body.plan {
-        // Resolve provider/model: channel > profile > env
-        let profile_registry = crate::profile::ProfileRegistry::new(&state.data_dir);
-        let prof = profile_registry
-            .get(profile_name)
-            .cloned()
-            .unwrap_or_else(|| crate::profile::Profile::default(profile_name));
-
-        let ch_provider = channel.as_ref().and_then(|ch| ch.current_provider.clone());
-        let ch_model = channel.as_ref().and_then(|ch| ch.current_model.clone());
-
-        let provider_name = match ch_provider
-            .filter(|s| !s.is_empty())
-            .or_else(|| prof.provider.clone().filter(|s| !s.is_empty()))
-            .or_else(|| {
-                crate::agent::config::get_global()
-                    .map(|g| g.read().default_provider.clone())
-                    .filter(|s| !s.is_empty())
-            }) {
-            Some(p) => p,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "No LLM provider configured: set LLM_PROVIDER env var or configure channel/provider profile"
-                    })),
-                );
-            }
-        };
-
-        let model_name = match ch_model
-            .filter(|s| !s.is_empty())
-            .or_else(|| prof.model.clone().filter(|s| !s.is_empty()))
-            .or_else(|| crate::llm::resolve_default_model(&provider_name))
-        {
-            Some(m) => m,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "No LLM model configured: channel, profile, or provider plugin default_model must define one"
-                    })),
-                );
-            }
-        };
-
-        // Resolve provider enum for the resolved provider name
-        let resolved_provider = crate::llm::ProviderId::new(&provider_name);
-
-        // Build planning prompt inline
-        let tool_list = if tool_names.is_empty() {
-            String::new()
-        } else {
-            format!("Your available tools: {}.", tool_names.join(", "))
-        };
-        let planning_prompt = format!(
-            "## Plan\nBefore responding, create a high-level plan with numbered steps. \
-{tool_list}\nBe specific about which tool to use and what parameters to pass. \
-Aim for the minimum number of steps to complete the task. \
-Wrap your plan in a <plan> block. After delivering the final answer, \
-evaluate: if the task was completed, call the completion tool.",
-            tool_list = tool_list
-        );
-
-        // Create LLM client: resolve api_key from provider plugin config
-        // (not from hardcoded {PROVIDER}_API_KEY env var names).
-        let base_url = crate::llm::resolve_default_base_url(&provider_name);
-
-        // Single shared resolver: models.yml api_key ($env:/$secret: expanded
-        // by core at request time) first, else the provider plugin config
-        // (identical expansion semantics - one resolver, no duplicate logic).
-        let api_key = crate::models_yaml::resolve_provider_api_key(
-            &state.data_dir,
-            &provider_name,
-            &state.pool,
-        )
-        .await;
-        let api_mode = crate::llm::ApiMode::resolve(&provider_name, &model_name);
-
-        // Custom headers declared for this provider/model in models.yml (and in
-        // the provider plugin config), resolved with this request's channel and
-        // profile context - the same provider-agnostic resolver the thread and
-        // proxy clients use, so a code-less provider whose endpoint needs a
-        // header also works on the planning/preview call.
-        let extra_headers = crate::models_yaml::resolve_extra_headers(
-            &state.data_dir,
-            &provider_name,
-            &model_name,
-            channel.as_ref().map(|c| c.name.as_str()),
-            Some(profile_name),
-        );
-
-        let llm_config = crate::llm::LLMConfig {
-            provider: resolved_provider,
-            api_key,
-            base_url,
-            model: model_name,
-            api_mode,
-            max_tokens: 1024,
-            temperature: 0.3,
-            supports_reasoning: crate::llm::PROVIDER_METADATA
-                .read()
-                .get(&provider_name)
-                .map(|m| m.supports_reasoning)
-                .unwrap_or(false),
-            extra_headers,
-        };
-        let llm = LLMClient::new(llm_config);
-
-        let plan_request = CompletionRequest {
-            messages: vec![ChatMessage::system(&planning_prompt)],
-            max_tokens: Some(1024),
-            temperature: 0.3,
-            stream: false,
-            tools: None,
-        };
-
-        match llm.completion(plan_request).await {
-            Ok(resp) => {
-                let plan_content = resp.content;
-                messages.push(serde_json::json!({ "role": "agent", "msg_type": "plan", "content": plan_content }));
-                Some(plan_content)
-            }
-            Err(e) => {
-                let err_msg = format!("Planning failed: {}", e);
-                messages.push(
-                    serde_json::json!({ "role": "agent", "msg_type": "plan", "content": err_msg }),
-                );
-                Some(err_msg)
-            }
-        }
-    } else {
-        None
-    };
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "system_prompt": messages[0]["content"].as_str().unwrap_or(""),
-            "messages": messages,
-            "plan": plan,
-        })),
-    )
-}
-
 /// GET /mcp/tools: list all registered MCP tools with their input schemas.
 async fn list_mcp_tools_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let tools: Vec<serde_json::Value> = state
@@ -1445,163 +1112,6 @@ async fn execute_mcp_tool_handler(
     }
 }
 
-/// GET /api/context/{channel_name}: preview section [3] Context, read-only.
-///
-/// Assembles the same ContextBuilder blocks that would be injected into the
-/// prompt for the latest thread in this channel. No messages are written.
-/// Returns the full context text as a string.
-async fn context_preview_handler(
-    Path(channel_name): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let channel = match queries::get_channel_by_name(&state.pool, &channel_name).await {
-        Ok(Some(ch)) => ch,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(
-                    serde_json::json!({ "error": format!("Channel '{}' not found", channel_name) }),
-                ),
-            );
-        }
-        Err(e) => {
-            error!("Failed to look up channel '{}': {:?}", channel_name, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Database error: {}", e) })),
-            );
-        }
-    };
-
-    let profile_name = if channel.current_profile.is_empty() {
-        &state.default_profile
-    } else {
-        &channel.current_profile
-    };
-    let platform = channel.platform.as_deref().unwrap_or("");
-
-    // Get the latest seq-0 message in this channel to use as the cause
-    // (so retrieval/search context is based on real content).
-    let (cause_id, cause_content) = match queries::get_latest_seq0_message(&state.pool, &channel.id)
-        .await
-    {
-        Ok(Some(msg)) => (msg.id, msg.content),
-        Ok(None) => {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({ "context": "", "info": "No messages in this channel" })),
-            );
-        }
-        Err(e) => {
-            error!(
-                "Failed to get latest message for channel {}: {:?}",
-                channel.id, e
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Database error: {}", e) })),
-            );
-        }
-    };
-
-    // Get the thread this message belongs to
-    let thread_id = match queries::get_message_thread(&state.pool, cause_id).await {
-        Ok(Some(tid)) => tid,
-        Ok(None) => {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({ "context": "", "info": "Message has no thread" })),
-            );
-        }
-        Err(e) => {
-            error!("Failed to get thread for message {}: {:?}", cause_id, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Database error: {}", e) })),
-            );
-        }
-    };
-
-    // Resolve profile
-    let profile_registry = crate::profile::ProfileRegistry::new(&state.data_dir);
-    let _prof = profile_registry
-        .get(profile_name)
-        .cloned()
-        .unwrap_or_else(|| crate::profile::Profile::default(profile_name));
-
-    // Use the prompt tool for context (same tool the agent uses)
-    let context_text = call_prompt_context(
-        &state.plugin_manager,
-        &state.app_context,
-        profile_name,
-        platform,
-        &cause_content,
-        thread_id,
-        &channel.id,
-    )
-    .await;
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "context": context_text })),
-    )
-}
-
-/// Call the prompt_generate MCP tool to build context: same tool the agent executor uses.
-/// Falls back to empty string if the tool is not registered or fails.
-async fn call_prompt_context(
-    plugin_manager: &Arc<dyn PluginManager>,
-    app_context: &AppContext,
-    profile_name: &str,
-    platform: &str,
-    user_message: &str,
-    thread_id: i64,
-    channel_id: &str,
-) -> String {
-    let prompt_tool_name = crate::agent::config::get_global()
-        .map(|g| g.read().prompt_tool_name.clone())
-        .unwrap_or_else(|| "prompt_generate".to_string());
-
-    // Collect all available tool names (same as the executor does)
-    let tool_names: Vec<String> = plugin_manager
-        .snapshot_registry()
-        .await
-        .all()
-        .iter()
-        .map(|t| t.name.clone())
-        .collect();
-    // V-5: forward the platform-declared formatting hint exactly like the
-    // agent executor does.
-    let platform_hint = crate::agent::helpers::platform_prompt_hint(app_context, platform).await;
-    let mcp_call = McpToolCall {
-        id: "preview-context".to_string(),
-        name: prompt_tool_name,
-        arguments: serde_json::json!({
-            "profile_name": profile_name,
-            "platform": platform,
-            "platform_hint": platform_hint,
-            "user_message": user_message,
-            "tool_names": tool_names,
-            "thread_id": thread_id,
-            "channel_id": channel_id,
-        }),
-    };
-
-    let result = plugin_manager
-        .snapshot_registry()
-        .await
-        .execute(&mcp_call, app_context.clone())
-        .await;
-
-    match result {
-        Ok(r) if !r.is_error => serde_json::from_str::<serde_json::Value>(&r.content)
-            .ok()
-            .and_then(|v| v["context"].as_str().map(String::from))
-            .unwrap_or_default(),
-        _ => String::new(),
-    }
-}
-
 /// POST /run-cron/{schedule_id}: manually fire a cron job.
 ///
 /// Accepts an optional `?force=true` query parameter. When force is true,
@@ -1703,30 +1213,6 @@ async fn timing_middleware(
 mod tests {
     use super::*;
 
-    // ─── PromptPreviewRequest serde ─────────────────────────────────────
-
-    #[test]
-    fn test_prompt_preview_request() {
-        let json = serde_json::json!({
-            "prompt": "Hello world",
-            "plan": true
-        });
-        let req: PromptPreviewRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.prompt, "Hello world");
-        assert!(req.plan);
-    }
-
-    #[test]
-    fn test_prompt_preview_request_no_plan() {
-        let json = serde_json::json!({
-            "prompt": "Hello world",
-            "plan": false
-        });
-        let req: PromptPreviewRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.prompt, "Hello world");
-        assert!(!req.plan);
-    }
-
     // ─── AppState ────────────────────────────────────────────────────────
 
     #[test]
@@ -1752,32 +1238,6 @@ mod tests {
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
         assert!(payload["uptime"].as_u64().is_some());
-    }
-
-    // ─── PromptPreviewResponse ──────────────────────────────────────────
-
-    #[test]
-    fn test_prompt_preview_response_serialize() {
-        let resp = PromptPreviewResponse {
-            system_prompt: "test system".to_string(),
-            messages: vec![serde_json::json!({ "role": "system", "content": "test" })],
-            plan: Some(true),
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["system_prompt"], "test system");
-        assert_eq!(json["messages"][0]["role"], "system");
-        assert_eq!(json["plan"], true);
-    }
-
-    #[test]
-    fn test_prompt_preview_response_no_plan() {
-        let resp = PromptPreviewResponse {
-            system_prompt: "test".to_string(),
-            messages: vec![],
-            plan: None,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert!(json["plan"].is_null());
     }
 
     // ─── Stop-thread surgical cancellation decisions ──────────────────────

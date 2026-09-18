@@ -995,6 +995,9 @@ Previous plan:\n{}",
     };
 
     // 5. Assemble messages from prompt parts
+    // SAME implementation the dashboard prompt preview uses
+    // (`context_builder::initial_prompt_messages`), so the preview cannot
+    // diverge from the real prompt.
     // Inverse role mapping (R7): for tester/reviewer STEP threads the role
     // template (dev-tester/dev-reviewer) is the USER prompt, and the task
     // description (title + body carried in the cause message) is the SYSTEM
@@ -1002,61 +1005,12 @@ Previous plan:\n{}",
     // task body = user). The step-thread cause message carries the task
     // description; template_section carries the role template.
     let is_step_thread = matches!(thread.workflow_step.as_deref(), Some("testing" | "review"));
-    let mut messages = vec![ChatMessage::system(&prompt_parts.system)];
-    if !prompt_parts.memory.is_empty() {
-        messages.push(ChatMessage::system(&prompt_parts.memory));
-    }
-
-    // Inject task template FIRST (right after system prompt): highest instruction priority
-    // for template-backed tasks (kanban/cron with template).
-    // Flush-left position ensures the template guides the model before any other context.
-    // For step threads the template is deferred to the USER slot (see below).
-    if let Some(ref template_section) = template_section {
-        if !is_step_thread {
-            messages.push(ChatMessage::system(template_section));
-        }
-    }
-
-    // Add context from plugin as system message (before the user message)
-    if !prompt_parts.context.is_empty() {
-        messages.push(ChatMessage::system(&format!(
-            "=== Context ===\n{}",
-            prompt_parts.context
-        )));
-    }
-
-    // Inject the plan as execution context if one was generated
-    if let Some(ref plan) = plan_content {
-        messages.push(ChatMessage::system(&format!(
-            "=== Generated Plan (use as guidance) ===\n\
-             A plan was generated for the current task. Follow it unless tool results \
-             contradict it. Do NOT explore alternative approaches that the plan already \
-             considered: adapt only when necessary.\n\n{}",
-            plan
-        )));
-        info!(
-            "[plan] Injected plan as context for thread {} ({} chars)",
-            thread.id,
-            plan.len(),
-        );
-    }
-
-    // Step threads: task description goes in the SYSTEM slot, the role
-    // template in the USER slot (inverse of the executor layout).
-    if is_step_thread {
-        messages.push(ChatMessage::system(&format!(
-            "=== Task Description ===\n{}",
-            prompt_parts.user
-        )));
-        if let Some(ref template_section) = template_section {
-            messages.push(ChatMessage::user(template_section));
-        } else {
-            messages.push(ChatMessage::user(&prompt_parts.user));
-        }
-    } else {
-        // Add the user message (from the prompt parts: the plugin provides this)
-        messages.push(ChatMessage::user(&prompt_parts.user));
-    }
+    let mut messages = crate::agent::context_builder::initial_prompt_messages(
+        &prompt_parts,
+        template_section.as_deref(),
+        plan_content.as_deref(),
+        is_step_thread,
+    );
 
     // ── Truncation recovery (finish_reason=length) ──
     // Normal LLM calls use the configured `max_tokens` budget (None = no cap:

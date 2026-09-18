@@ -960,7 +960,7 @@ impl Platform for ExternalPlatformClient {
                                                                         match crate::commands::handle_stop_external(
                                                                             &pool,
                                                                             &channel.id,
-                                                                            parent_external_id.as_deref(),
+                                                                            parent_external_id,
                                                                         ).await {
                                                                             Ok(outcome) => crate::commands::format_stop_reply(&outcome),
                                                                             Err(e) => format!("Error stopping threads: {}", e),

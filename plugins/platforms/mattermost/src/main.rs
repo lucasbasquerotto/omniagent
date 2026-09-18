@@ -2173,7 +2173,11 @@ async fn handle_initialize(id: u64) -> PluginResponse {
             "setup": true,
             "prompt_hint": MATTERMOST_PROMPT_HINT,
             "commands": {
-                "new": ["/new", "$new", "//new"]
+                "new": ["/new", "$new", "//new"],
+                // Inbound stop prompt command. `/stop` / `//stop` are declared
+                // alongside `$stop` so the escape forms keep working where the
+                // Mattermost client eats a bare `/stop` as a slash command.
+                "stop": ["/stop", "$stop", "//stop"]
             },
         }
     });

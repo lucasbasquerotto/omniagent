@@ -5,6 +5,7 @@
 
 use crate::err_msg;
 use crate::error::{AppResult, Error};
+use sql_forge::sql_forge;
 use sqlx::PgPool;
 
 use crate::db::types::Channel;
@@ -220,6 +221,150 @@ pub fn parse_new_command(input: &str, prefix: &str) -> AppResult<NewCommand> {
         Some(rest.to_string())
     };
     Ok(NewCommand { name })
+}
+
+// ---------------------------------------------------------------------------
+// StopCommand: the inbound `stop` prompt command ($stop / /stop)
+// ---------------------------------------------------------------------------
+
+/// Generic fallback prefixes for the `stop` command, used when a platform
+/// plugin declares no `commands.stop` capability (the Telegram Bot API style
+/// `/stop`). A plugin that declares its own syntax (Mattermost: `$stop`) wins.
+pub const DEFAULT_STOP_COMMAND_PREFIXES: &[&str] = &["/stop"];
+
+/// The `stop`-command prefix matched by `text` on a platform that declared
+/// `declared` prefixes (`capabilities.commands.stop`), falling back to
+/// [`DEFAULT_STOP_COMMAND_PREFIXES`] when the plugin declared none. Mirrors
+/// [`match_new_command`]: core only matches what the plugin advertised, and
+/// never decides on its own which prefix belongs to which platform.
+pub fn match_stop_command<'p>(text: &str, declared: Option<&'p [String]>) -> Option<&'p str> {
+    match declared {
+        Some(prefixes) if !prefixes.is_empty() => {
+            match_command_prefix(text, prefixes.iter().map(String::as_str))
+        }
+        _ => match_command_prefix(text, DEFAULT_STOP_COMMAND_PREFIXES.iter().copied()),
+    }
+}
+
+/// Parse a `/stop` / `$stop` command text that already matched `prefix`.
+///
+/// The command takes NO arguments (the scope comes from the message itself:
+/// a top-level channel message stops the whole channel, a threaded reply stops
+/// only its thread family), so any trailing text is a usage error.
+pub fn parse_stop_command(input: &str, prefix: &str) -> AppResult<StopCommand> {
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix(prefix).unwrap_or(trimmed).trim();
+    if !rest.is_empty() {
+        err_msg!("Usage: /stop (no arguments)");
+    }
+    Ok(StopCommand)
+}
+
+/// Parsed `stop` command: a unit struct today, kept as a type so callers are
+/// written against the shape of the `new` command (future flags can be added
+/// without touching every call site).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopCommand;
+
+/// Resolve the thread a parent-scoped stop applies to: the thread of
+/// `channel_id` whose cause (seq-0) message carries `parent_external_id` as its
+/// external id - i.e. the thread the operator replied inside. Returns `None`
+/// when the parent id is empty or no such thread exists in the channel.
+pub async fn resolve_parent_thread_id(
+    pool: &PgPool,
+    channel_id: &str,
+    parent_external_id: &str,
+) -> AppResult<Option<i64>> {
+    if parent_external_id.is_empty() {
+        return Ok(None);
+    }
+    #[derive(Debug, sqlx::FromRow)]
+    struct ParentRow {
+        thread_id: i64,
+    }
+    let found: Option<ParentRow> = sql_forge!(
+        ParentRow,
+        r#"
+        SELECT m.thread_id
+        FROM messages m
+        JOIN threads t ON t.id = m.thread_id
+        WHERE t.channel_id = :channel_id
+          AND m.external_id = :parent_ext_id
+          AND m.thread_sequence = 0
+        LIMIT 1
+        "#,
+        ( :channel_id = channel_id, :parent_ext_id = parent_external_id )
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.map(|row| row.thread_id))
+}
+
+/// Handle an inbound `stop` prompt command (`$stop` on Mattermost, `/stop` on
+/// Telegram) for an already-resolved channel.
+///
+/// A top-level channel message (no parent id) stops the WHOLE channel: every
+/// pending/processing thread of `channel_id`. A message carrying a parent id
+/// (Mattermost thread reply, `root_id` / `parent_external_id` metadata) stops
+/// only that FAMILY: the parent thread itself plus the threads attached to it.
+/// An unresolvable parent id stops nothing - it must never fall back to the
+/// channel-wide scope, which would kill unrelated threads.
+pub async fn handle_stop_external(
+    pool: &PgPool,
+    channel_id: &str,
+    parent_external_id: Option<&str>,
+) -> Result<crate::server::StopOutcome, String> {
+    let scoped = parent_external_id.filter(|id| !id.is_empty());
+    let Some(parent_external_id) = scoped else {
+        return crate::server::stop_threads(
+            pool,
+            crate::server::StopScope::Channel(channel_id.to_string()),
+        )
+        .await;
+    };
+
+    match resolve_parent_thread_id(pool, channel_id, parent_external_id).await {
+        Ok(Some(parent_id)) => {
+            crate::server::stop_threads(
+                pool,
+                crate::server::StopScope::Family {
+                    channel_id: channel_id.to_string(),
+                    parent_id,
+                },
+            )
+            .await
+        }
+        Ok(None) => {
+            // Threaded stop whose root thread is unknown (e.g. the root post
+            // predates this channel): nothing to stop, and the reply must say
+            // so rather than silently widening the scope to the channel.
+            tracing::info!(
+                "Stop: parent id {} has no thread in channel {}; nothing stopped",
+                parent_external_id,
+                channel_id
+            );
+            Ok(crate::server::StopOutcome {
+                scoped: true,
+                channel_id: Some(channel_id.to_string()),
+                ..crate::server::StopOutcome::default()
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Operator-facing confirmation for a stop command. Deliberately platform
+/// neutral so the Mattermost `$stop` and the Telegram `/stop` replies read the
+/// same; the scoped wording makes the family variant unmistakable.
+pub fn format_stop_reply(outcome: &crate::server::StopOutcome) -> String {
+    if outcome.scoped {
+        format!(
+            "Stopped {} thread(s) in this thread group.",
+            outcome.skipped
+        )
+    } else {
+        format!("Stopped {} thread(s).", outcome.skipped)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -585,5 +730,95 @@ mod tests {
     fn test_parse_profile_reset() {
         let cmd = parse_profile_command("//profile reset").unwrap();
         assert!(matches!(cmd, ProfileCommand::Reset));
+    }
+}
+
+#[cfg(test)]
+mod stop_command_tests {
+    use super::*;
+
+    fn declared(prefixes: &[&str]) -> Vec<String> {
+        prefixes.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// The `stop` prefixes are PLUGIN-DECLARED, exactly like `new`: a plugin
+    /// that declares its own syntax wins and core only falls back to `/stop`
+    /// when the plugin declared nothing at all.
+    #[test]
+    fn stop_prefix_matching_is_capability_driven() {
+        // Mattermost declares `$stop` plus the escape forms.
+        let mm = declared(&["/stop", "$stop", "//stop"]);
+        assert_eq!(match_stop_command("$stop", Some(&mm)), Some("$stop"));
+        assert_eq!(match_stop_command("//stop", Some(&mm)), Some("//stop"));
+        assert_eq!(match_stop_command("/stop", Some(&mm)), Some("/stop"));
+        // Token-exact: these are normal prompts, not the command.
+        assert_eq!(match_stop_command("/stopping now", Some(&mm)), None);
+        assert_eq!(match_stop_command("please $stop", Some(&mm)), None);
+
+        // Telegram declares the Bot API style `/stop` only.
+        let tg = declared(&["/stop"]);
+        assert_eq!(match_stop_command("/stop", Some(&tg)), Some("/stop"));
+        assert_eq!(match_stop_command("$stop", Some(&tg)), None);
+
+        // Plugin declares nothing -> generic `/stop` fallback.
+        assert_eq!(match_stop_command("/stop", None), Some("/stop"));
+        assert_eq!(match_stop_command("$stop", None), None);
+        // An empty declaration behaves like no declaration.
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(match_stop_command("/stop", Some(&empty)), Some("/stop"));
+    }
+
+    /// Core never decides a prefix the plugin did not advertise: a plugin that
+    /// declares only `$stop` must NOT silently accept `/stop`.
+    #[test]
+    fn declared_stop_beats_generic_fallback() {
+        let mm_only = declared(&["$stop"]);
+        assert_eq!(match_stop_command("$stop", Some(&mm_only)), Some("$stop"));
+        assert_eq!(match_stop_command("/stop", Some(&mm_only)), None);
+    }
+
+    /// The longest declared prefix wins (`//stop` over `/stop`), so the escaped
+    /// Mattermost form is not parsed with the shorter prefix left over.
+    #[test]
+    fn stop_prefix_is_the_longest_match() {
+        let both = declared(&["/stop", "//stop"]);
+        assert_eq!(match_stop_command("//stop", Some(&both)), Some("//stop"));
+    }
+
+    /// The command takes no arguments: trailing text is a usage error, and the
+    /// scope always comes from the message shape (top-level vs threaded).
+    #[test]
+    fn parse_stop_command_rejects_arguments() {
+        assert_eq!(parse_stop_command("/stop", "/stop").unwrap(), StopCommand);
+        assert_eq!(
+            parse_stop_command("  $stop  ", "$stop").unwrap(),
+            StopCommand
+        );
+        assert!(parse_stop_command("/stop now", "/stop").is_err());
+        assert!(parse_stop_command("$stop all", "$stop").is_err());
+    }
+
+    /// The reply always names the count, and the family variant says so.
+    #[test]
+    fn stop_reply_reports_count_and_scope() {
+        let channel = crate::server::StopOutcome {
+            skipped: 3,
+            ..crate::server::StopOutcome::default()
+        };
+        assert_eq!(format_stop_reply(&channel), "Stopped 3 thread(s).");
+
+        let family = crate::server::StopOutcome {
+            skipped: 2,
+            scoped: true,
+            ..crate::server::StopOutcome::default()
+        };
+        assert_eq!(
+            format_stop_reply(&family),
+            "Stopped 2 thread(s) in this thread group."
+        );
+
+        // Nothing to stop still produces a reply (never a silent no-op).
+        let none = crate::server::StopOutcome::default();
+        assert_eq!(format_stop_reply(&none), "Stopped 0 thread(s).");
     }
 }

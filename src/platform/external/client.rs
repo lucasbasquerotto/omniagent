@@ -931,6 +931,44 @@ impl Platform for ExternalPlatformClient {
                                                                 continue;
                                                                 }
 
+                                                            // Inbound `stop` prompt command (`$stop` on Mattermost,
+                                                            // `/stop` on Telegram): handled INLINE here, before any
+                                                            // thread is created or merged, so it takes effect while a
+                                                            // thread is already running and is never swallowed by the
+                                                            // sub-prompt merging logic. The accepted prefixes are
+                                                            // DECLARED by the platform plugin (`commands.stop`); core
+                                                            // falls back to `/stop` when the plugin declares nothing.
+                                                            let declared_stop = caps.commands.get("stop").map(|v| v.as_slice());
+                                                            if let Some(prefix) =
+                                                                crate::commands::match_stop_command(&inbound.text, declared_stop)
+                                                            {
+                                                                let reply = match crate::commands::parse_stop_command(&inbound.text, prefix) {
+                                                                    Ok(_) => {
+                                                                        // A threaded stop (Mattermost reply with a root
+                                                                        // id) scopes to that thread family; a top-level
+                                                                        // channel message stops the whole channel.
+                                                                        let parent_external_id =
+                                                                            crate::platform::external::parent_external_id_from_metadata(&inbound.metadata);
+                                                                        match crate::commands::handle_stop_external(
+                                                                            &pool,
+                                                                            &channel.id,
+                                                                            parent_external_id.as_deref(),
+                                                                        ).await {
+                                                                            Ok(outcome) => crate::commands::format_stop_reply(&outcome),
+                                                                            Err(e) => format!("Error stopping threads: {}", e),
+                                                                        }
+                                                                    }
+                                                                    Err(e) => format!("Error: {}", e),
+                                                                };
+                                                                send_external_reply(
+                                                                    &mut stdin,
+                                                                    &mut next_id_val,
+                                                                    &inbound,
+                                                                    &reply,
+                                                                ).await;
+                                                                continue;
+                                                            }
+
                                                                 // Apply generic file attachment inlining (handles all platforms uniformly)
                                                                 let max_inline_file_kb = crate::agent::config::get_global()
                                                                     .map(|g| g.read().max_inline_file_kb)
@@ -1661,7 +1699,13 @@ async fn send_external_reply(
         msg_subtype: None,
         thread_id: 0,
         cause_external_id: Some(inbound.external_id.clone()),
-        cause_root_id: None,
+        // When the message this reply answers was itself inside a thread
+        // (Mattermost `root_id` / generic `parent_external_id`), the reply must
+        // land in that same thread: the platform plugin uses the cause root id
+        // for that (Mattermost cannot nest replies).
+        cause_root_id: crate::platform::external::parent_external_id_from_metadata(
+            &inbound.metadata,
+        ),
         reply_to_message_id: None,
         is_final: false,
         is_summary: false,

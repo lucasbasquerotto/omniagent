@@ -326,9 +326,13 @@ async fn run_server() -> AppResult<()> {
         }
     }
 
-    // Shared cancellation tokens for /stop endpoint
+    // Shared cancellation tokens for the stop surfaces (`/stop/{channel_id}`
+    // endpoint AND the inbound `stop` prompt command: `$stop` / `/stop`).
+    // ONE process-wide registry serves the agent supervisor, the HTTP server
+    // and the platform clients, so a prompt stop really cancels the same
+    // channel processing task the endpoint would have cancelled.
     let cancel_tokens: Arc<Mutex<HashMap<String, CancellationToken>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+        server::cancel_registry().clone();
     let cancel_tokens_agent = cancel_tokens.clone();
     let cancel_tokens_server = cancel_tokens.clone();
 

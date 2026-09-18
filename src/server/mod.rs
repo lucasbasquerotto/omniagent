@@ -63,6 +63,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -503,47 +504,108 @@ async fn apply_stop_recovery(
     }
 }
 
-/// Stop: explicitly stop all pending/processing threads for a channel.
+// ---------------------------------------------------------------------------
+// Shared explicit-stop core (HTTP endpoints + inbound stop prompt command)
+// ---------------------------------------------------------------------------
+
+/// Process-wide channel cancellation-token registry.
 ///
-/// Phase 6b: unlike a failure (which re-schedules), an explicit stop BLOCKS the
-/// kanban tasks of the skipped threads and clears their thread_status - no
-/// retry is consumed and no re-run thread is created. The channel stays open.
-async fn stop_handler(
-    Path(channel_id): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    // 1. Collect pending/processing threads (id + kanban task) BEFORE skipping
-    let threads = match     sql_forge!(
-        ThreadTaskRow,
-        "SELECT id, channel_id, task_id, status FROM threads WHERE channel_id = :channel_id AND status IN ('pending', 'processing')",
-        ( :channel_id = channel_id.as_str() )
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            error!(
-                "Stop: failed to list threads for channel {}: {:?}",
-                channel_id, e
-            );
-            return Json(serde_json::json!({
-                "status": "error",
-                "error": e.to_string(),
-                "channel_id": channel_id,
-            }));
-        }
+/// The agent supervisor registers one token per channel here; the HTTP
+/// `/stop/{channel_id}` endpoint AND the inbound `stop` prompt command
+/// (`$stop` on Mattermost, `/stop` on Telegram) cancel through this SAME map,
+/// so both surfaces stop the very same processing task. Lazily initialised so
+/// the binary, the HTTP server and the platform clients share one instance.
+static CANCEL_TOKENS: OnceLock<Arc<Mutex<HashMap<String, CancellationToken>>>> = OnceLock::new();
+
+/// The process-wide channel cancellation-token registry.
+pub fn cancel_registry() -> &'static Arc<Mutex<HashMap<String, CancellationToken>>> {
+    CANCEL_TOKENS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+/// What an explicit stop targets.
+#[derive(Debug, Clone)]
+pub enum StopScope {
+    /// Every pending/processing thread of the channel (HTTP `/stop/{channel_id}`
+    /// and a top-level `$stop` / `/stop` prompt).
+    Channel(String),
+    /// The prompt-command family form: the parent thread itself
+    /// (`id == parent_id`) plus the threads attached to it
+    /// (`parent_id == parent_id`), all inside `channel_id`.
+    Family { channel_id: String, parent_id: i64 },
+}
+
+/// Outcome of an explicit stop, shared by the HTTP endpoint and the prompt
+/// command so both report identical numbers.
+#[derive(Debug, Default, Clone)]
+pub struct StopOutcome {
+    /// Threads flipped to terminal `skipped` by this call.
+    pub skipped: usize,
+    /// Kanban tasks moved to `blocked` by the explicit-stop recovery.
+    pub blocked_tasks: u32,
+    /// True when the channel's processing task was cancelled.
+    pub handler_cancelled: bool,
+    /// True when the scope was limited to a thread family (prompt command).
+    pub scoped: bool,
+    /// Number of pending/processing threads the scope selected before skipping.
+    pub target_threads: usize,
+    /// Channel the stop applied to, when known.
+    pub channel_id: Option<String>,
+}
+
+/// Explicitly stop the threads selected by `scope`.
+///
+/// This is the single implementation behind BOTH `POST|GET /stop/{channel_id}`
+/// and the inbound `stop` prompt command: list the pending/processing targets,
+/// mark each one terminal `skipped` (through the `mark_thread_terminal` choke
+/// point, so pending subtasks are cancelled and the terminal invariant holds),
+/// fire the terminal hooks, apply the kanban explicit-stop recovery and cancel
+/// the channel's processing task through the shared cancellation registry.
+pub async fn stop_threads(pool: &PgPool, scope: StopScope) -> Result<StopOutcome, String> {
+    let (rows, scoped, channel_id): (Vec<ThreadTaskRow>, bool, String) = match &scope {
+        StopScope::Channel(channel_id) => (
+            sql_forge!(
+                ThreadTaskRow,
+                "SELECT id, channel_id, task_id, status FROM threads WHERE channel_id = :channel_id AND status IN ('pending', 'processing')",
+                ( :channel_id = channel_id.as_str() )
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?,
+            false,
+            channel_id.clone(),
+        ),
+        StopScope::Family {
+            channel_id,
+            parent_id,
+        } => (
+            sql_forge!(
+                ThreadTaskRow,
+                "SELECT id, channel_id, task_id, status FROM threads WHERE channel_id = :channel_id AND (parent_id = :parent_id OR id = :parent_id) AND status IN ('pending', 'processing')",
+                ( :channel_id = channel_id.as_str(), :parent_id = *parent_id )
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?,
+            true,
+            channel_id.clone(),
+        ),
     };
 
-    // 2. Mark them all as skipped (plain skip - no reschedule, no re-run thread).
-    //    Every terminal write funnels through queries::mark_thread_terminal so
-    //    the terminal=true invariant holds on the skipped rows.
-    let mut skipped = 0u64;
+    let mut outcome = StopOutcome {
+        scoped,
+        target_threads: rows.len(),
+        channel_id: Some(channel_id.clone()),
+        ..StopOutcome::default()
+    };
+
+    // 1. Mark every target terminal 'skipped' (plain skip - no reschedule, no
+    //    re-run thread). Every terminal write funnels through
+    //    mark_thread_terminal so the terminal=true invariant holds.
     let mut skipped_ids: Vec<i64> = Vec::new();
-    for row in &threads {
-        match queries::mark_thread_terminal(&state.pool, row.id, "skipped").await {
+    for row in &rows {
+        match queries::mark_thread_terminal(pool, row.id, "skipped").await {
             Ok(n) => {
-                skipped += n;
+                outcome.skipped += n as usize;
                 if n > 0 {
                     skipped_ids.push(row.id);
                 }
@@ -553,31 +615,22 @@ async fn stop_handler(
                     "Stop: failed to skip thread {} for channel {}: {:?}",
                     row.id, channel_id, e
                 );
-                return Json(serde_json::json!({
-                    "status": "error",
-                    "error": e.to_string(),
-                    "channel_id": channel_id,
-                }));
+                return Err(e.to_string());
             }
         }
     }
-    info!(
-        "Stop: skipped {} pending/processing threads for channel {}",
-        skipped, channel_id
-    );
 
-    // Event-driven hooks: every thread this stop flipped to terminal
-    // 'skipped' emits the terminal lifecycle events (thread_skipped +
-    // thread_terminated), fire-and-forget.
+    // 2. Event-driven hooks: every thread this stop flipped to terminal
+    //    'skipped' emits the terminal lifecycle events (thread_skipped +
+    //    thread_terminated), fire-and-forget.
     for id in skipped_ids {
         crate::hooks::fire_thread_terminated(id, "skipped");
     }
 
-    // 3. Phase 6b: block the kanban tasks of the skipped threads
-    let mut blocked = 0u32;
-    for row in &threads {
-        match apply_stop_recovery(&state.pool, row.id, row.task_id.as_deref(), "stop").await {
-            Ok(true) => blocked += 1,
+    // 3. Phase 6b: block the kanban tasks of the skipped threads.
+    for row in &rows {
+        match apply_stop_recovery(pool, row.id, row.task_id.as_deref(), "stop").await {
+            Ok(true) => outcome.blocked_tasks += 1,
             Ok(false) => {}
             Err(e) => error!(
                 "Stop: failed to apply recovery for thread {}: {}",
@@ -585,30 +638,69 @@ async fn stop_handler(
             ),
         }
     }
-    if blocked > 0 {
-        info!(
-            "Stop: blocked {} kanban task(s) for channel {}",
-            blocked, channel_id
-        );
+
+    // 4. Cancel the channel's processing task (if running).
+    //    - channel scope: always (the whole channel is being stopped);
+    //    - family scope: only when a target was actively `processing` - a
+    //      pending-only family means the handler is running a DIFFERENT thread
+    //      and must not be killed.
+    let cancel_handler = match &scope {
+        StopScope::Channel(_) => true,
+        StopScope::Family { .. } => rows
+            .iter()
+            .any(|row| stop_thread_cancels_handler(row.status.as_deref())),
+    };
+    if cancel_handler {
+        let mut tokens = cancel_registry().lock().await;
+        if let Some(token) = tokens.remove(&channel_id) {
+            token.cancel();
+            outcome.handler_cancelled = true;
+        }
     }
 
-    // 4. Cancel the channel's processing task (if running)
-    let mut tokens = state.cancel_tokens.lock().await;
-    let has_handler = if let Some(token) = tokens.remove(&channel_id) {
-        token.cancel();
-        info!("Stop: cancelled processing task for channel {}", channel_id);
-        true
-    } else {
-        false
-    };
+    info!(
+        "Stop: skipped {} pending/processing threads for channel {} (scope={}{})",
+        outcome.skipped,
+        channel_id,
+        if scoped { "family" } else { "channel" },
+        if outcome.handler_cancelled {
+            ", handler cancelled"
+        } else {
+            ""
+        }
+    );
 
-    Json(serde_json::json!({
-        "action": "stop",
-        "channel_id": channel_id,
-        "skipped_threads": skipped,
-        "blocked_tasks": blocked,
-        "handler_cancelled": has_handler,
-    }))
+    Ok(outcome)
+}
+
+/// Stop: explicitly stop all pending/processing threads for a channel.
+///
+/// Phase 6b: unlike a failure (which re-schedules), an explicit stop BLOCKS the
+/// kanban tasks of the skipped threads and clears their thread_status - no
+/// retry is consumed and no re-run thread is created. The channel stays open.
+async fn stop_handler(
+    Path(channel_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    // Delegated to the shared explicit-stop core so the HTTP endpoint and the
+    // inbound `stop` prompt command ($stop / /stop) can never diverge.
+    match stop_threads(&state.pool, StopScope::Channel(channel_id.clone())).await {
+        Ok(outcome) => Json(serde_json::json!({
+            "action": "stop",
+            "channel_id": channel_id,
+            "skipped_threads": outcome.skipped,
+            "blocked_tasks": outcome.blocked_tasks,
+            "handler_cancelled": outcome.handler_cancelled,
+        })),
+        Err(e) => {
+            error!("Stop: failed for channel {}: {}", channel_id, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "error": e,
+                "channel_id": channel_id,
+            }))
+        }
+    }
 }
 
 /// Stop-thread: explicitly stop a single thread.

@@ -947,8 +947,16 @@ impl Platform for ExternalPlatformClient {
                                                                         // A threaded stop (Mattermost reply with a root
                                                                         // id) scopes to that thread family; a top-level
                                                                         // channel message stops the whole channel.
-                                                                        let parent_external_id =
-                                                                            crate::platform::external::parent_external_id_from_metadata(&inbound.metadata);
+                                                                        // A chat-level parent (the Telegram
+                                                                        // plugin's `parent_by_chat` delivers the
+                                                                        // chat id on EVERY message) is the channel
+                                                                        // itself, not a thread family: it must keep
+                                                                        // the stop channel-wide.
+                                                                        let raw_parent = crate::platform::external::parent_external_id_from_metadata(&inbound.metadata);
+                                                                        let parent_external_id = crate::commands::stop_parent_external_id(
+                                                                            raw_parent.as_deref(),
+                                                                            &inbound.resource_identifier,
+                                                                        );
                                                                         match crate::commands::handle_stop_external(
                                                                             &pool,
                                                                             &channel.id,

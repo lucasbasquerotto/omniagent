@@ -246,6 +246,22 @@ pub fn match_stop_command<'p>(text: &str, declared: Option<&'p [String]>) -> Opt
     }
 }
 
+/// The parent id that actually SCOPES a `stop` command, if any.
+///
+/// Some platforms deliver a CHAT-level parent on EVERY inbound message: the
+/// Telegram plugin's `parent_by_chat` grouping sets
+/// `metadata.parent_external_id` (and the `root_id` alias) to the chat id for
+/// every message, replies or not. That parent IS the channel, so it must not
+/// be read as a thread family - otherwise a top-level `/stop` resolves no
+/// parent thread and stops nothing. Mattermost delivers `root_id` only for
+/// thread replies (a post id, which is never the channel id), so the family
+/// scope is unaffected there.
+pub fn stop_parent_external_id<'a>(
+    parent_external_id: Option<&'a str>,
+    resource_identifier: &str,
+) -> Option<&'a str> {
+    parent_external_id.filter(|id| !id.is_empty() && *id != resource_identifier)
+}
 /// Parse a `/stop` / `$stop` command text that already matched `prefix`.
 ///
 /// The command takes NO arguments (the scope comes from the message itself:
@@ -291,6 +307,11 @@ pub async fn resolve_parent_thread_id(
         WHERE t.channel_id = :channel_id
           AND m.external_id = :parent_ext_id
           AND m.thread_sequence = 0
+        -- A root post maps to exactly one thread in practice; when a second
+        -- row ever shares that seq-0 external id (replayed / synthetic
+        -- message), prefer the LIVE thread (non-terminal, newest) so a
+        -- family stop never resolves to a dead duplicate and stops nothing.
+        ORDER BY t.terminal ASC, t.id DESC
         LIMIT 1
         "#,
         ( :channel_id = channel_id, :parent_ext_id = parent_external_id )
@@ -769,6 +790,23 @@ mod stop_command_tests {
     }
 
     /// Core never decides a prefix the plugin did not advertise: a plugin that
+    /// A chat-level parent (Telegram `parent_by_chat`: the parent external id
+    /// is the chat id on every message) must NOT scope the stop to a family:
+    /// the parent IS the channel, so a top-level `/stop` stays channel-wide.
+    #[test]
+    fn stop_parent_scope_ignores_a_chat_level_parent() {
+        // Mattermost thread reply: root_id is a post id -> family scope.
+        assert_eq!(
+            stop_parent_external_id(Some("post-abc"), "chan-1"),
+            Some("post-abc")
+        );
+        // Telegram top-level: parent external id == the chat id -> channel-wide.
+        assert_eq!(stop_parent_external_id(Some("chan-1"), "chan-1"), None);
+        // Absent/empty parent -> channel-wide.
+        assert_eq!(stop_parent_external_id(Some(""), "chan-1"), None);
+        assert_eq!(stop_parent_external_id(None, "chan-1"), None);
+    }
+
     /// declares only `$stop` must NOT silently accept `/stop`.
     #[test]
     fn declared_stop_beats_generic_fallback() {

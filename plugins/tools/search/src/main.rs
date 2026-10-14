@@ -187,8 +187,14 @@ fn build_search_messages_sql(query: &str, channel_id: Option<&str>, limit: i64) 
         if exact_tsq.is_empty() {
             format!("ts_rank_cd({ts_col}, {english_tsq}) DESC, {dot}created_at DESC, {dot}id DESC")
         } else {
+            // exact_tsq MUST be parenthesized: for a query with 2+ underscore
+            // identifier runs it is a `&&`-joined expression, and PostgreSQL
+            // gives `@@`, `&&` and `||` the SAME precedence with left
+            // associativity. Unparenthesized, `search_tsv @@ to_tsquery(a) &&
+            // to_tsquery(b)` parses as `(search_tsv @@ to_tsquery(a)) &&
+            // to_tsquery(b)` -> "operator does not exist: boolean && tsquery".
             format!(
-                "({ts_col} @@ {exact_tsq}) DESC, ts_rank_cd({ts_col}, {english_tsq}) DESC, {dot}created_at DESC, {dot}id DESC"
+                "({ts_col} @@ ({exact_tsq})) DESC, ts_rank_cd({ts_col}, {english_tsq}) DESC, {dot}created_at DESC, {dot}id DESC"
             )
         }
     };
@@ -1771,13 +1777,55 @@ mod tests {
             "exact joined-token term must be added for snake_case queries: {sql}"
         );
         assert!(
-            sql.contains("(im.search_tsv @@ to_tsquery('english', 'parentbychat')) DESC"),
-            "exact identifier matches must sort first: {sql}"
+            sql.contains("(im.search_tsv @@ (to_tsquery('english', 'parentbychat'))) DESC"),
+            "exact identifier matches must sort first (parenthesized tsquery): {sql}"
         );
         assert!(
             sql.contains("plainto_tsquery('english', 'parent_by_chat') || (to_tsquery('english', 'parentbychat'))"),
             "match must OR the word query with the exact token: {sql}"
         );
+    }
+
+    #[test]
+    fn search_sql_two_underscore_runs_parenthesizes_exact_tsquery() {
+        // Regression for "operator does not exist: boolean && tsquery": two
+        // underscore-joined identifier runs build an exact tsquery joined by
+        // `&&`. `@@`, `&&` and `||` share the same precedence and are left
+        // associative, so the ORDER BY embed MUST be parenthesized.
+        let q = "task_omnidev_fix search_tsv_backfill";
+        let expected_exact =
+            "to_tsquery('english', 'taskomnidevfix') && to_tsquery('english', 'searchtsvbackfill')";
+        // Both branches (global, channel-scoped) and both query levels.
+        for sql in [
+            build_search_messages_sql(q, None, 10),
+            build_search_messages_sql(q, Some("omnidev"), 10),
+        ] {
+            assert!(
+                sql.contains(&format!("search_tsv @@ ({expected_exact})) DESC")),
+                "exact `&&` tsquery must be parenthesized in the ORDER BY: {sql}"
+            );
+            assert!(
+                !sql.contains(&format!("@@ {expected_exact}")),
+                "unparenthesized boolean && tsquery must never be emitted: {sql}"
+            );
+            assert!(
+                sql.contains(&format!("|| ({expected_exact}))")),
+                "match predicate must OR the word query with the exact run set: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_sql_two_underscore_runs_have_no_bare_and_embed() {
+        // The precise failure shape: `@@ to_tsquery(...) && to_tsquery(...)`
+        // at the same paren level anywhere in the statement.
+        for channel in [None, Some("omnidev")] {
+            let sql = build_search_messages_sql("task_omnidev_fix search_tsv_backfill", channel, 10);
+            assert!(
+                !sql.contains("@@ to_tsquery('english', 'taskomnidevfix') && to_tsquery("),
+                "statement must contain no unparenthesized `@@ ... && to_tsquery`: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -1827,6 +1875,52 @@ mod tests {
             !g.contains("ts_rank_cd(search_tsv, "),
             "global rank must use the im alias: {g}"
         );
+    }
+}
+
+#[cfg(test)]
+// ---------------------------------------------------------------------------
+// Functional regression: EXECUTE the generated statement against the dev DB.
+// String assertions alone cannot prove PostgreSQL accepts the expression, so
+// this test actually runs the SQL. It is skipped (loudly) when DATABASE_URL is
+// absent, which keeps DB-free/CI runs green; the omnidev dev stack sets it.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod search_sql_execution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn generated_sql_executes_for_two_identifier_runs() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "[skip] DATABASE_URL not set: generated-SQL execution test skipped (run it in the dev stack)"
+            );
+            return;
+        };
+        let pool = omniagent::db::connect(&url)
+            .await
+            .expect("dev database must be reachable when DATABASE_URL is set");
+        for channel in [None, Some("omnidev")] {
+            let sql =
+                build_search_messages_sql("task_omnidev_fix search_tsv_backfill", channel, 5);
+            let rows = sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(sql.as_str()))
+                .fetch_all(&pool)
+                .await;
+            match &rows {
+                Ok(r) => eprintln!(
+                    "[executed] generated SQL against dev DB (channel_id={channel:?}): {} row(s)",
+                    r.len()
+                ),
+                Err(e) => eprintln!(
+                    "[executed] generated SQL against dev DB (channel_id={channel:?}) FAILED: {e}"
+                ),
+            }
+            assert!(
+                rows.is_ok(),
+                "generated SQL must execute against the dev DB (channel_id={channel:?}): {:?}",
+                rows.err()
+            );
+        }
     }
 }
 

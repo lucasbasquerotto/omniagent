@@ -66,13 +66,242 @@ fn thread_progress_stats(
     }
 }
 
+/// Maximum number of plan steps kept (one subtask auto-create batch).
+const MAX_PLAN_STEPS: usize = 6;
+
+/// True when a planning reply is actually a TOOL-CALL ATTEMPT, not a plan.
+///
+/// The plan request is sent with `tools: None`, but the profile system prompt
+/// still teaches the textual tool-call syntax, so the model sometimes answers
+/// the planning prompt with a tool call instead of a plan: DeepSeek renders it
+/// as `<|DSML| invoke name="...">` markup, other providers as `<tool_calls>` or
+/// a ```tool_call fence. Live evidence (2026-10: 182 of the 289 plans persisted
+/// in 21 days carried such markup) shows this is the dominant cause of
+/// `[plan] No parseable steps`. Such content is NOT a plan and must never be
+/// turned into invented steps.
+fn is_tool_call_dump(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("dsml")
+        || lower.contains("<tool_calls")
+        || lower.contains("<tool_call ")
+        || lower.contains("<function_call")
+        || lower.contains("invoke name=")
+        || lower.contains("```tool_call")
+}
+
+/// Where a candidate plan step came from in the markdown line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepMarker {
+    Numbered,
+    Bullet,
+    Table,
+    Heading,
+}
+
+/// Strip markdown decoration around a step's text (`**bold**`, `` `code` ``).
+/// Double underscores are left alone on purpose: tool names such as
+/// `notes__note_list` use them as a separator.
+fn clean_step_text(text: &str) -> String {
+    let t = text.trim();
+    let t = t.trim_start_matches(['*', '`', '>', '#']).trim();
+    let t = t.trim_end_matches(['*', '`']).trim();
+    t.replace("**", "").replace('`', "").trim().to_string()
+}
+
+/// Reject noise: a plan step needs at least 3 chars and one alphanumeric.
+fn is_step_text(text: &str) -> bool {
+    text.chars().count() >= 3 && text.chars().any(|c| c.is_alphanumeric())
+}
+
+/// Read a leading `1.` / `1)` / `1:` or `Step 3:` marker and return the rest.
+fn after_number_marker(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && matches!(bytes[i], b'.' | b')' | b':') {
+        let rest = s[i + 1..].trim_start();
+        if !rest.is_empty() {
+            return Some(rest);
+        }
+    }
+    // "Step 3: ..." / "Step 3. ..." / "Step 3) ..."
+    if s.get(..4).is_some_and(|h| h.eq_ignore_ascii_case("step")) {
+        let rest = s[4..].trim_start();
+        let rb = rest.as_bytes();
+        let mut j = 0;
+        while j < rb.len() && rb[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > 0 && j < rb.len() && matches!(rb[j], b'.' | b')' | b':') {
+            let text = rest[j + 1..].trim_start();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// A plan rendered as a markdown table: accept rows whose FIRST cell is a
+/// number (`| 3 | Run the gates |`); header and separator rows are not steps.
+fn table_row_step(row: &str) -> Option<String> {
+    let cells: Vec<&str> = row
+        .trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|c| c.trim())
+        .collect();
+    if cells.len() < 2 {
+        return None;
+    }
+    // separator row: |---|---|
+    if cells
+        .iter()
+        .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+    {
+        return None;
+    }
+    let first = cells[0].trim_matches(['*', '`', ' ', '#']);
+    let numeric_first = !first.is_empty() && first.chars().all(|c| c.is_ascii_digit());
+    if !numeric_first {
+        return None;
+    }
+    let text = cells[1..]
+        .iter()
+        .filter(|c| !c.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" - ");
+    let clean = clean_step_text(&text);
+    if is_step_text(&clean) {
+        Some(clean)
+    } else {
+        None
+    }
+}
+
+/// Turn one markdown line into a plan-step candidate, tolerating the shapes
+/// real plans use: `## 1. Step`, `### Step 3: ...`, `- step`, `**1. step**`,
+/// blockquotes and table rows. Code fences are handled by the caller.
+fn step_from_line(line: &str) -> Option<(StepMarker, String)> {
+    let mut s = line.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // horizontal rule / decoration-only line
+    if s.chars().all(|c| matches!(c, '-' | '*' | '_' | '=' | ' ')) {
+        return None;
+    }
+    while let Some(rest) = s.strip_prefix('>') {
+        s = rest.trim_start();
+    }
+    let mut heading = false;
+    if s.starts_with('#') {
+        heading = true;
+        s = s.trim_start_matches('#').trim_start();
+    }
+    // emphasis wrapped marker: "**1. step**"
+    s = s.trim_start_matches("**").trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with('|') {
+        return table_row_step(s).map(|text| (StepMarker::Table, text));
+    }
+    if let Some(rest) = after_number_marker(s) {
+        let clean = clean_step_text(rest);
+        if is_step_text(&clean) {
+            return Some((StepMarker::Numbered, clean));
+        }
+    }
+    // bullets: a marker followed by whitespace (so "*emphasis*" is not a step)
+    for marker in ['-', '*', '+', '\u{2022}'] {
+        if let Some(rest) = s.strip_prefix(marker) {
+            if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
+                let clean = clean_step_text(rest);
+                if is_step_text(&clean) {
+                    return Some((StepMarker::Bullet, clean));
+                }
+            }
+        }
+    }
+    if heading {
+        let clean = clean_step_text(s);
+        if is_step_text(&clean) {
+            return Some((StepMarker::Heading, clean));
+        }
+    }
+    None
+}
+
+/// Section headings that describe a plan document, never a plan STEP.
+fn is_generic_heading(text: &str) -> bool {
+    let t = text
+        .trim()
+        .trim_matches(['*', '`'])
+        .trim_end_matches(':')
+        .trim()
+        .to_lowercase();
+    matches!(
+        t.as_str(),
+        "plan"
+            | "plans"
+            | "steps"
+            | "step"
+            | "approach"
+            | "overview"
+            | "context"
+            | "grounding"
+            | "goal"
+            | "goals"
+            | "objective"
+            | "objectives"
+            | "scope"
+            | "deliverables"
+            | "risks"
+            | "notes"
+            | "note"
+            | "acceptance"
+            | "acceptance criteria"
+            | "testing"
+            | "tests"
+            | "summary"
+            | "timeline"
+            | "phases"
+            | "background"
+            | "requirements"
+            | "out of scope"
+            | "non-goals"
+    )
+}
+
+/// Dedupe, drop noise, keep document order and cap at [`MAX_PLAN_STEPS`].
+fn finish_steps(steps: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for step in steps {
+        if !is_step_text(&step) {
+            continue;
+        }
+        if out.iter().any(|o| o == &step) {
+            continue;
+        }
+        out.push(step);
+        if out.len() >= MAX_PLAN_STEPS {
+            break;
+        }
+    }
+    out
+}
+
 /// Extract up to 6 plan steps from plan content (markdown or JSON).
 ///
-/// Real plans are markdown: `<plan>1. step one</plan>` or plain numbered/bulleted
-/// lists. We no longer REQUIRE JSON `{"steps": [...]}` - that never matched real
-/// plans (every live plan is markdown), so no subtasks were ever auto-created.
-/// JSON steps are still honored as a fallback. Priority is preserved: the FIRST
-/// step gets the HIGHEST priority.
+/// Real plans are markdown: `<plan>1. step one</plan>`, numbered/bulleted lists,
+/// numbered headings (`## 1. Step`) and table rows. JSON `{"steps": [...]}` is
+/// still honored as a fallback. Priority is preserved: the FIRST step gets the
+/// HIGHEST priority. A genuinely empty (or step-less) body still yields an
+/// empty vector - no step is ever invented.
 fn extract_plan_steps(content: &str) -> Vec<String> {
     // 1. JSON fallback: {"steps": ["a", "b"]}
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
@@ -103,40 +332,108 @@ fn extract_plan_steps(content: &str) -> Vec<String> {
     } else {
         content
     };
-    // 3. Parse numbered/bulleted lines.
-    let mut out: Vec<String> = Vec::new();
+    // 3. Parse markdown step lines. Numbered steps are the strongest plan
+    // signal, then bullets, then table rows, and headings as a last resort
+    // (generic section words like "Context" are rejected). Fenced code blocks
+    // are never a plan: their contents are skipped.
+    let mut numbered: Vec<String> = Vec::new();
+    let mut bullets: Vec<String> = Vec::new();
+    let mut tables: Vec<String> = Vec::new();
+    let mut headings: Vec<String> = Vec::new();
+    let mut in_fence = false;
     for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let probe = line.trim_start();
+        if probe.starts_with("```") || probe.starts_with("~~~") {
+            in_fence = !in_fence;
             continue;
         }
-        let step = if let Some(rest) = trimmed
-            .strip_prefix('-')
-            .or_else(|| trimmed.strip_prefix('*'))
-        {
-            rest.trim()
-        } else {
-            // numbered: "1.", "1)", "1:" optionally followed by space
-            let bytes = trimmed.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i > 0 && i < bytes.len() && matches!(bytes[i], b'.' | b')' | b':') {
-                trimmed[i + 1..].trim()
-            } else {
-                continue;
-            }
-        };
-        let clean = step.trim().trim_end_matches(['*', '`']).trim();
-        if !clean.is_empty() && !out.iter().any(|o| o == clean) {
-            out.push(clean.to_string());
-            if out.len() >= 6 {
-                break;
-            }
+        if in_fence {
+            continue;
+        }
+        match step_from_line(line) {
+            Some((StepMarker::Numbered, step)) => numbered.push(step),
+            Some((StepMarker::Bullet, step)) => bullets.push(step),
+            Some((StepMarker::Table, step)) => tables.push(step),
+            Some((StepMarker::Heading, step)) => headings.push(step),
+            None => {}
         }
     }
-    out
+    let numbered_steps = finish_steps(numbered);
+    if !numbered_steps.is_empty() {
+        return numbered_steps;
+    }
+    // Heading-only plans: two or more non-generic section headings are the
+    // plan steps (their bullets are details, not steps).
+    let section_steps: Vec<String> = headings
+        .iter()
+        .filter(|h| !is_generic_heading(h))
+        .cloned()
+        .collect();
+    if section_steps.len() >= 2 {
+        return finish_steps(section_steps);
+    }
+    for bucket in [bullets, tables] {
+        let steps = finish_steps(bucket);
+        if !steps.is_empty() {
+            return steps;
+        }
+    }
+    finish_steps(section_steps)
+}
+
+/// Strict instruction for the single plan-repair call. The first planning
+/// reply was not a plan (a tool-call dump or prose with no steps); the model
+/// must re-answer without touching any tool.
+const PLAN_REPAIR_INSTRUCTION: &str = "=== Plan Repair ===\nYour previous reply was not a plan: it emitted tool-call syntax (or prose \
+with no steps) instead of a plan. You CANNOT call tools in this phase and no \
+tool is available to you. Reply again with ONLY a <plan> block containing 3-8 \
+numbered steps in execution order, for example:\n<plan>\n1. Orient: read the \
+notes and list subtasks.\n2. Implement: edit src/agent/main_loop.rs.\n3. Gate: run \
+cargo test.\n</plan>\nName the tool and arguments each step will use in prose. \
+No preamble, no tool-call markup, no markdown fences.";
+
+/// ONE bounded repair call for a planning reply that contains no parseable
+/// steps. Returns the repaired content only when it DOES parse (plus its usage
+/// so token accounting stays honest); `(None, usage)` otherwise. A genuinely
+/// empty reply is never repaired by the caller (no steps are invented).
+async fn repair_plan(
+    llm: &LLMClient,
+    planning_messages: &[ChatMessage],
+    max_tokens: Option<u32>,
+) -> (Option<String>, Option<Usage>) {
+    let mut messages: Vec<ChatMessage> = planning_messages.to_vec();
+    messages.push(ChatMessage::user(PLAN_REPAIR_INSTRUCTION));
+    let request = CompletionRequest {
+        messages,
+        max_tokens,
+        temperature: 0.2,
+        stream: false,
+        tools: None,
+    };
+    match llm.completion(request).await {
+        Ok(resp) => {
+            // Same field preference as the first planning call: content, then
+            // reasoning when the provider left content empty.
+            let text = if !resp.content.trim().is_empty() {
+                resp.content
+            } else {
+                resp.reasoning.unwrap_or_default()
+            };
+            let usable = !extract_plan_steps(&text).is_empty();
+            if !usable {
+                warn!(
+                    "[plan] Repair reply still carried no parseable steps ({} chars, tool_call_dump={})",
+                    text.len(),
+                    is_tool_call_dump(&text)
+                );
+            }
+            (if usable { Some(text) } else { None }, resp.usage)
+        }
+        Err(e) => {
+            warn!("[plan] Plan repair call failed: {:?}", e);
+            (None, None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +501,104 @@ mod plan_extract_tests {
         let content = "<plan>\n1. same\n2. same\n3. other\n</plan>";
         let steps = extract_plan_steps(content);
         assert_eq!(steps, vec!["same", "other"]);
+    }
+
+    /// The verbatim shape persisted by a real failing `ai` thread (4724,
+    /// task_ai_credit_surface_v6_x6_measure_the_7_multi): the plan request is
+    /// sent with `tools: None`, but the model answered with a textual tool-call
+    /// attempt (DeepSeek DSML markup). That is not a plan: it must be detected
+    /// and must never be turned into invented steps.
+    #[test]
+    fn tool_call_dump_is_detected_and_never_becomes_steps() {
+        let raw = "I'll start by orienting: my notes, the subtask ledger, and the dispatch-briefing method.\n\n\
+<\u{FF5C}DSML\u{FF5C} calls>\n\
+<\u{FF5C}DSML\u{FF5C} invoke name=\"notes__note_list\">\n\n\
+</\u{FF5C}DSML\u{FF5C} invoke>\n\
+<\u{FF5C}DSML\u{FF5C} invoke name=\"subtasks__list_subtasks\">\n\n\
+</\u{FF5C}DSML\u{FF5C} invoke>\n\
+</\u{FF5C}DSML\u{FF5C} calls>";
+        assert!(is_tool_call_dump(raw));
+        assert!(
+            extract_plan_steps(raw).is_empty(),
+            "a tool-call dump must not invent plan steps"
+        );
+        // XML/other-provider shapes are recognised too.
+        assert!(is_tool_call_dump(
+            "<tool_calls><invoke name=\"x\"></tool_calls>"
+        ));
+        assert!(!is_tool_call_dump("1. read the notes\n2. edit the file"));
+    }
+
+    /// A representative large `ai` plan (thread 4414 shape: `<plan>`, `# PLAN`,
+    /// bold numbered steps, long prose) must yield its ordered steps.
+    #[test]
+    fn large_ai_plan_with_bold_steps_parses() {
+        let content = format!(
+            "<plan>\n# PLAN - generalize the policy over the flat genome\n\n\
+**Task digest:** fix the semi-pure-evolutionary ceiling; work in nexuslbs/ai.\n\n\
+{}\n\n## Steps\n\
+1. **Setup + fail-fast** - write the working note, list subtasks, `ssh__status` the remote host.\n\
+2. **Evidence read (QUOTE into notes, no re-read)** - read the source repo docs.\n\
+3. **Design** - write DESIGN.md before code.\n\
+4. **Implement** - patch `prototype/train.py`.\n\
+5. **Run** - train and eval on the remote host.\n\
+6. **Report** - commit, push, summary.\n\n## Notes\n- deliverable lives in docs/evolution/\n</plan>",
+            "long body prose without any list markers. ".repeat(80)
+        );
+        let steps = extract_plan_steps(&content);
+        assert_eq!(steps.len(), 6, "got {steps:?}");
+        assert!(steps[0].starts_with("Setup + fail-fast"), "got {steps:?}");
+        assert!(steps[5].starts_with("Report"), "got {steps:?}");
+    }
+
+    /// Markdown-heavy plans: numbered headings, `Step 3:` markers and fenced
+    /// code blocks (whose numbered lines are NOT plan steps).
+    #[test]
+    fn numbered_headings_parse_and_code_fences_are_skipped() {
+        let content = "<plan>\n# PLAN - ship the parser fix\n\n## Steps\n\
+### 1. **Orient**\n- read the notes\n\
+### 2. Ground the repo\n\
+```text\n1. fenced line must not become a step\n2. nor this one\n```\n\
+### Step 3: Implement the parser\n\
+| # | Step |\n|---|------|\n| 4 | Run the gates |\n</plan>";
+        let steps = extract_plan_steps(content);
+        assert_eq!(
+            steps,
+            vec!["Orient", "Ground the repo", "Implement the parser"]
+        );
+    }
+
+    /// A plan rendered as a markdown table (numeric first column).
+    #[test]
+    fn table_plan_rows_are_steps() {
+        let content = "| # | Step |\n|---|------|\n\
+| 1 | Reproduce the failure |\n| 2 | Patch the parser |\n| 3 | Run the gates |";
+        assert_eq!(
+            extract_plan_steps(content),
+            vec!["Reproduce the failure", "Patch the parser", "Run the gates"]
+        );
+    }
+
+    /// Heading-only plans fall back to their sections; generic document
+    /// headings ("Plan", "Notes") are never steps.
+    #[test]
+    fn heading_only_plan_uses_section_steps() {
+        let content = "<plan>\n# Plan\n\n## Ground the repo state\n\n## Implement the parser fix\n\n## Run the gates\n\n## Notes\n- extra\n</plan>";
+        assert_eq!(
+            extract_plan_steps(content),
+            vec![
+                "Ground the repo state",
+                "Implement the parser fix",
+                "Run the gates"
+            ]
+        );
+    }
+
+    /// Honesty pin: a genuinely empty / step-less plan still reports empty.
+    #[test]
+    fn empty_plan_stays_empty() {
+        assert!(extract_plan_steps("<plan>\n\n</plan>").is_empty());
+        assert!(extract_plan_steps("<plan>I will try my best here.</plan>").is_empty());
     }
 }
 /// Fill every result slot of a round that no tool task produced, so the
@@ -493,10 +888,14 @@ pub(crate) async fn run_main_loop(
             let planning_prompt = if iter == 0 {
                 format!(
                     "## Plan\nBefore responding, create a high-level plan with numbered steps. \
-{tool_list}\nBe specific about which tool to use and what parameters to pass. \
+{tool_list}\nThis phase is PLANNING ONLY: you cannot call a tool here, so never \
+emit tool-call syntax (`<|DSML| ...>`, `<tool_calls>`, `invoke name=...`, function \
+calls) - such a reply is rejected and re-requested. Say which tool and \
+arguments each step will use, in prose. \
 Aim for the minimum number of steps to complete the task. \
-Wrap your plan in a <plan> block. After delivering the final answer, \
-evaluate: if the task was completed, call the completion tool."
+Wrap your plan in a <plan> block with numbered steps, e.g. \
+`<plan>1. ... 2. ...</plan>`. After delivering the final answer, evaluate: \
+if the task was completed, call the completion tool."
                 )
             } else {
                 format!(
@@ -559,6 +958,9 @@ Previous plan:\n{}",
                 }
             }
 
+            // Keep a copy for the one bounded plan-repair call: the request
+            // below consumes `planning_messages`.
+            let repair_messages = planning_messages.clone();
             let plan_request = CompletionRequest {
                 messages: planning_messages,
                 max_tokens,
@@ -608,7 +1010,7 @@ Previous plan:\n{}",
                     let plan_duration_ms = resp.duration_ms as i32;
                     // Use reasoning as fallback when plan content is empty (e.g. DeepSeek
                     // puts everything in reasoning/thinking and leaves content empty).
-                    let plan_content = if !resp.content.is_empty() {
+                    let mut plan_content = if !resp.content.is_empty() {
                         resp.content.clone()
                     } else if let Some(ref r) = resp.reasoning {
                         if !r.is_empty() {
@@ -619,6 +1021,48 @@ Previous plan:\n{}",
                     } else {
                         String::new()
                     };
+
+                    // A planning reply that is a tool-call attempt (or prose with
+                    // no steps) is not a plan: repair it ONCE with a strict
+                    // instruction so even a large markdown-heavy body yields an
+                    // ordered plan. A genuinely empty reply is never repaired, so
+                    // an empty task still reports the empty-plan case honestly and
+                    // no step is ever invented.
+                    if !plan_content.trim().is_empty()
+                        && extract_plan_steps(&plan_content).is_empty()
+                    {
+                        info!(
+                            "[plan] Plan reply for thread {} is not parseable ({} chars, tool_call_dump={}) - one repair attempt",
+                            thread.id,
+                            plan_content.len(),
+                            is_tool_call_dump(&plan_content)
+                        );
+                        let (repaired, repair_usage) =
+                            repair_plan(per_thread_llm, &repair_messages, max_tokens).await;
+                        helpers::merge_usage(&mut cumulative_usage, repair_usage.clone());
+                        if let Some(ref u) = repair_usage {
+                            usage_entries.push(crate::agent::usage_entries::omniagent_usage_entry(
+                                u,
+                                &per_thread_llm.config.provider.0,
+                                &per_thread_llm.config.model,
+                                &thread.profile,
+                            ));
+                        }
+                        if let Some(repaired) = repaired {
+                            info!(
+                                "[plan] Repaired plan for thread {} ({} chars, {} step(s))",
+                                thread.id,
+                                repaired.len(),
+                                extract_plan_steps(&repaired).len()
+                            );
+                            plan_content = repaired;
+                        } else {
+                            warn!(
+                                "[plan] Plan repair for thread {} produced no parseable steps - keeping the original reply",
+                                thread.id
+                            );
+                        }
+                    }
 
                     info!(
                         "[plan] Generated plan for thread {} ({} chars from field '{}', iteration {}/{})",

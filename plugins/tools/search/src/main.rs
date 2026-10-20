@@ -1820,7 +1820,8 @@ mod tests {
         // The precise failure shape: `@@ to_tsquery(...) && to_tsquery(...)`
         // at the same paren level anywhere in the statement.
         for channel in [None, Some("omnidev")] {
-            let sql = build_search_messages_sql("task_omnidev_fix search_tsv_backfill", channel, 10);
+            let sql =
+                build_search_messages_sql("task_omnidev_fix search_tsv_backfill", channel, 10);
             assert!(
                 !sql.contains("@@ to_tsquery('english', 'taskomnidevfix') && to_tsquery("),
                 "statement must contain no unparenthesized `@@ ... && to_tsquery`: {sql}"
@@ -1901,8 +1902,7 @@ mod search_sql_execution_tests {
             .await
             .expect("dev database must be reachable when DATABASE_URL is set");
         for channel in [None, Some("omnidev")] {
-            let sql =
-                build_search_messages_sql("task_omnidev_fix search_tsv_backfill", channel, 5);
+            let sql = build_search_messages_sql("task_omnidev_fix search_tsv_backfill", channel, 5);
             let rows = sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(sql.as_str()))
                 .fetch_all(&pool)
                 .await;

@@ -419,11 +419,19 @@ async fn repair_plan(
             } else {
                 resp.reasoning.unwrap_or_default()
             };
-            let usable = !extract_plan_steps(&text).is_empty();
+            // A reply that merely ECHOES our repair instruction (some providers
+            // and the noop/echo test provider repeat the prompt verbatim) is not
+            // a plan: the instruction's own example steps would otherwise be
+            // parsed as real steps, materialized as subtasks and then enforced,
+            // failing the thread with "ran out of attempts to complete all
+            // subtasks" (GROUP 22 workflow tests, thread 4838).
+            let echoes_instruction = text.contains("=== Plan Repair ===");
+            let usable = !echoes_instruction && !extract_plan_steps(&text).is_empty();
             if !usable {
                 warn!(
-                    "[plan] Repair reply still carried no parseable steps ({} chars, tool_call_dump={})",
+                    "[plan] Repair reply carried no parseable steps or merely echoed the repair instruction ({} chars, echo={}, tool_call_dump={})",
                     text.len(),
+                    echoes_instruction,
                     is_tool_call_dump(&text)
                 );
             }

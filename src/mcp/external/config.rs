@@ -441,35 +441,7 @@ fn scan_plugin_dir(plugin_dir: &str, data_dir: &str) -> Option<Vec<McpServerConf
             pool_size: default_pool_size(),
         };
         // Load YAML config values with original (non-prefixed) keys
-        if let Some(yaml_config) = crate::plugins_yaml::load_plugin_yaml_config(
-            &dir_name,
-            data_dir,
-            &crate::plugins_yaml::PluginYamlType::Tool,
-        ) {
-            if let Some(obj) = yaml_config.as_object() {
-                for (key, val) in obj {
-                    // YAML config values can be strings, numbers, or booleans
-                    // (e.g. `github_app_id: 3967918`). Serialize non-strings to
-                    // their literal form instead of silently dropping them -
-                    // as_str() on a Number returns None, which used to make
-                    // numeric plugin config (like git's github_app_id /
-                    // github_installation_id) vanish and auth fail with
-                    // "must be set in the plugin config".
-                    let raw = match val {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        _ => String::new(),
-                    };
-                    if !raw.is_empty() {
-                        let resolved = crate::plugins_yaml::resolve_config_value(&raw);
-                        if !resolved.is_empty() {
-                            srv.env.insert(key.clone(), resolved);
-                        }
-                    }
-                }
-            }
-        }
+        apply_yaml_config(&mut srv.env, &dir_name, data_dir, &path.to_string_lossy());
         // Apply config_schema defaults from plugin.json (fills missing fields)
         apply_config_schema_defaults(&mut srv.env, &path.to_string_lossy());
 
@@ -546,28 +518,8 @@ fn scan_plugin_dir(plugin_dir: &str, data_dir: &str) -> Option<Vec<McpServerConf
             allowed_tools: default_allowed_tools(),
             pool_size: default_pool_size(),
         };
-        if let Some(yaml_config) = crate::plugins_yaml::load_plugin_yaml_config(
-            &dir_name,
-            data_dir,
-            &crate::plugins_yaml::PluginYamlType::Tool,
-        ) {
-            if let Some(obj) = yaml_config.as_object() {
-                for (key, val) in obj {
-                    let raw = match val {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        _ => String::new(),
-                    };
-                    if !raw.is_empty() {
-                        let resolved = crate::plugins_yaml::resolve_config_value(&raw);
-                        if !resolved.is_empty() {
-                            srv.env.insert(key.clone(), resolved);
-                        }
-                    }
-                }
-            }
-        }
+        // Load YAML config values with original (non-prefixed) keys
+        apply_yaml_config(&mut srv.env, &dir_name, data_dir, &plugin_dir_str);
         apply_config_schema_defaults(&mut srv.env, &plugin_dir_str);
         inject_core_bootstrap_env(&mut srv, &plugin_dir_str);
         tracing::debug!(
@@ -674,31 +626,7 @@ fn scan_plugin_dir(plugin_dir: &str, data_dir: &str) -> Option<Vec<McpServerConf
                     }
 
                     // Load YAML config values with original (non-prefixed) keys
-                    if let Some(yaml_config) = crate::plugins_yaml::load_plugin_yaml_config(
-                        &dir_name, data_dir,
-                        &crate::plugins_yaml::PluginYamlType::Tool,
-                    ) {
-                        if let Some(obj) = yaml_config.as_object() {
-                            for (key, val) in obj {
-                                // YAML config values can be strings, numbers, or
-                                // booleans (e.g. `github_app_id: 3967918`).
-                                // Serialize non-strings to their literal form
-                                // instead of silently dropping them.
-                                let raw = match val {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    serde_json::Value::Number(n) => n.to_string(),
-                                    serde_json::Value::Bool(b) => b.to_string(),
-                                    _ => String::new(),
-                                };
-                                if !raw.is_empty() {
-                                    let resolved = crate::plugins_yaml::resolve_config_value(&raw);
-                                    if !resolved.is_empty() {
-                                        srv.env.insert(key.clone(), resolved);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    apply_yaml_config(&mut srv.env, &dir_name, data_dir, &plugin_dir_str);
                     // Apply config_schema defaults from plugin.json (fills missing fields)
                     apply_config_schema_defaults(&mut srv.env, &path.to_string_lossy());
                     inject_core_bootstrap_env(&mut srv, &path.to_string_lossy());
@@ -787,6 +715,78 @@ fn read_config_file(path: &str) -> AppResult<McpServersConfig> {
 /// is not already present in `env`, resolves `$env:` references and adds it
 /// with the original (non-prefixed) key. This allows the configure message
 /// sent to the plugin to include these values.
+/// Copy a plugin's `plugins.yml` `config` block into the `configure` env map.
+///
+/// Values are sent with their ORIGINAL (non-prefixed) keys so the plugin's
+/// configure handler sees them. Strings, numbers and booleans are supported
+/// (e.g. `github_app_id: 3967918`).
+///
+/// An EXPLICITLY empty value is forwarded as `""` when the plugin's
+/// plugin.json `config_schema` declares that key: for a schema-declared key the
+/// empty string is a real value (opt-out, e.g. `ssh_key_secret_name: ''`
+/// disables a configured default), not "unset". For any other key it is still
+/// dropped, exactly as before.
+fn apply_yaml_config(
+    env: &mut HashMap<String, String>,
+    dir_name: &str,
+    data_dir: &str,
+    plugin_dir: &str,
+) {
+    let yaml_config = crate::plugins_yaml::load_plugin_yaml_config(
+        dir_name,
+        data_dir,
+        &crate::plugins_yaml::PluginYamlType::Tool,
+    );
+    let obj = match yaml_config.as_ref().and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return,
+    };
+    let schema_keys = config_schema_keys(plugin_dir);
+    for (key, val) in obj {
+        let raw = match val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => String::new(),
+        };
+        let resolved = crate::plugins_yaml::resolve_config_value(&raw);
+        if forward_config_value(&resolved, schema_keys.contains(key.as_str())) {
+            env.insert(key.clone(), resolved);
+        }
+    }
+}
+
+/// Keys declared in a plugin's `plugin.json` `config_schema`.
+///
+/// Used to forward an EXPLICITLY empty configured value to the plugin: for a
+/// schema-declared key the empty string is a real value (opt-out), not "unset".
+fn config_schema_keys(plugin_dir: &str) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    let content =
+        match std::fs::read_to_string(std::path::Path::new(plugin_dir).join("plugin.json")) {
+            Ok(c) => c,
+            Err(_) => return keys,
+        };
+    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return keys,
+    };
+    if let Some(arr) = parsed.get("config_schema").and_then(|v| v.as_array()) {
+        for field in arr {
+            if let Some(key) = field.get("key").and_then(|v| v.as_str()) {
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+/// Whether a resolved config value must be sent in the plugin `configure`
+/// message: any non-empty value, plus an empty one for a schema-declared key.
+fn forward_config_value(resolved: &str, declared_in_schema: bool) -> bool {
+    !resolved.is_empty() || declared_in_schema
+}
+
 fn apply_config_schema_defaults(env: &mut HashMap<String, String>, plugin_dir: &str) {
     let plugin_json_path = std::path::Path::new(plugin_dir).join("plugin.json");
     if !plugin_json_path.exists() {
@@ -964,5 +964,46 @@ mod tests {
         assert_eq!(config.timeout_secs, None);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.allowed_tools, vec!["*"]);
+    }
+}
+
+#[cfg(test)]
+mod config_schema_forwarding_tests {
+    use super::*;
+
+    /// An explicitly empty value is forwarded only for a schema-declared key;
+    /// for any other key it is still dropped (unchanged behaviour).
+    #[test]
+    fn empty_value_forwarded_only_for_schema_declared_key() {
+        assert!(forward_config_value("", true));
+        assert!(!forward_config_value("", false));
+        assert!(forward_config_value("SSH_PRIVATE_KEY", false));
+        assert!(forward_config_value("SSH_PRIVATE_KEY", true));
+    }
+
+    /// The schema key set comes from plugin.json and is empty (never a panic)
+    /// when the file or the directory is missing.
+    #[test]
+    fn config_schema_keys_reads_plugin_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "omni-plugin-schema-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp plugin dir");
+        std::fs::write(
+            dir.join("plugin.json"),
+            r#"{"name":"t","config_schema":[{"key":"ssh_key_secret_name","default":"SSH_PRIVATE_KEY"},{"key":"ssh_dir","default":""}]}"#,
+        )
+        .expect("write plugin.json");
+        let keys = config_schema_keys(dir.to_str().unwrap());
+        assert!(keys.contains("ssh_key_secret_name"));
+        assert!(keys.contains("ssh_dir"));
+        assert_eq!(keys.len(), 2);
+        assert!(config_schema_keys("/nonexistent/plugin/dir").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -32,6 +32,13 @@
       "label": "Database URL (for resolving ssh_key_secret_name from the omniagent secrets store)",
       "type": "string",
       "required": false
+    },
+    {
+      "key": "ssh_key_secret_name",
+      "default": "SSH_PRIVATE_KEY",
+      "label": "Default SSH Key Secret (secret name whose VALUE is the private key; empty = local key files only)",
+      "type": "string",
+      "required": false
     }
   ],
   "tools": [

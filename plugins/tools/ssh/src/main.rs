@@ -16,6 +16,13 @@
 //!   - workspace_dir: optional sandbox for the LOCAL side of ssh_copy.
 //!   - database_url: Postgres URL of the omniagent secrets store (default
 //!     $env:DATABASE_URL); used to resolve ssh_key_secret_name at call time.
+//!   - ssh_key_secret_name: DEFAULT secret name whose VALUE is the private key
+//!     used for every ssh/scp call (default `SSH_PRIVATE_KEY`). A per-call
+//!     `ssh_key_secret_name` argument overrides it; an empty configured value
+//!     disables the default so only local key files under ssh_dir are used.
+//!     When the configured default cannot be resolved (no database_url, secret
+//!     missing or empty) the plugin logs a warning and falls back to the local
+//!     key files. The key VALUE is never persisted and never logged.
 
 use anyhow::{Context, Result};
 use mcp_server_util::*;
@@ -32,12 +39,24 @@ use tokio::process::Command;
 
 //  Config
 
+/// Default secret name whose VALUE is the private key used for ssh/scp.
+///
+/// "Always use SSH_PRIVATE_KEY" is enforced by CODE, not only by prose: a call
+/// that omits the `ssh_key_secret_name` argument still authenticates with this
+/// secret, so a stale/unauthorized local key file in ssh_dir can no longer
+/// silently win. Set the plugin config `ssh_key_secret_name` to an empty string
+/// to opt out (local key files only).
+const DEFAULT_SSH_KEY_SECRET_NAME: &str = "SSH_PRIVATE_KEY";
+
 #[derive(Clone)]
 struct Config {
     ssh_dir: String,
     connect_timeout_secs: u64,
     workspace_dir: String,
     database_url: String, // secrets store URL (from the configure message)
+    /// Default secret NAME holding the private key for every ssh/scp call.
+    /// Empty = disabled (local key files only).
+    ssh_key_secret_name: String,
 }
 
 impl Default for Config {
@@ -47,6 +66,7 @@ impl Default for Config {
             connect_timeout_secs: 10,
             workspace_dir: "/opt/workspace".to_string(),
             database_url: String::new(),
+            ssh_key_secret_name: DEFAULT_SSH_KEY_SECRET_NAME.to_string(),
         }
     }
 }
@@ -146,6 +166,61 @@ async fn resolve_secret_key(secret_name: &str) -> Result<SecretKeyFile> {
             secret_name
         ),
         Some(v) => SecretKeyFile::create(v.trim()),
+    }
+}
+
+/// Pick the key-secret NAME for one call.
+///
+/// Priority: explicit per-call `ssh_key_secret_name` argument > configured
+/// `ssh_key_secret_name` default > no secret (local key files under ssh_dir).
+/// An empty/whitespace explicit argument counts as "not given"; an empty
+/// configured default disables the secret path entirely.
+fn secret_name_choice(configured: &str, explicit: Option<&str>) -> Option<String> {
+    if let Some(name) = explicit {
+        let name = name.trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    let name = configured.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Resolve the private key material for one ssh/scp call.
+///
+/// An EXPLICIT per-call secret name fails hard when it cannot be resolved (a
+/// caller that named a secret must never silently authenticate as somebody
+/// else). The CONFIGURED default is a preference: when it cannot be resolved -
+/// no database_url configured, secret row missing or empty - the plugin logs a
+/// warning and falls back to the local key files under ssh_dir, which stays the
+/// documented opt-out path (set the config value to an empty string).
+async fn resolve_identity(args: &Value) -> Result<Option<SecretKeyFile>> {
+    let explicit = args["ssh_key_secret_name"].as_str();
+    let explicit_used = explicit.is_some_and(|n| !n.trim().is_empty());
+    let configured = {
+        let cfg = CONFIG.lock();
+        cfg.ssh_key_secret_name.clone()
+    };
+    match secret_name_choice(&configured, explicit) {
+        Some(name) => match resolve_secret_key(&name).await {
+            Ok(key) => Ok(Some(key)),
+            Err(e) if explicit_used => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    "ssh plugin: configured ssh_key_secret_name '{}' is not usable ({}); \
+                     falling back to the local key files in ssh_dir. Set the plugin config \
+                     ssh_key_secret_name to an empty string to opt out explicitly.",
+                    name,
+                    e
+                );
+                Ok(None)
+            }
+        },
+        None => Ok(None),
     }
 }
 
@@ -506,13 +581,9 @@ async fn handle_run(args: Value) -> Result<(String, bool)> {
         cfg.connect_timeout_secs
     };
 
-    // Optional secret-backed identity (ssh_key_secret_name): when the agent
-    // passes the NAME of a secret (e.g. SSH_PRIVATE_KEY), its VALUE is used as
-    // the private key for this connection. Local key files stay the default.
-    let secret_key = match args["ssh_key_secret_name"].as_str() {
-        Some(name) if !name.trim().is_empty() => Some(resolve_secret_key(name.trim()).await?),
-        _ => None,
-    };
+    // Secret-backed identity: explicit `ssh_key_secret_name` argument, else the
+    // configured default (SSH_PRIVATE_KEY), else the local key files in ssh_dir.
+    let secret_key = resolve_identity(&args).await?;
     let identity_path = secret_key.as_ref().map(|k| k.path());
 
     // Build the remote command line. The command is passed as ONE argument so
@@ -630,11 +701,9 @@ async fn handle_copy(args: Value) -> Result<(String, bool)> {
         return Ok((e.to_string(), true));
     }
 
-    // Optional secret-backed identity (ssh_key_secret_name).
-    let secret_key = match args["ssh_key_secret_name"].as_str() {
-        Some(name) if !name.trim().is_empty() => Some(resolve_secret_key(name.trim()).await?),
-        _ => None,
-    };
+    // Secret-backed identity: explicit `ssh_key_secret_name` argument, else the
+    // configured default (SSH_PRIVATE_KEY), else the local key files in ssh_dir.
+    let secret_key = resolve_identity(&args).await?;
     let identity_path = secret_key.as_ref().map(|k| k.path());
 
     let (host_part, port) = split_host_port(&host);
@@ -771,11 +840,9 @@ async fn handle_status(args: Value) -> Result<(String, bool)> {
         cfg.connect_timeout_secs
     };
 
-    // Optional secret-backed identity (ssh_key_secret_name).
-    let secret_key = match args["ssh_key_secret_name"].as_str() {
-        Some(name) if !name.trim().is_empty() => Some(resolve_secret_key(name.trim()).await?),
-        _ => None,
-    };
+    // Secret-backed identity: explicit `ssh_key_secret_name` argument, else the
+    // configured default (SSH_PRIVATE_KEY), else the local key files in ssh_dir.
+    let secret_key = resolve_identity(&args).await?;
     let identity_path = secret_key.as_ref().map(|k| k.path());
 
     let (out, err, rc, elapsed_ms) = run_ssh(
@@ -834,8 +901,9 @@ async fn main() -> Result<()> {
                     'ssh_dir' (optional) overrides the configured ssh dir (default \
                     {OMNI_DIR}/data/ssh). 'ssh_key_secret_name' (optional): name of a secret in the omniagent secrets store \
                     (e.g. SSH_PRIVATE_KEY) whose VALUE is the private SSH key used for \
-                    authentication. Local key files under ssh_dir remain supported when this \
-                    param is omitted. Returns stdout, stderr, exit code and duration."
+                    authentication. When omitted, the plugin's configured default secret \
+                    (SSH_PRIVATE_KEY by default) is used, with local key files under ssh_dir \
+                    as the fallback. Returns stdout, stderr, exit code and duration."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -866,7 +934,7 @@ async fn main() -> Result<()> {
                         },
                         "ssh_key_secret_name": {
                             "type": "string",
-                            "description": "Name of a secret in the omniagent secrets store (e.g. SSH_PRIVATE_KEY) whose VALUE is the private SSH key used to authenticate with this host. Fetched at call time, never persisted. Optional: when omitted, local key files under ssh_dir are used (unchanged behavior)."
+                            "description": "Name of a secret in the omniagent secrets store (e.g. SSH_PRIVATE_KEY) whose VALUE is the private SSH key used to authenticate with this host. Fetched at call time, never persisted. Optional: when omitted, the plugin's configured default secret is used (SSH_PRIVATE_KEY unless changed in the plugin settings); local key files under ssh_dir are used when no secret can be resolved or the default is configured empty."
                         }
                     },
                     "required": ["host"]
@@ -888,8 +956,9 @@ async fn main() -> Result<()> {
                     The LOCAL side is sandboxed to the configured workspace_dir \
                     (default /opt/workspace). 'timeout' (optional) bounds the copy in seconds. \
                     'ssh_dir' (optional) overrides the configured ssh dir. 'ssh_key_secret_name' (optional): \
-                    name of a secret whose VALUE is the private SSH key to use; local key files \
-                    remain supported when omitted."
+                    name of a secret whose VALUE is the private SSH key to use; when omitted, the \
+                    plugin's configured default secret (SSH_PRIVATE_KEY by default) is used, with \
+                    local key files as the fallback."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -925,7 +994,7 @@ async fn main() -> Result<()> {
                         },
                         "ssh_key_secret_name": {
                             "type": "string",
-                            "description": "Name of a secret in the omniagent secrets store (e.g. SSH_PRIVATE_KEY) whose VALUE is the private SSH key used to authenticate with this host. Fetched at call time, never persisted. Optional: when omitted, local key files under ssh_dir are used (unchanged behavior)."
+                            "description": "Name of a secret in the omniagent secrets store (e.g. SSH_PRIVATE_KEY) whose VALUE is the private SSH key used to authenticate with this host. Fetched at call time, never persisted. Optional: when omitted, the plugin's configured default secret is used (SSH_PRIVATE_KEY unless changed in the plugin settings); local key files under ssh_dir are used when no secret can be resolved or the default is configured empty."
                         }
                     },
                     "required": ["host", "direction", "source", "destination"]
@@ -943,8 +1012,9 @@ async fn main() -> Result<()> {
                     to fail fast before scripting a long remote setup. 'host' (required) is \
                     a host alias OR 'user@host:port' inline. 'ssh_dir' (optional) overrides \
                     the configured ssh dir. 'ssh_key_secret_name' (optional): name of a secret \
-                    whose VALUE is the private SSH key to use; local key files remain \
-                    supported when omitted."
+                    whose VALUE is the private SSH key to use; when omitted, the plugin's configured \
+                    default secret (SSH_PRIVATE_KEY by default) is used, with local key files as the \
+                    fallback."
                     .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -963,7 +1033,7 @@ async fn main() -> Result<()> {
                         },
                         "ssh_key_secret_name": {
                             "type": "string",
-                            "description": "Name of a secret in the omniagent secrets store (e.g. SSH_PRIVATE_KEY) whose VALUE is the private SSH key used to authenticate with this host. Fetched at call time, never persisted. Optional: when omitted, local key files under ssh_dir are used (unchanged behavior)."
+                            "description": "Name of a secret in the omniagent secrets store (e.g. SSH_PRIVATE_KEY) whose VALUE is the private SSH key used to authenticate with this host. Fetched at call time, never persisted. Optional: when omitted, the plugin's configured default secret is used (SSH_PRIVATE_KEY unless changed in the plugin settings); local key files under ssh_dir are used when no secret can be resolved or the default is configured empty."
                         }
                     },
                     "required": ["host"]
@@ -1007,7 +1077,20 @@ async fn main() -> Result<()> {
                     cfg.database_url = url.to_string();
                 }
             }
-            tracing::info!("SSH plugin configured (ssh_dir={})", cfg.ssh_dir);
+            if let Some(name) = params.get("ssh_key_secret_name").and_then(|v| v.as_str()) {
+                // An EMPTY value is meaningful: it disables the default secret
+                // and restores the local-key-files-only behaviour.
+                cfg.ssh_key_secret_name = name.trim().to_string();
+            }
+            tracing::info!(
+                "SSH plugin configured (ssh_dir={}, default_key_secret={})",
+                cfg.ssh_dir,
+                if cfg.ssh_key_secret_name.is_empty() {
+                    "<none>"
+                } else {
+                    cfg.ssh_key_secret_name.as_str()
+                }
+            );
         }),
     )
     .await
@@ -1038,6 +1121,9 @@ mod tests {
             cfg.ssh_dir = ssh_dir.to_string();
             cfg.workspace_dir = workspace.to_string();
             cfg.database_url = String::new();
+            // No default secret in tests: resolution falls back to local keys
+            // unless a test sets it explicitly.
+            cfg.ssh_key_secret_name = String::new();
         }
         guard
     }
@@ -1270,5 +1356,86 @@ mod tests {
             msg.contains("database_url"),
             "error must suggest config fix: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_secret_tests {
+    use super::*;
+
+    /// The configured default is used when a call omits the argument.
+    #[test]
+    fn configured_default_secret_used_when_call_omits_it() {
+        assert_eq!(
+            secret_name_choice(DEFAULT_SSH_KEY_SECRET_NAME, None).as_deref(),
+            Some("SSH_PRIVATE_KEY")
+        );
+    }
+
+    /// An explicit per-call name always wins over the configured default.
+    #[test]
+    fn explicit_per_call_secret_beats_configured_default() {
+        assert_eq!(
+            secret_name_choice("SSH_PRIVATE_KEY", Some("OTHER_KEY")).as_deref(),
+            Some("OTHER_KEY")
+        );
+        assert_eq!(
+            secret_name_choice("SSH_PRIVATE_KEY", Some("  OTHER_KEY  ")).as_deref(),
+            Some("OTHER_KEY")
+        );
+    }
+
+    /// An empty configured default disables the secret path entirely.
+    #[test]
+    fn empty_configured_default_falls_back_to_local_keys() {
+        assert_eq!(secret_name_choice("", None), None);
+        assert_eq!(secret_name_choice("   ", None), None);
+        // An empty explicit argument counts as "not given" -> configured wins.
+        assert_eq!(
+            secret_name_choice("SSH_PRIVATE_KEY", Some("   ")).as_deref(),
+            Some("SSH_PRIVATE_KEY")
+        );
+    }
+
+    /// The code default is SSH_PRIVATE_KEY, not an empty value.
+    #[test]
+    fn config_default_is_ssh_private_key() {
+        assert_eq!(
+            Config::default().ssh_key_secret_name,
+            "SSH_PRIVATE_KEY".to_string()
+        );
+    }
+
+    /// A configured default that cannot be resolved (no database_url) falls
+    /// back to the local key files instead of failing the call; an EXPLICIT
+    /// name still fails hard.
+    #[tokio::test]
+    async fn unresolvable_configured_default_falls_back_but_explicit_fails() {
+        static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+            LazyLock::new(|| tokio::sync::Mutex::new(()));
+        let _g = TEST_LOCK.lock().await;
+        {
+            let mut cfg = CONFIG.lock();
+            cfg.database_url = String::new();
+            cfg.ssh_key_secret_name = DEFAULT_SSH_KEY_SECRET_NAME.to_string();
+        }
+        let fallback = resolve_identity(&serde_json::json!({"host": "h"}))
+            .await
+            .expect("configured default falls back instead of failing");
+        assert!(fallback.is_none(), "fallback means local key files");
+
+        let explicit = resolve_identity(&serde_json::json!({
+            "host": "h",
+            "ssh_key_secret_name": "OTHER_KEY"
+        }))
+        .await;
+        assert!(
+            explicit.is_err(),
+            "an explicit name must fail hard, never silently fall back"
+        );
+        {
+            let mut cfg = CONFIG.lock();
+            cfg.ssh_key_secret_name = String::new();
+        }
     }
 }
